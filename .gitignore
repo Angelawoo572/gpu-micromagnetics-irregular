@@ -1,0 +1,67 @@
+# =========================
+# Build files
+# =========================
+build/
+bin/
+obj/
+*.o
+*.so
+*.a
+*.out
+*.exe
+*.txt
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# =========================
+# CUDA
+# =========================
+*.ptx
+*.cubin
+*.fatbin
+
+# =========================
+# Logs / profiling
+# =========================
+*.log
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Nsight output
+nsight-compute*
+nsight-systems*
+
+# =========================
+# Python (if you use scripts)
+# =========================
+__pycache__/
+*.pyc
+
+# =========================
+# Data / results (VERY IMPORTANT)
+# =========================
+data/
+datasets/
+results/
+outputs/
+*.csv
+*.npy
+*.npz
+
+# =========================
+# Editor / OS junk
+# =========================
+.DS_Store
+.vscode/
+.idea/
+
+# =========================
+# Misc
+# =========================
+*.tmp
+*.bak
