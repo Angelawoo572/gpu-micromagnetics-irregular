@@ -36,6 +36,14 @@ Optimized version:
 #define ENABLE_OUTPUT 0
 #endif
 
+#ifndef BLOCK_X
+#define BLOCK_X 16
+#endif
+
+#ifndef BLOCK_Y
+#define BLOCK_Y 8
+#endif
+
 /* typed constant memory */
 __constant__ sunrealtype c_msk[3] = {
     SUN_RCONST(0.0), SUN_RCONST(0.0), SUN_RCONST(1.0)};
@@ -164,9 +172,17 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   sunrealtype* ydotdata = N_VGetDeviceArrayPointer_Cuda(ydot);
 
   /* 2D mapping over physical groups */
-  dim3 block(32, 8);  // 256 threads/block, warp-friendly x dimension
+  // dim3 block(32, 8);  // 256 threads/block, warp-friendly x dimension
+  // dim3 grid((udata->ng + block.x - 1) / block.x,
+  //           (udata->ny + block.y - 1) / block.y);
+  dim3 block(BLOCK_X, BLOCK_Y);
   dim3 grid((udata->ng + block.x - 1) / block.x,
             (udata->ny + block.y - 1) / block.y);
+  if (BLOCK_X * BLOCK_Y > 1024) {
+    fprintf(stderr, "Invalid block size: BLOCK_X * BLOCK_Y = %d > 1024\n",
+            BLOCK_X * BLOCK_Y);
+    return -1;
+  }
 
   f_kernel_group<<<grid, block>>>(ydata, ydotdata, udata->nx, udata->ny,
                                   udata->ng);

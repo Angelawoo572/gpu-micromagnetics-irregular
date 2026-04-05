@@ -1,0 +1,8 @@
+
+Group of independent 3-species kinetics problems
+
+scalar width nx = 9000, rows ny = 128, groups/row = 3000, neq = 1152000
+GPU simulation took 15172.349 ms
+
+Final Statistics:
+nst = 6666   nfe  = 7850   nsetups = 0      nni = 7847   ncfn = 0      netf = 1      nge = 0
