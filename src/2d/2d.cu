@@ -277,7 +277,7 @@ int main(int argc, char* argv[]) {
   float elapsedTime = 0.0f;
 
   /* problem size */
-  const int nx = 9000;       /* old scalar width */
+  const int nx = 1536;       /* old scalar width */
   const int ny = 128;
 
   if (nx % GROUPSIZE != 0) {
