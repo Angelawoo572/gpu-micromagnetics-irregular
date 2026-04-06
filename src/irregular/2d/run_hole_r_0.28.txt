@@ -1,0 +1,11 @@
+
+2D irregular baseline (SoA, dense masked execution)
+
+scalar width nx = 1536, rows ny = 128, groups/row = 512, ncell = 65536, neq = 196608
+periodic BC: x and y
+masked hole: center=(255.50, 63.50), radius=35.84 cells
+active cells = 61492 / 65536 (93.83% active)
+GPU simulation took 8855.327 ms
+
+Final Statistics:
+nst = 6551   nfe  = 7760   nsetups = 0      nni = 7757   ncfn = 2      netf = 1      nge = 0
