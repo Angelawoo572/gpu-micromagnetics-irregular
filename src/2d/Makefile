@@ -20,7 +20,7 @@ CUDA_ARCH ?= -arch=sm_89
 BUILD ?= release
 PRINT ?= 0
 
-BLOCK_X ?= 32
+BLOCK_X ?= 16
 BLOCK_Y ?= 8
 
 ifeq ($(BUILD),debug)
