@@ -1,5 +1,5 @@
 /**
- * 2D irregular baseline for CVODE + CUDA (SoA)
+ * 2D irregular compact active-cell execution for CVODE + CUDA (SoA)
  *
  * Geometry:
  *   - periodic in x
@@ -7,12 +7,17 @@
  *   - one circular masked hole in the interior
  *
  * Execution policy:
- *   - dense full-grid launch
- *   - one CUDA thread per physical cell
- *   - if current cell is inactive: yd = 0
- *   - if neighbor is inactive: skip that neighbor contribution
+ *   - compact active-cell launch for RHS
+ *   - one CUDA thread per active cell
+ *   - inactive cells are stored in the full state vector but do not evolve
+ *   - inactive entries in ydot are explicitly zeroed each RHS call
+ *   - neighbor contributions from inactive cells are skipped
  *
- * This is a correctness-first baseline, not a performance-optimized irregular version.
+ * Notes:
+ *   - State layout remains dense SoA in one N_Vector:
+ *       [mx for all cells][my for all cells][mz for all cells]
+ *   - This isolates the effect of execution compaction without changing the
+ *     mathematical state representation expected by CVODE.
  */
 
 #include <cvode/cvode.h>
@@ -48,15 +53,10 @@
 #define ENABLE_OUTPUT 0
 #endif
 
-#ifndef BLOCK_X
-#define BLOCK_X 16
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256
 #endif
 
-#ifndef BLOCK_Y
-#define BLOCK_Y 8
-#endif
-
-/* Hole parameters (correctness-first defaults) */
 #ifndef HOLE_CENTER_X_FRAC
 #define HOLE_CENTER_X_FRAC 0.50
 #endif
@@ -65,7 +65,6 @@
 #define HOLE_CENTER_Y_FRAC 0.50
 #endif
 
-/* radius measured in cell units, relative to ny */
 #ifndef HOLE_RADIUS_FRAC_Y
 #define HOLE_RADIUS_FRAC_Y 0.22
 #endif
@@ -106,16 +105,22 @@ __constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
 
 /* user data */
 typedef struct {
-  int nx;         /* old scalar width = 3 * ng */
-  int ny;         /* number of rows */
-  int ng;         /* number of physical cells per row */
-  int ncell;      /* total physical cells = ng * ny */
-  int neq;        /* total equations = 3 * ncell */
+  int nx;
+  int ny;
+  int ng;
+  int ncell;
+  int neq;
 
-  unsigned char* d_active; /* device mask: 1 active, 0 inactive */
-  unsigned char* h_active; /* host mirror for initialization / output */
+  unsigned char* h_active;
+  unsigned char* d_active;
 
-  int n_active;   /* count of active cells, for sanity print */
+  int* h_active_ids;
+  int* d_active_ids;
+  int  n_active;
+
+  int* h_inactive_ids;
+  int* d_inactive_ids;
+  int  n_inactive;
 } UserData;
 
 /* SoA indexing helpers */
@@ -139,43 +144,42 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
   return (y < 0) ? (y + ny) : ((y >= ny) ? (y - ny) : y);
 }
 
-/*
- * RHS kernel
- *
- * Geometry:
- *   - toroidal periodic domain in x and y
- *   - inactive cells represent the interior hole
- *
- * Policy:
- *   - if self inactive: derivative = 0
- *   - if neighbor inactive: skip contribution
- */
-__global__ static void f_kernel_group_soa_irregular(
+/* zero ydot only for inactive cells */
+__global__ static void zero_inactive_kernel(
+    sunrealtype* __restrict__ yd,
+    const int* __restrict__ inactive_ids,
+    int n_inactive,
+    int ncell) {
+
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= n_inactive) return;
+
+  int cell = inactive_ids[tid];
+  yd[idx_mx(cell, ncell)] = ZERO;
+  yd[idx_my(cell, ncell)] = ZERO;
+  yd[idx_mz(cell, ncell)] = ZERO;
+}
+
+/* compact RHS kernel: one thread per active cell */
+__global__ static void f_kernel_group_soa_irregular_compact(
     const sunrealtype* __restrict__ y,
     sunrealtype* __restrict__ yd,
     const unsigned char* __restrict__ active,
+    const int* __restrict__ active_ids,
+    int n_active,
     int ng, int ny, int ncell) {
 
-  const int gx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int gy = blockIdx.y * blockDim.y + threadIdx.y;
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= n_active) return;
 
-  if (gx >= ng || gy >= ny) return;
-
-  const int cell = gy * ng + gx;
+  const int cell = active_ids[tid];
+  const int gx = cell % ng;
+  const int gy = cell / ng;
 
   const int mx = idx_mx(cell, ncell);
   const int my = idx_my(cell, ncell);
   const int mz = idx_mz(cell, ncell);
 
-  /* inactive cells do not evolve */
-  if (!active[cell]) {
-    yd[mx] = ZERO;
-    yd[my] = ZERO;
-    yd[mz] = ZERO;
-    return;
-  }
-
-  /* periodic neighbors on the torus */
   const int xl = wrap_x(gx - 1, ng);
   const int xr = wrap_x(gx + 1, ng);
   const int yu = wrap_y(gy - 1, ny);
@@ -186,12 +190,10 @@ __global__ static void f_kernel_group_soa_irregular(
   const int up_cell    = yu * ng + gx;
   const int down_cell  = ydwn * ng + gx;
 
-  /* local m */
   const sunrealtype m1 = y[mx];
   const sunrealtype m2 = y[my];
   const sunrealtype m3 = y[mz];
 
-  /* accumulate only active-neighbor contributions */
   sunrealtype sum_x_h1 = ZERO, sum_y_h1 = ZERO;
   sunrealtype sum_x_h2 = ZERO, sum_y_h2 = ZERO;
   sunrealtype sum_x_h3 = ZERO, sum_y_h3 = ZERO;
@@ -232,17 +234,17 @@ __global__ static void f_kernel_group_soa_irregular(
   const sunrealtype h1 =
       c_che * (sum_x_h1 + sum_y_h1) +
       c_msk[0] * (c_chk * m3 + c_cha) +
-      c_chb * c_nsk[0] * (sum_lr_h1);
+      c_chb * c_nsk[0] * sum_lr_h1;
 
   const sunrealtype h2 =
       c_che * (sum_x_h2 + sum_y_h2) +
       c_msk[1] * (c_chk * m3 + c_cha) +
-      c_chb * c_nsk[1] * (sum_lr_h2);
+      c_chb * c_nsk[1] * sum_lr_h2;
 
   const sunrealtype h3 =
       c_che * (sum_x_h3 + sum_y_h3) +
       c_msk[2] * (c_chk * m3 + c_cha) +
-      c_chb * c_nsk[2] * (sum_lr_h3);
+      c_chb * c_nsk[2] * sum_lr_h3;
 
   const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
 
@@ -259,19 +261,25 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   sunrealtype* ydata    = N_VGetDeviceArrayPointer_Cuda(y);
   sunrealtype* ydotdata = N_VGetDeviceArrayPointer_Cuda(ydot);
 
-  if (BLOCK_X * BLOCK_Y > 1024) {
-    fprintf(stderr, "Invalid block size: BLOCK_X * BLOCK_Y = %d > 1024\n",
-            BLOCK_X * BLOCK_Y);
+  if (BLOCK_SIZE > 1024) {
+    fprintf(stderr, "Invalid BLOCK_SIZE=%d > 1024\n", BLOCK_SIZE);
     return -1;
   }
 
-  dim3 block(BLOCK_X, BLOCK_Y);
-  dim3 grid((udata->ng + block.x - 1) / block.x,
-            (udata->ny + block.y - 1) / block.y);
+  /* zero inactive entries each RHS call */
+  if (udata->n_inactive > 0) {
+    int grid0 = (udata->n_inactive + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    zero_inactive_kernel<<<grid0, BLOCK_SIZE>>>(
+        ydotdata, udata->d_inactive_ids, udata->n_inactive, udata->ncell);
+  }
 
-  f_kernel_group_soa_irregular<<<grid, block>>>(
-      ydata, ydotdata, udata->d_active,
-      udata->ng, udata->ny, udata->ncell);
+  /* compact active-cell launch */
+  if (udata->n_active > 0) {
+    int grid1 = (udata->n_active + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    f_kernel_group_soa_irregular_compact<<<grid1, BLOCK_SIZE>>>(
+        ydata, ydotdata, udata->d_active, udata->d_active_ids,
+        udata->n_active, udata->ng, udata->ny, udata->ncell);
+  }
 
   cudaError_t cuerr = cudaPeekAtLastError();
   if (cuerr != cudaSuccess) {
@@ -303,38 +311,56 @@ static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
          nni, ncfn, netf, nge);
 }
 
-/* Build a circular hole mask on the host */
-static void BuildCircularHoleMask(UserData* udata) {
+/* Build mask and compact lists on host */
+static void BuildCircularHoleMaskAndLists(UserData* udata) {
   const int ng = udata->ng;
   const int ny = udata->ny;
 
   const double cx = HOLE_CENTER_X_FRAC * (double)(ng - 1);
   const double cy = HOLE_CENTER_Y_FRAC * (double)(ny - 1);
-
-  /* correctness-first: radius tied to ny */
   const double radius = HOLE_RADIUS_FRAC_Y * (double)ny;
   const double r2 = radius * radius;
 
-  int active_count = 0;
+  int n_active = 0;
+  int n_inactive = 0;
 
   for (int j = 0; j < ny; ++j) {
     for (int i = 0; i < ng; ++i) {
       const double dx = (double)i - cx;
       const double dy = (double)j - cy;
       const double dist2 = dx * dx + dy * dy;
-
       const int cell = j * ng + i;
 
       if (dist2 <= r2) {
-        udata->h_active[cell] = 0; /* inside hole */
+        udata->h_active[cell] = 0;
+        n_inactive++;
       } else {
-        udata->h_active[cell] = 1; /* active */
-        active_count++;
+        udata->h_active[cell] = 1;
+        n_active++;
       }
     }
   }
 
-  udata->n_active = active_count;
+  udata->n_active = n_active;
+  udata->n_inactive = n_inactive;
+
+  udata->h_active_ids = (int*)malloc((size_t)n_active * sizeof(int));
+  udata->h_inactive_ids = (int*)malloc((size_t)n_inactive * sizeof(int));
+
+  if ((n_active > 0 && udata->h_active_ids == NULL) ||
+      (n_inactive > 0 && udata->h_inactive_ids == NULL)) {
+    fprintf(stderr, "Failed to allocate compact index arrays.\n");
+    exit(EXIT_FAILURE);
+  }
+
+  int ia = 0, ii = 0;
+  for (int cell = 0; cell < udata->ncell; ++cell) {
+    if (udata->h_active[cell]) {
+      udata->h_active_ids[ia++] = cell;
+    } else {
+      udata->h_inactive_ids[ii++] = cell;
+    }
+  }
 }
 
 int main(int argc, char* argv[]) {
@@ -362,8 +388,7 @@ int main(int argc, char* argv[]) {
   cudaEvent_t start, stop;
   float elapsedTime = 0.0f;
 
-  /* problem size */
-  const int nx = 1536;   /* old scalar width */
+  const int nx = 1536;
   const int ny = 128;
 
   if (nx % GROUPSIZE != 0) {
@@ -385,31 +410,58 @@ int main(int argc, char* argv[]) {
   setvbuf(fp, NULL, _IOFBF, 1 << 20);
 #endif
 
-  /* fill user data */
-  udata.nx    = nx;
-  udata.ny    = ny;
-  udata.ng    = ng;
+  udata.nx = nx;
+  udata.ny = ny;
+  udata.ng = ng;
   udata.ncell = ncell;
-  udata.neq   = neq;
-  udata.d_active = NULL;
+  udata.neq = neq;
   udata.h_active = NULL;
+  udata.d_active = NULL;
+  udata.h_active_ids = NULL;
+  udata.d_active_ids = NULL;
+  udata.h_inactive_ids = NULL;
+  udata.d_inactive_ids = NULL;
   udata.n_active = 0;
+  udata.n_inactive = 0;
 
   CHECK_SUNDIALS(SUNContext_Create(SUN_COMM_NULL, &sunctx));
 
-  /* allocate mask */
   udata.h_active = (unsigned char*)malloc((size_t)ncell * sizeof(unsigned char));
   if (udata.h_active == NULL) {
     fprintf(stderr, "Failed to allocate host active mask.\n");
     goto cleanup;
   }
 
+  BuildCircularHoleMaskAndLists(&udata);
+
   CHECK_CUDA(cudaMalloc((void**)&udata.d_active,
                         (size_t)ncell * sizeof(unsigned char)));
 
-  BuildCircularHoleMask(&udata);
+  if (udata.n_active > 0) {
+    CHECK_CUDA(cudaMalloc((void**)&udata.d_active_ids,
+                          (size_t)udata.n_active * sizeof(int)));
+  }
+  if (udata.n_inactive > 0) {
+    CHECK_CUDA(cudaMalloc((void**)&udata.d_inactive_ids,
+                          (size_t)udata.n_inactive * sizeof(int)));
+  }
 
-  printf("\n2D irregular baseline (SoA, dense masked execution)\n\n");
+  CHECK_CUDA(cudaMemcpy(udata.d_active, udata.h_active,
+                        (size_t)ncell * sizeof(unsigned char),
+                        cudaMemcpyHostToDevice));
+
+  if (udata.n_active > 0) {
+    CHECK_CUDA(cudaMemcpy(udata.d_active_ids, udata.h_active_ids,
+                          (size_t)udata.n_active * sizeof(int),
+                          cudaMemcpyHostToDevice));
+  }
+  if (udata.n_inactive > 0) {
+    CHECK_CUDA(cudaMemcpy(udata.d_inactive_ids, udata.h_inactive_ids,
+                          (size_t)udata.n_inactive * sizeof(int),
+                          cudaMemcpyHostToDevice));
+  }
+
+  printf("\n2D irregular compact (SoA, compact active-cell execution)\n\n");
   printf("scalar width nx = %d, rows ny = %d, groups/row = %d, ncell = %d, neq = %d\n",
          nx, ny, ng, ncell, neq);
   printf("periodic BC: x and y\n");
@@ -417,13 +469,12 @@ int main(int argc, char* argv[]) {
          HOLE_CENTER_X_FRAC * (double)(ng - 1),
          HOLE_CENTER_Y_FRAC * (double)(ny - 1),
          HOLE_RADIUS_FRAC_Y * (double)ny);
-  printf("active cells = %d / %d (%.2f%% active)\n",
+  printf("active cells   = %d / %d (%.2f%% active)\n",
          udata.n_active, ncell,
          100.0 * (double)udata.n_active / (double)ncell);
-
-  CHECK_CUDA(cudaMemcpy(udata.d_active, udata.h_active,
-                        (size_t)ncell * sizeof(unsigned char),
-                        cudaMemcpyHostToDevice));
+  printf("inactive cells = %d / %d (%.2f%% inactive)\n",
+         udata.n_inactive, ncell,
+         100.0 * (double)udata.n_inactive / (double)ncell);
 
   y      = N_VNew_Cuda(neq, sunctx);
   abstol = N_VNew_Cuda(neq, sunctx);
@@ -439,7 +490,6 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
 
-  /* Initialize y and abstol in SoA layout */
   for (int j = 0; j < ny; j++) {
     for (int i = 0; i < ng; i++) {
       cell = j * ng + i;
@@ -451,15 +501,8 @@ int main(int argc, char* argv[]) {
       if (udata.h_active[cell]) {
         ydata[mx] = SUN_RCONST(0.0);
         ydata[my] = SUN_RCONST(0.0175);
-
-        /* keep your original left/right domain-wall style init */
-        if (i < ng / 2) {
-          ydata[mz] = SUN_RCONST(0.998);
-        } else {
-          ydata[mz] = SUN_RCONST(-0.998);
-        }
+        ydata[mz] = (i < ng / 2) ? SUN_RCONST(0.998) : SUN_RCONST(-0.998);
       } else {
-        /* inactive cells: fixed zero state */
         ydata[mx] = ZERO;
         ydata[my] = ZERO;
         ydata[mz] = ZERO;
@@ -521,14 +564,12 @@ int main(int argc, char* argv[]) {
       for (jp = 0; jp < ny; jp++) {
         for (ip = 0; ip < ng; ip++) {
           cell_out = jp * ng + ip;
-
           if (udata.h_active[cell_out]) {
             fprintf(fp, "%f %f %f\n",
                     (double)ydata[idx_mx(cell_out, ncell)],
                     (double)ydata[idx_my(cell_out, ncell)],
                     (double)ydata[idx_mz(cell_out, ncell)]);
           } else {
-            /* write zeros for hole cells so visualization keeps grid shape */
             fprintf(fp, "0.0 0.0 0.0\n");
           }
         }
@@ -550,7 +591,12 @@ int main(int argc, char* argv[]) {
 
 cleanup:
   if (udata.d_active) cudaFree(udata.d_active);
+  if (udata.d_active_ids) cudaFree(udata.d_active_ids);
+  if (udata.d_inactive_ids) cudaFree(udata.d_inactive_ids);
+
   if (udata.h_active) free(udata.h_active);
+  if (udata.h_active_ids) free(udata.h_active_ids);
+  if (udata.h_inactive_ids) free(udata.h_inactive_ids);
 
   if (LS) SUNLinSolFree(LS);
   if (NLS) SUNNonlinSolFree(NLS);
