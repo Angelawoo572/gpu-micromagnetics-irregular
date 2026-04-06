@@ -5,11 +5,14 @@ problem: three rate equations:
    dm3/dt = m2*f1 - m1*f2 + g3 - m*g*m3
 
 This program solves the problem with the BDF method using CVODE + CUDA.
-Optimized version:
-  - one CUDA thread per 3-component group (cell)
-  - no global temporary arrays h/mh
+
+SoA version:
+  - one CUDA thread per physical cell
+  - planar SoA layout inside one N_Vector:
+      [mx for all cells][my for all cells][mz for all cells]
+  - no global temporary arrays
   - no __syncthreads()
-  - no cudaDeviceSynchronize() inside every RHS evaluation
+  - no cudaDeviceSynchronize() inside RHS
 */
 
 #include <cvode/cvode.h>
@@ -80,37 +83,55 @@ __constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
 
 /* user data */
 typedef struct {
-  int nx;   /* total scalar width, must be multiple of 3 */
-  int ny;   /* number of rows */
-  int ng;   /* number of 3-component groups per row = nx / 3 */
-  int neq;  /* total number of equations = nx * ny */
+  int nx;      /* old scalar width = 3 * ng */
+  int ny;      /* number of rows */
+  int ng;      /* number of physical cells per row */
+  int ncell;   /* total physical cells = ng * ny */
+  int neq;     /* total equations = 3 * ncell */
 } UserData;
+
+/* SoA indexing helpers */
+__host__ __device__ static inline int idx_mx(int cell, int ncell) {
+  return cell;
+}
+
+__host__ __device__ static inline int idx_my(int cell, int ncell) {
+  return ncell + cell;
+}
+
+__host__ __device__ static inline int idx_mz(int cell, int ncell) {
+  return 2 * ncell + cell;
+}
 
 /*
  * Right-hand-side kernel
  *
  * Mapping:
- *   one thread -> one physical 3-component group (mx,my,mz)
+ *   one thread -> one physical cell
  *
- * Boundary policy preserved in intended form:
- *   - first/last group in x are boundary
+ * Layout:
+ *   y = [mx-plane][my-plane][mz-plane]
+ *
+ * Boundary policy:
+ *   - first/last cell in x are boundary
  *   - first/last row in y are boundary
  *   - boundary derivatives set to zero
  */
-__global__ static void f_kernel_group(const sunrealtype* __restrict__ y,
-                                      sunrealtype* __restrict__ yd,
-                                      int nx, int ny, int ng) {
-  const int gx = blockIdx.x * blockDim.x + threadIdx.x;  // group index in x
-  const int gy = blockIdx.y * blockDim.y + threadIdx.y;  // row index in y
+__global__ static void f_kernel_group_soa(const sunrealtype* __restrict__ y,
+                                          sunrealtype* __restrict__ yd,
+                                          int ng, int ny, int ncell) {
+  const int gx = blockIdx.x * blockDim.x + threadIdx.x;  // x cell index
+  const int gy = blockIdx.y * blockDim.y + threadIdx.y;  // y row index
 
   if (gx >= ng || gy >= ny) return;
 
-  const int base = gy * nx + gx * GROUPSIZE;
-  const int mx = base;
-  const int my = base + 1;
-  const int mz = base + 2;
+  const int cell = gy * ng + gx;
 
-  /* boundary cells: keep zero derivative */
+  const int mx = idx_mx(cell, ncell);
+  const int my = idx_my(cell, ncell);
+  const int mz = idx_mz(cell, ncell);
+
+  /* boundary cells */
   if (gx == 0 || gx == ng - 1 || gy == 0 || gy == ny - 1) {
     yd[mx] = ZERO;
     yd[my] = ZERO;
@@ -118,46 +139,52 @@ __global__ static void f_kernel_group(const sunrealtype* __restrict__ y,
     return;
   }
 
-  /* neighbor bases */
-  const int left  = base - GROUPSIZE;
-  const int right = base + GROUPSIZE;
-  const int up    = base - nx;
-  const int down  = base + nx;
+  const int left_cell  = cell - 1;
+  const int right_cell = cell + 1;
+  const int up_cell    = cell - ng;
+  const int down_cell  = cell + ng;
 
   /* local m */
   const sunrealtype m1 = y[mx];
   const sunrealtype m2 = y[my];
   const sunrealtype m3 = y[mz];
 
+  /* neighbor component indices */
+  const int lx = idx_mx(left_cell,  ncell);
+  const int rx = idx_mx(right_cell, ncell);
+  const int ux = idx_mx(up_cell,    ncell);
+  const int dx = idx_mx(down_cell,  ncell);
+
+  const int ly = idx_my(left_cell,  ncell);
+  const int ry = idx_my(right_cell, ncell);
+  const int uy = idx_my(up_cell,    ncell);
+  const int dy = idx_my(down_cell,  ncell);
+
+  const int lz = idx_mz(left_cell,  ncell);
+  const int rz = idx_mz(right_cell, ncell);
+  const int uz = idx_mz(up_cell,    ncell);
+  const int dz = idx_mz(down_cell,  ncell);
+
   /*
-   * Compute h for each component using the same formula as your original code:
-   *
-   * h[tid] = che*(left + right + up + down)
-   *        + msk[comp]*(chk*m3 + cha)
-   *        + chb*nsk[comp]*(left + right)
-   *
-   * comp=0 -> x component gets chb*(left_x + right_x)
-   * comp=1 -> y component gets neither extra term
-   * comp=2 -> z component gets chk*m3 + cha
+   * Same formula as packed version, just with SoA indexing.
    */
   const sunrealtype h1 =
-      c_che * (y[left] + y[right] + y[up] + y[down]) +
+      c_che * (y[lx] + y[rx] + y[ux] + y[dx]) +
       c_msk[0] * (c_chk * m3 + c_cha) +
-      c_chb * c_nsk[0] * (y[left] + y[right]);
+      c_chb * c_nsk[0] * (y[lx] + y[rx]);
 
   const sunrealtype h2 =
-      c_che * (y[left + 1] + y[right + 1] + y[up + 1] + y[down + 1]) +
+      c_che * (y[ly] + y[ry] + y[uy] + y[dy]) +
       c_msk[1] * (c_chk * m3 + c_cha) +
-      c_chb * c_nsk[1] * (y[left + 1] + y[right + 1]);
+      c_chb * c_nsk[1] * (y[ly] + y[ry]);
 
   const sunrealtype h3 =
-      c_che * (y[left + 2] + y[right + 2] + y[up + 2] + y[down + 2]) +
+      c_che * (y[lz] + y[rz] + y[uz] + y[dz]) +
       c_msk[2] * (c_chk * m3 + c_cha) +
-      c_chb * c_nsk[2] * (y[left + 2] + y[right + 2]);
+      c_chb * c_nsk[2] * (y[lz] + y[rz]);
 
   const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
 
-  /* same cyclic cross-product-like update as original code */
   yd[mx] = c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1);
   yd[my] = c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2);
   yd[mz] = c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3);
@@ -165,29 +192,25 @@ __global__ static void f_kernel_group(const sunrealtype* __restrict__ y,
 
 /* RHS wrapper for CVODE */
 static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
-  (void)t;  // unused
+  (void)t;
 
   UserData* udata = (UserData*)user_data;
   sunrealtype* ydata    = N_VGetDeviceArrayPointer_Cuda(y);
   sunrealtype* ydotdata = N_VGetDeviceArrayPointer_Cuda(ydot);
 
-  /* 2D mapping over physical groups */
-  // dim3 block(32, 8);  // 256 threads/block, warp-friendly x dimension
-  // dim3 grid((udata->ng + block.x - 1) / block.x,
-  //           (udata->ny + block.y - 1) / block.y);
-  dim3 block(BLOCK_X, BLOCK_Y);
-  dim3 grid((udata->ng + block.x - 1) / block.x,
-            (udata->ny + block.y - 1) / block.y);
   if (BLOCK_X * BLOCK_Y > 1024) {
     fprintf(stderr, "Invalid block size: BLOCK_X * BLOCK_Y = %d > 1024\n",
             BLOCK_X * BLOCK_Y);
     return -1;
   }
 
-  f_kernel_group<<<grid, block>>>(ydata, ydotdata, udata->nx, udata->ny,
-                                  udata->ng);
+  dim3 block(BLOCK_X, BLOCK_Y);
+  dim3 grid((udata->ng + block.x - 1) / block.x,
+            (udata->ny + block.y - 1) / block.y);
 
-  /* launch error check only; avoid device-wide sync in hot RHS path */
+  f_kernel_group_soa<<<grid, block>>>(ydata, ydotdata,
+                                      udata->ng, udata->ny, udata->ncell);
+
   cudaError_t cuerr = cudaPeekAtLastError();
   if (cuerr != cudaSuccess) {
     fprintf(stderr, ">>> ERROR in f: kernel launch failed: %s\n",
@@ -202,7 +225,7 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
  * Get and print final statistics
  */
 static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
-  (void)LS;  // unused in stats collection below
+  (void)LS;
 
   long int nst, nfe, nsetups, nni, ncfn, netf, nge;
 
@@ -234,16 +257,19 @@ int main(int argc, char* argv[]) {
   SUNNonlinearSolver NLS = NULL;
   void* cvode_mem = NULL;
 
-  int retval, iout;
-  int NOUT;
+  int retval, iout, NOUT;
   UserData udata;
 
-  int idx, ip, jp, kp;
+  int cell;
+#if ENABLE_OUTPUT
+  int jp, ip, cell_out;
+#endif
+
   cudaEvent_t start, stop;
   float elapsedTime = 0.0f;
 
   /* problem size */
-  const int nx = 9000;
+  const int nx = 9000;       /* old scalar width */
   const int ny = 128;
 
   if (nx % GROUPSIZE != 0) {
@@ -251,10 +277,11 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  const int ng  = nx / GROUPSIZE;
-  const int neq = nx * ny;
+  const int ng    = nx / GROUPSIZE;
+  const int ncell = ng * ny;
+  const int neq   = 3 * ncell;
 
-    FILE* fp = NULL;
+  FILE* fp = NULL;
 #if ENABLE_OUTPUT
   fp = fopen("output.txt", "w");
   if (fp == NULL) {
@@ -265,58 +292,63 @@ int main(int argc, char* argv[]) {
 #endif
 
   /* fill user data */
-  udata.nx  = nx;
-  udata.ny  = ny;
-  udata.ng  = ng;
-  udata.neq = neq;
+  udata.nx    = nx;
+  udata.ny    = ny;
+  udata.ng    = ng;
+  udata.ncell = ncell;
+  udata.neq   = neq;
 
-  /* Create SUNDIALS context */
   CHECK_SUNDIALS(SUNContext_Create(SUN_COMM_NULL, &sunctx));
 
-  /* Allocate CUDA vectors */
   y      = N_VNew_Cuda(neq, sunctx);
   abstol = N_VNew_Cuda(neq, sunctx);
   if (y == NULL || abstol == NULL) {
     fprintf(stderr, "Failed to allocate N_Vector_Cuda objects.\n");
+#if ENABLE_OUTPUT
     fclose(fp);
+#endif
     return 1;
   }
 
-  /* Get host pointers */
   ydata       = N_VGetHostArrayPointer_Cuda(y);
   abstol_data = N_VGetHostArrayPointer_Cuda(abstol);
   if (ydata == NULL || abstol_data == NULL) {
     fprintf(stderr, "Failed to get host array pointers from N_Vector_Cuda.\n");
+#if ENABLE_OUTPUT
     fclose(fp);
+#endif
     N_VDestroy(y);
     N_VDestroy(abstol);
     return 1;
   }
 
-  /* Initialize y and abstol on host */
+  /* Initialize y and abstol in SoA layout */
   for (int j = 0; j < ny; j++) {
-    for (int i = 0; i < nx; i += GROUPSIZE) {
-      idx = i + nx * j;
+    for (int i = 0; i < ng; i++) {
+      cell = j * ng + i;
 
-      ydata[idx]     = SUN_RCONST(0.0);
-      abstol_data[idx] = ATOL1;
+      const int mx = idx_mx(cell, ncell);
+      const int my = idx_my(cell, ncell);
+      const int mz = idx_mz(cell, ncell);
 
-      ydata[idx + 1]   = SUN_RCONST(0.0175);
-      abstol_data[idx + 1] = ATOL2;
+      ydata[mx] = SUN_RCONST(0.0);
+      ydata[my] = SUN_RCONST(0.0175);
 
-      if (i < nx / 2) {
-        ydata[idx + 2] = SUN_RCONST(0.998);
+      if (i < ng / 2) {
+        ydata[mz] = SUN_RCONST(0.998);
       } else {
-        ydata[idx + 2] = SUN_RCONST(-0.998);
+        ydata[mz] = SUN_RCONST(-0.998);
       }
-      abstol_data[idx + 2] = ATOL3;
+
+      abstol_data[mx] = ATOL1;
+      abstol_data[my] = ATOL2;
+      abstol_data[mz] = ATOL3;
     }
   }
 
   N_VCopyToDevice_Cuda(y);
   N_VCopyToDevice_Cuda(abstol);
 
-  /* Create and initialize CVODE */
   cvode_mem = CVodeCreate(CV_BDF, sunctx);
   if (cvode_mem == NULL) {
     fprintf(stderr, "CVodeCreate failed.\n");
@@ -327,7 +359,6 @@ int main(int argc, char* argv[]) {
   CHECK_SUNDIALS(CVodeSetUserData(cvode_mem, &udata));
   CHECK_SUNDIALS(CVodeSVtolerances(cvode_mem, RTOL, abstol));
 
-  /* nonlinear + linear solvers */
   NLS = SUNNonlinSol_Newton(y, sunctx);
   if (NLS == NULL) {
     fprintf(stderr, "SUNNonlinSol_Newton failed.\n");
@@ -342,12 +373,11 @@ int main(int argc, char* argv[]) {
   }
   CHECK_SUNDIALS(CVodeSetLinearSolver(cvode_mem, LS, NULL));
 
-  printf("\nGroup of independent 3-species kinetics problems\n\n");
-  printf("scalar width nx = %d, rows ny = %d, groups/row = %d, neq = %d\n",
-         nx, ny, ng, neq);
+  printf("\nGroup of independent 3-species kinetics problems (SoA)\n\n");
+  printf("scalar width nx = %d, rows ny = %d, groups/row = %d, ncell = %d, neq = %d\n",
+         nx, ny, ng, ncell, neq);
 
   NOUT = (int)(ttotal / T1 + SUN_RCONST(0.5));
-
   iout = 0;
 
   CHECK_CUDA(cudaEventCreate(&start));
@@ -361,24 +391,24 @@ int main(int argc, char* argv[]) {
       break;
     }
 
-    #if ENABLE_OUTPUT
-        if (iout % 50 == 0) {
-          N_VCopyFromDevice_Cuda(y);
-          ydata = N_VGetHostArrayPointer_Cuda(y);
+#if ENABLE_OUTPUT
+    if (iout % 50 == 0) {
+      N_VCopyFromDevice_Cuda(y);
+      ydata = N_VGetHostArrayPointer_Cuda(y);
 
-          fprintf(fp, "%f %d %d\n", (double)t, nx, ny);
-          for (jp = 0; jp < ny; jp++) {
-            for (ip = 0; ip < nx - 2; ip += GROUPSIZE) {
-              kp = jp * nx + ip;
-              fprintf(fp, "%f %f %f\n",
-                      (double)ydata[kp],
-                      (double)ydata[kp + 1],
-                      (double)ydata[kp + 2]);
-            }
-          }
-          fprintf(fp, "\n");
+      fprintf(fp, "%f %d %d\n", (double)t, nx, ny);
+      for (jp = 0; jp < ny; jp++) {
+        for (ip = 0; ip < ng; ip++) {
+          cell_out = jp * ng + ip;
+          fprintf(fp, "%f %f %f\n",
+                  (double)ydata[idx_mx(cell_out, ncell)],
+                  (double)ydata[idx_my(cell_out, ncell)],
+                  (double)ydata[idx_mz(cell_out, ncell)]);
         }
-    #endif
+      }
+      fprintf(fp, "\n");
+    }
+#endif
 
     iout++;
     tout += T1;
@@ -398,7 +428,9 @@ cleanup:
   if (y) N_VDestroy(y);
   if (abstol) N_VDestroy(abstol);
   if (sunctx) SUNContext_Free(&sunctx);
+#if ENABLE_OUTPUT
   if (fp) fclose(fp);
+#endif
 
   return 0;
 }
