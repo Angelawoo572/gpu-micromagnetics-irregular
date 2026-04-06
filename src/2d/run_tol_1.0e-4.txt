@@ -1,0 +1,8 @@
+
+Group of independent 3-species kinetics problems (SoA)
+
+scalar width nx = 9000, rows ny = 128, groups/row = 3000, ncell = 384000, neq = 1152000
+GPU simulation took 13415.652 ms
+
+Final Statistics:
+nst = 6783   nfe  = 7925   nsetups = 0      nni = 7922   ncfn = 553    netf = 1      nge = 0

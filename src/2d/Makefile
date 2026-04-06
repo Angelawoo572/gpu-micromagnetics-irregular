@@ -23,13 +23,18 @@ PRINT ?= 0
 BLOCK_X ?= 16
 BLOCK_Y ?= 8
 
+RTOL_VAL ?= 1.0e-4
+ATOL_VAL ?= 1.0e-4
+
 ifeq ($(BUILD),debug)
   NVCC_FLAGS := $(CUDA_ARCH) -G -g -lineinfo -Xcompiler -O0
 else
   NVCC_FLAGS := $(CUDA_ARCH) -O3 -lineinfo --use_fast_math
 endif
 
-NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y)
+NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
+              -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) \
+              -DRTOL_VAL=$(RTOL_VAL) -DATOL_VAL=$(ATOL_VAL)
 
 TARGET := 2d
 SRC := 2d.cu
@@ -50,6 +55,7 @@ NCU_FLAGS ?= --set roofline -o ncu_$(TARGET)
 
 .PHONY: all run run-debug build-debug build-release \
         run-print run-noprint \
+        sweep-block sweep-tol \
         profile profile-light profile-ext stats \
         export-csv export-sqlite ui compute clean reallyclean reports
 
@@ -94,6 +100,15 @@ sweep-block:
 	      LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_bx$${bx}_by$${by}.txt; \
 	    fi; \
 	  done; \
+	done
+
+sweep-tol:
+	@for tol in 1.0e-4 1.0e-5 1.0e-6; do \
+	  echo "========================================"; \
+	  echo "Testing RTOL_VAL=$$tol ATOL_VAL=$$tol BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y)"; \
+	  $(MAKE) clean >/dev/null 2>&1; \
+	  $(MAKE) BUILD=release PRINT=0 BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y) RTOL_VAL=$$tol ATOL_VAL=$$tol >/dev/null && \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_tol_$${tol}.txt; \
 	done
 
 # ====== Nsight Systems ======

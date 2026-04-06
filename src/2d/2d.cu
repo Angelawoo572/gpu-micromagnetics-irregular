@@ -27,10 +27,18 @@ SoA version:
 
 /* Problem Constants */
 #define GROUPSIZE 3
-#define RTOL  SUN_RCONST(1.0e-5)
-#define ATOL1 SUN_RCONST(1.0e-5)
-#define ATOL2 SUN_RCONST(1.0e-5)
-#define ATOL3 SUN_RCONST(1.0e-5)
+#ifndef RTOL_VAL
+#define RTOL_VAL 1.0e-5
+#endif
+
+#ifndef ATOL_VAL
+#define ATOL_VAL 1.0e-5
+#endif
+
+#define RTOL  SUN_RCONST(RTOL_VAL)
+#define ATOL1 SUN_RCONST(ATOL_VAL)
+#define ATOL2 SUN_RCONST(ATOL_VAL)
+#define ATOL3 SUN_RCONST(ATOL_VAL)
 #define T0    SUN_RCONST(0.0)
 #define T1    SUN_RCONST(0.1)
 #define ZERO  SUN_RCONST(0.0)
