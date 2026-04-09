@@ -15,6 +15,11 @@
  *   - transition region rotates continuously
  *   - in-plane component is radial (Néel-like)
  *
+ * Output policy:
+ *   - write initial frame at t = 0
+ *   - dense output during early transient
+ *   - sparse output after that
+ *
  * SoA layout in one N_Vector:
  *   [mx for all cells][my for all cells][mz for all cells]
  */
@@ -48,6 +53,10 @@
 #define T0    SUN_RCONST(0.0)
 #define T1    SUN_RCONST(0.1)
 #define ZERO  SUN_RCONST(0.0)
+
+#ifndef T_TOTAL
+#define T_TOTAL 1000.0
+#endif
 
 #ifndef ENABLE_OUTPUT
 #define ENABLE_OUTPUT 0
@@ -92,6 +101,22 @@
 /* tiny bias to avoid exact singularity at center */
 #ifndef TEXTURE_EPS
 #define TEXTURE_EPS 1.0e-12
+#endif
+
+/* output schedule:
+ * write more densely before EARLY_SAVE_UNTIL,
+ * then more sparsely afterward.
+ */
+#ifndef EARLY_SAVE_UNTIL
+#define EARLY_SAVE_UNTIL 80.0
+#endif
+
+#ifndef EARLY_SAVE_EVERY
+#define EARLY_SAVE_EVERY 5
+#endif
+
+#ifndef LATE_SAVE_EVERY
+#define LATE_SAVE_EVERY 100
 #endif
 
 /* typed constant memory */
@@ -287,6 +312,36 @@ static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
          nni, ncfn, netf, nge);
 }
 
+#if ENABLE_OUTPUT
+static void WriteFrame(FILE* fp,
+                       sunrealtype t,
+                       int nx, int ny, int ng, int ncell,
+                       N_Vector y) {
+  N_VCopyFromDevice_Cuda(y);
+  sunrealtype* ydata = N_VGetHostArrayPointer_Cuda(y);
+
+  fprintf(fp, "%f %d %d\n", (double)t, nx, ny);
+  for (int jp = 0; jp < ny; jp++) {
+    for (int ip = 0; ip < ng; ip++) {
+      int cell_out = jp * ng + ip;
+      fprintf(fp, "%f %f %f\n",
+              (double)ydata[idx_mx(cell_out, ncell)],
+              (double)ydata[idx_my(cell_out, ncell)],
+              (double)ydata[idx_mz(cell_out, ncell)]);
+    }
+  }
+  fprintf(fp, "\n");
+}
+
+static int ShouldWriteFrame(long int iout, sunrealtype t) {
+  if (t <= SUN_RCONST(EARLY_SAVE_UNTIL)) {
+    return (iout % EARLY_SAVE_EVERY) == 0;
+  } else {
+    return (iout % LATE_SAVE_EVERY) == 0;
+  }
+}
+#endif
+
 int main(int argc, char* argv[]) {
   (void)argc;
   (void)argv;
@@ -294,26 +349,24 @@ int main(int argc, char* argv[]) {
   SUNContext sunctx = NULL;
   sunrealtype *ydata = NULL, *abstol_data = NULL;
   sunrealtype t = T0, tout = T1;
-  sunrealtype ttotal = SUN_RCONST(1000.0);
+  sunrealtype ttotal = SUN_RCONST(T_TOTAL);
 
   N_Vector y = NULL, abstol = NULL;
   SUNLinearSolver LS = NULL;
   SUNNonlinearSolver NLS = NULL;
   void* cvode_mem = NULL;
 
-  int retval, iout, NOUT;
+  int retval;
+  long int iout, NOUT;
   UserData udata;
 
   int cell;
-#if ENABLE_OUTPUT
-  int jp, ip, cell_out;
-#endif
 
   cudaEvent_t start, stop;
   float elapsedTime = 0.0f;
 
   /* problem size */
-  const int nx = 900;
+  const int nx = 600;
   const int ny = 128;
 
   if (nx % GROUPSIZE != 0) {
@@ -339,8 +392,6 @@ int main(int argc, char* argv[]) {
   const double cx = CIRCLE_CENTER_X_FRAC * (double)(ng - 1);
   const double cy = CIRCLE_CENTER_Y_FRAC * (double)(ny - 1);
   const double radius = CIRCLE_RADIUS_FRAC_Y * (double)ny;
-  const double r2 = radius * radius;
-  (void)r2; /* radius still useful conceptually even though init uses rho */
 
   /* fill user data */
   udata.nx    = nx;
@@ -452,20 +503,9 @@ int main(int argc, char* argv[]) {
 
   N_VCopyToDevice_Cuda(y);
   N_VCopyToDevice_Cuda(abstol);
+
 #if ENABLE_OUTPUT
-  {
-    fprintf(fp, "%f %d %d\n", (double)T0, nx, ny);
-    for (int jp = 0; jp < ny; jp++) {
-      for (int ip = 0; ip < ng; ip++) {
-        int cell_out = jp * ng + ip;
-        fprintf(fp, "%f %f %f\n",
-                (double)ydata[idx_mx(cell_out, ncell)],
-                (double)ydata[idx_my(cell_out, ncell)],
-                (double)ydata[idx_mz(cell_out, ncell)]);
-      }
-    }
-    fprintf(fp, "\n");
-  }
+  WriteFrame(fp, T0, nx, ny, ng, ncell, y);
 #endif
 
   cvode_mem = CVodeCreate(CV_BDF, sunctx);
@@ -498,11 +538,17 @@ int main(int argc, char* argv[]) {
   printf("periodic BC: x and y\n");
   printf("circle center = (%.2f, %.2f), radius = %.2f cells\n", cx, cy, radius);
   printf("smooth radial texture init\n");
-  printf("core mz    = %.4f\n", (double)TEXTURE_CORE_MZ);
-  printf("outer mz   = %.4f\n", (double)TEXTURE_OUTER_MZ);
-  printf("width frac = %.4f\n", (double)TEXTURE_WIDTH_FRAC);
+  printf("core mz         = %.4f\n", (double)TEXTURE_CORE_MZ);
+  printf("outer mz        = %.4f\n", (double)TEXTURE_OUTER_MZ);
+  printf("width frac      = %.4f\n", (double)TEXTURE_WIDTH_FRAC);
+  printf("T_TOTAL         = %.2f\n", (double)T_TOTAL);
+#if ENABLE_OUTPUT
+  printf("EARLY_SAVE_UNTIL = %.2f\n", (double)EARLY_SAVE_UNTIL);
+  printf("EARLY_SAVE_EVERY = %d\n", EARLY_SAVE_EVERY);
+  printf("LATE_SAVE_EVERY  = %d\n", LATE_SAVE_EVERY);
+#endif
 
-  NOUT = (int)(ttotal / T1 + SUN_RCONST(0.5));
+  NOUT = (long int)(ttotal / T1 + SUN_RCONST(0.5));
   iout = 0;
 
   CHECK_CUDA(cudaEventCreate(&start));
@@ -512,26 +558,13 @@ int main(int argc, char* argv[]) {
   while (iout < NOUT) {
     retval = CVode(cvode_mem, tout, y, &t, CV_NORMAL);
     if (retval != CV_SUCCESS) {
-      fprintf(stderr, "CVode error at output %d: retval = %d\n", iout, retval);
+      fprintf(stderr, "CVode error at output %ld: retval = %d\n", iout, retval);
       break;
     }
 
 #if ENABLE_OUTPUT
-    if (iout % 50 == 0) {
-      N_VCopyFromDevice_Cuda(y);
-      ydata = N_VGetHostArrayPointer_Cuda(y);
-
-      fprintf(fp, "%f %d %d\n", (double)t, nx, ny);
-      for (jp = 0; jp < ny; jp++) {
-        for (ip = 0; ip < ng; ip++) {
-          cell_out = jp * ng + ip;
-          fprintf(fp, "%f %f %f\n",
-                  (double)ydata[idx_mx(cell_out, ncell)],
-                  (double)ydata[idx_my(cell_out, ncell)],
-                  (double)ydata[idx_mz(cell_out, ncell)]);
-        }
-      }
-      fprintf(fp, "\n");
+    if (ShouldWriteFrame(iout + 1, t)) {
+      WriteFrame(fp, t, nx, ny, ng, ncell, y);
     }
 #endif
 

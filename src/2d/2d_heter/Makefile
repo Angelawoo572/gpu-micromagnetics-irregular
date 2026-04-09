@@ -26,15 +26,22 @@ BLOCK_Y ?= 8
 
 RTOL_VAL ?= 1.0e-4
 ATOL_VAL ?= 1.0e-4
+T_TOTAL  ?= 1000.0
 
-# ====== Periodic circle-init params ======
+# ====== Periodic smooth-texture params ======
 CIRCLE_CENTER_X_FRAC ?= 0.50
 CIRCLE_CENTER_Y_FRAC ?= 0.50
 CIRCLE_RADIUS_FRAC_Y ?= 0.22
 
-INIT_MY ?= 0.0175
-INIT_MZ_INSIDE ?= -0.998
-INIT_MZ_OUTSIDE ?= 0.998
+TEXTURE_CORE_MZ   ?= -0.998
+TEXTURE_OUTER_MZ  ?= 0.998
+TEXTURE_WIDTH_FRAC ?= 0.35
+TEXTURE_EPS       ?= 1.0e-12
+
+# ====== Output schedule ======
+EARLY_SAVE_UNTIL ?= 80.0
+EARLY_SAVE_EVERY ?= 5
+LATE_SAVE_EVERY  ?= 100
 
 ifeq ($(BUILD),debug)
   NVCC_FLAGS := $(CUDA_ARCH) -G -g -lineinfo -Xcompiler -O0
@@ -45,12 +52,17 @@ endif
 NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) \
               -DRTOL_VAL=$(RTOL_VAL) -DATOL_VAL=$(ATOL_VAL) \
+              -DT_TOTAL=$(T_TOTAL) \
               -DCIRCLE_CENTER_X_FRAC=$(CIRCLE_CENTER_X_FRAC) \
               -DCIRCLE_CENTER_Y_FRAC=$(CIRCLE_CENTER_Y_FRAC) \
               -DCIRCLE_RADIUS_FRAC_Y=$(CIRCLE_RADIUS_FRAC_Y) \
-              -DINIT_MY=$(INIT_MY) \
-              -DINIT_MZ_INSIDE=$(INIT_MZ_INSIDE) \
-              -DINIT_MZ_OUTSIDE=$(INIT_MZ_OUTSIDE)
+              -DTEXTURE_CORE_MZ=$(TEXTURE_CORE_MZ) \
+              -DTEXTURE_OUTER_MZ=$(TEXTURE_OUTER_MZ) \
+              -DTEXTURE_WIDTH_FRAC=$(TEXTURE_WIDTH_FRAC) \
+              -DTEXTURE_EPS=$(TEXTURE_EPS) \
+              -DEARLY_SAVE_UNTIL=$(EARLY_SAVE_UNTIL) \
+              -DEARLY_SAVE_EVERY=$(EARLY_SAVE_EVERY) \
+              -DLATE_SAVE_EVERY=$(LATE_SAVE_EVERY)
 
 # ====== Target ======
 TARGET := 2d_p
@@ -139,12 +151,14 @@ sweep-circle:
 	  $(MAKE) BUILD=release PRINT=0 \
 	    BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y) \
 	    RTOL_VAL=$(RTOL_VAL) ATOL_VAL=$(ATOL_VAL) \
+	    T_TOTAL=$(T_TOTAL) \
 	    CIRCLE_CENTER_X_FRAC=$(CIRCLE_CENTER_X_FRAC) \
 	    CIRCLE_CENTER_Y_FRAC=$(CIRCLE_CENTER_Y_FRAC) \
 	    CIRCLE_RADIUS_FRAC_Y=$$r \
-	    INIT_MY=$(INIT_MY) \
-	    INIT_MZ_INSIDE=$(INIT_MZ_INSIDE) \
-	    INIT_MZ_OUTSIDE=$(INIT_MZ_OUTSIDE) >/dev/null && \
+	    TEXTURE_CORE_MZ=$(TEXTURE_CORE_MZ) \
+	    TEXTURE_OUTER_MZ=$(TEXTURE_OUTER_MZ) \
+	    TEXTURE_WIDTH_FRAC=$(TEXTURE_WIDTH_FRAC) \
+	    TEXTURE_EPS=$(TEXTURE_EPS) >/dev/null && \
 	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_circle_r_$${r}.txt; \
 	done
 
@@ -210,12 +224,17 @@ show-config:
 	@echo "BLOCK_Y               = $(BLOCK_Y)"
 	@echo "RTOL_VAL              = $(RTOL_VAL)"
 	@echo "ATOL_VAL              = $(ATOL_VAL)"
+	@echo "T_TOTAL               = $(T_TOTAL)"
 	@echo "CIRCLE_CENTER_X_FRAC  = $(CIRCLE_CENTER_X_FRAC)"
 	@echo "CIRCLE_CENTER_Y_FRAC  = $(CIRCLE_CENTER_Y_FRAC)"
 	@echo "CIRCLE_RADIUS_FRAC_Y  = $(CIRCLE_RADIUS_FRAC_Y)"
-	@echo "INIT_MY               = $(INIT_MY)"
-	@echo "INIT_MZ_INSIDE        = $(INIT_MZ_INSIDE)"
-	@echo "INIT_MZ_OUTSIDE       = $(INIT_MZ_OUTSIDE)"
+	@echo "TEXTURE_CORE_MZ       = $(TEXTURE_CORE_MZ)"
+	@echo "TEXTURE_OUTER_MZ      = $(TEXTURE_OUTER_MZ)"
+	@echo "TEXTURE_WIDTH_FRAC    = $(TEXTURE_WIDTH_FRAC)"
+	@echo "TEXTURE_EPS           = $(TEXTURE_EPS)"
+	@echo "EARLY_SAVE_UNTIL      = $(EARLY_SAVE_UNTIL)"
+	@echo "EARLY_SAVE_EVERY      = $(EARLY_SAVE_EVERY)"
+	@echo "LATE_SAVE_EVERY       = $(LATE_SAVE_EVERY)"
 	@echo "PROFILE_OUT           = $(PROFILE_OUT)"
 
 # ====== Clean ======
