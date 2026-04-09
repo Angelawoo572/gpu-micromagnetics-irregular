@@ -27,17 +27,14 @@ BLOCK_Y ?= 8
 RTOL_VAL ?= 1.0e-4
 ATOL_VAL ?= 1.0e-4
 
-# ====== Growing circle params (NEW) ======
+# ====== Periodic circle-init params ======
 CIRCLE_CENTER_X_FRAC ?= 0.50
 CIRCLE_CENTER_Y_FRAC ?= 0.50
+CIRCLE_RADIUS_FRAC_Y ?= 0.22
 
-R0_FRAC_Y ?= 0.10
-R_GROWTH_FRAC_Y_PER_T ?= 0.0002
-WALL_WIDTH_FRAC_Y ?= 0.06
-SEED_AMP ?= 0.20
-
-INIT_MY ?= 0.0
-T_TOTAL ?= 1000.0
+INIT_MY ?= 0.0175
+INIT_MZ_INSIDE ?= -0.998
+INIT_MZ_OUTSIDE ?= 0.998
 
 ifeq ($(BUILD),debug)
   NVCC_FLAGS := $(CUDA_ARCH) -G -g -lineinfo -Xcompiler -O0
@@ -45,18 +42,15 @@ else
   NVCC_FLAGS := $(CUDA_ARCH) -O3 -lineinfo --use_fast_math
 endif
 
-# ====== Pass macros ======
 NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) \
               -DRTOL_VAL=$(RTOL_VAL) -DATOL_VAL=$(ATOL_VAL) \
               -DCIRCLE_CENTER_X_FRAC=$(CIRCLE_CENTER_X_FRAC) \
               -DCIRCLE_CENTER_Y_FRAC=$(CIRCLE_CENTER_Y_FRAC) \
-              -DR0_FRAC_Y=$(R0_FRAC_Y) \
-              -DR_GROWTH_FRAC_Y_PER_T=$(R_GROWTH_FRAC_Y_PER_T) \
-              -DWALL_WIDTH_FRAC_Y=$(WALL_WIDTH_FRAC_Y) \
-              -DSEED_AMP=$(SEED_AMP) \
+              -DCIRCLE_RADIUS_FRAC_Y=$(CIRCLE_RADIUS_FRAC_Y) \
               -DINIT_MY=$(INIT_MY) \
-              -DT_TOTAL=$(T_TOTAL)
+              -DINIT_MZ_INSIDE=$(INIT_MZ_INSIDE) \
+              -DINIT_MZ_OUTSIDE=$(INIT_MZ_OUTSIDE)
 
 # ====== Target ======
 TARGET := 2d_p
@@ -79,7 +73,7 @@ NCU_FLAGS ?= --set roofline -o ncu_$(TARGET)
 
 .PHONY: all run run-debug build-debug build-release \
         run-print run-noprint \
-        sweep-block sweep-tol sweep-growth \
+        sweep-block sweep-tol sweep-circle \
         profile profile-light profile-ext stats \
         export-csv export-sqlite ui compute \
         show-config clean reallyclean reports
@@ -114,8 +108,6 @@ run-noprint:
 	$(MAKE) run PRINT=0
 
 # ====== Parameter sweeps ======
-
-# block tuning
 sweep-block:
 	@for bx in 32 16; do \
 	  for by in 4 8 16; do \
@@ -125,74 +117,115 @@ sweep-block:
 	      echo "Testing BLOCK_X=$$bx BLOCK_Y=$$by"; \
 	      $(MAKE) clean >/dev/null 2>&1; \
 	      $(MAKE) BUILD=release PRINT=0 BLOCK_X=$$bx BLOCK_Y=$$by >/dev/null && \
-	      LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) | tee run_bx$${bx}_by$${by}.txt; \
+	      LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_bx$${bx}_by$${by}.txt; \
 	    fi; \
 	  done; \
 	done
 
-# tolerance sweep
 sweep-tol:
 	@for tol in 1.0e-4 1.0e-5 1.0e-6; do \
 	  echo "========================================"; \
-	  echo "Testing tol=$$tol"; \
+	  echo "Testing RTOL_VAL=$$tol ATOL_VAL=$$tol BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y)"; \
 	  $(MAKE) clean >/dev/null 2>&1; \
-	  $(MAKE) BUILD=release PRINT=0 RTOL_VAL=$$tol ATOL_VAL=$$tol >/dev/null && \
-	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) | tee run_tol_$${tol}.txt; \
+	  $(MAKE) BUILD=release PRINT=0 BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y) RTOL_VAL=$$tol ATOL_VAL=$$tol >/dev/null && \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_tol_$${tol}.txt; \
 	done
 
-# ⭐ NEW: growth sweep（最重要）
-sweep-growth:
-	@for gr in 0.0001 0.0002 0.0004 0.0008; do \
+sweep-circle:
+	@for r in 0.12 0.18 0.22 0.28 0.34; do \
 	  echo "========================================"; \
-	  echo "Testing growth=$$gr"; \
+	  echo "Testing CIRCLE_RADIUS_FRAC_Y=$$r"; \
 	  $(MAKE) clean >/dev/null 2>&1; \
 	  $(MAKE) BUILD=release PRINT=0 \
-	    R_GROWTH_FRAC_Y_PER_T=$$gr \
-	    R0_FRAC_Y=$(R0_FRAC_Y) \
-	    WALL_WIDTH_FRAC_Y=$(WALL_WIDTH_FRAC_Y) \
-	    SEED_AMP=$(SEED_AMP) >/dev/null && \
-	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) | tee run_growth_$${gr}.txt; \
+	    BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y) \
+	    RTOL_VAL=$(RTOL_VAL) ATOL_VAL=$(ATOL_VAL) \
+	    CIRCLE_CENTER_X_FRAC=$(CIRCLE_CENTER_X_FRAC) \
+	    CIRCLE_CENTER_Y_FRAC=$(CIRCLE_CENTER_Y_FRAC) \
+	    CIRCLE_RADIUS_FRAC_Y=$$r \
+	    INIT_MY=$(INIT_MY) \
+	    INIT_MZ_INSIDE=$(INIT_MZ_INSIDE) \
+	    INIT_MZ_OUTSIDE=$(INIT_MZ_OUTSIDE) >/dev/null && \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_circle_r_$${r}.txt; \
 	done
 
 # ====== Nsight Systems ======
 profile: $(TARGET)
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
-	$(NSYS) $(NSYS_FLAGS_STD) ./$(TARGET)
+	$(NSYS) $(NSYS_FLAGS_STD) ./$(TARGET) $(ARGS)
 	@echo "Generated: $(PROFILE_OUT).nsys-rep"
 
 profile-light: $(TARGET)
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
-	$(NSYS) $(NSYS_FLAGS_LIGHT) ./$(TARGET)
+	$(NSYS) $(NSYS_FLAGS_LIGHT) ./$(TARGET) $(ARGS)
+	@echo "Generated: $(PROFILE_OUT).nsys-rep"
 
 profile-ext: $(TARGET)
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
-	$(NSYS) $(NSYS_FLAGS_EXT) ./$(TARGET)
+	$(NSYS) $(NSYS_FLAGS_EXT) ./$(TARGET) $(ARGS)
+	@echo "Generated: $(PROFILE_OUT).nsys-rep"
 
 # ====== Stats ======
 stats:
-	nsys stats --report cuda_api_sum,cuda_gpu_kern_sum $(PROFILE_OUT).nsys-rep > nsys_report.txt
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: $(PROFILE_OUT).nsys-rep not found. Run 'make profile' first."; exit 1)
+	nsys stats --report cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum $(PROFILE_OUT).nsys-rep > nsys_report.txt
+	@echo "Wrote: nsys_report.txt"
+
+# ====== Export ======
+export-csv:
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: $(PROFILE_OUT).nsys-rep not found. Run 'make profile' first."; exit 1)
+	nsys export --type csv --output ./csv_out $(PROFILE_OUT).nsys-rep
+	@echo "CSV out -> ./csv_out/"
+
+export-sqlite:
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: $(PROFILE_OUT).nsys-rep not found. Run 'make profile' first."; exit 1)
+	nsys export --sqlite $(PROFILE_OUT).sqlite $(PROFILE_OUT).nsys-rep
+	@echo "SQLite -> $(PROFILE_OUT).sqlite"
 
 # ====== GUI ======
 ui:
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: $(PROFILE_OUT).nsys-rep not found. Run 'make profile' first."; exit 1)
 	$(NSYS_UI) $(PROFILE_OUT).nsys-rep
 
 # ====== Nsight Compute ======
 compute: $(TARGET)
+	@echo "Running Nsight Compute..."
+	@echo "If this fails with ERR_NVGPUCTRPERM, the machine lacks permission for GPU performance counters."
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
-	$(NCU) $(NCU_FLAGS) ./$(TARGET)
+	$(NCU) $(NCU_FLAGS) ./$(TARGET) $(ARGS) || \
+	(echo ""; \
+	 echo "Nsight Compute failed."; \
+	 echo "Likely causes:"; \
+	 echo "  1) no permission for GPU performance counters"; \
+	 echo "  2) driver / ncu version mismatch"; \
+	 exit 1)
 
 # ====== Show config ======
 show-config:
-	@echo "BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y)"
-	@echo "R0_FRAC_Y=$(R0_FRAC_Y)"
-	@echo "R_GROWTH=$(R_GROWTH_FRAC_Y_PER_T)"
-	@echo "WALL_WIDTH=$(WALL_WIDTH_FRAC_Y)"
-	@echo "SEED_AMP=$(SEED_AMP)"
-	@echo "T_TOTAL=$(T_TOTAL)"
+	@echo "TARGET                = $(TARGET)"
+	@echo "SRC                   = $(SRC)"
+	@echo "BUILD                 = $(BUILD)"
+	@echo "PRINT                 = $(PRINT)"
+	@echo "CUDA_ARCH             = $(CUDA_ARCH)"
+	@echo "BLOCK_X               = $(BLOCK_X)"
+	@echo "BLOCK_Y               = $(BLOCK_Y)"
+	@echo "RTOL_VAL              = $(RTOL_VAL)"
+	@echo "ATOL_VAL              = $(ATOL_VAL)"
+	@echo "CIRCLE_CENTER_X_FRAC  = $(CIRCLE_CENTER_X_FRAC)"
+	@echo "CIRCLE_CENTER_Y_FRAC  = $(CIRCLE_CENTER_Y_FRAC)"
+	@echo "CIRCLE_RADIUS_FRAC_Y  = $(CIRCLE_RADIUS_FRAC_Y)"
+	@echo "INIT_MY               = $(INIT_MY)"
+	@echo "INIT_MZ_INSIDE        = $(INIT_MZ_INSIDE)"
+	@echo "INIT_MZ_OUTSIDE       = $(INIT_MZ_OUTSIDE)"
+	@echo "PROFILE_OUT           = $(PROFILE_OUT)"
 
 # ====== Clean ======
 clean:
 	rm -f $(TARGET)
 
 reallyclean: clean
-	rm -f *.nsys-rep *.sqlite *.txt output.txt
+	rm -f $(PROFILE_OUT).nsys-rep $(PROFILE_OUT).qdrep $(PROFILE_OUT).sqlite ncu_$(TARGET).ncu-rep
+	rm -rf csv_out
+	rm -f output.txt run_bx*.txt run_tol_*.txt run_circle_r_*.txt
+
+reports:
+	$(NSYS) stats --help-reports || true

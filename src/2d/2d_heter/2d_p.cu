@@ -1,5 +1,5 @@
 /**
- * 2D periodic growing circular texture solver
+ * 2D periodic smooth-texture LLG solver
  * CVODE + CUDA, SoA layout
  *
  * Geometry / topology:
@@ -8,17 +8,12 @@
  *   - periodic in y
  *   - no masked / inactive cells
  *
- * Dynamics:
- *   - local periodic RHS as before
- *   - plus a smooth, time-dependent circular target texture
- *   - the characteristic radius grows with time:
- *         R(t) = R0 + growth_rate * t
- *
- * Texture:
- *   - center tends to point downward
- *   - far field tends to point upward
- *   - transition band is smooth
- *   - in-plane component is Neel-like (radial)
+ * Initialization:
+ *   - one circular smooth texture in the interior
+ *   - center approximately points downward (mz < 0)
+ *   - far field approximately points upward (mz > 0)
+ *   - transition region rotates continuously
+ *   - in-plane component is radial (Néel-like)
  *
  * SoA layout in one N_Vector:
  *   [mx for all cells][my for all cells][mz for all cells]
@@ -33,10 +28,6 @@
 #include <sundials/sundials_types.h>
 #include <sunlinsol/sunlinsol_spgmr.h>
 #include <sunnonlinsol/sunnonlinsol_newton.h>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 /* Problem constants */
 #define GROUPSIZE 3
@@ -58,11 +49,6 @@
 #define T1    SUN_RCONST(0.1)
 #define ZERO  SUN_RCONST(0.0)
 
-/* total simulated physical time */
-#ifndef T_TOTAL
-#define T_TOTAL 1000.0
-#endif
-
 #ifndef ENABLE_OUTPUT
 #define ENABLE_OUTPUT 0
 #endif
@@ -75,7 +61,7 @@
 #define BLOCK_Y 8
 #endif
 
-/* circle center */
+/* Circle parameters */
 #ifndef CIRCLE_CENTER_X_FRAC
 #define CIRCLE_CENTER_X_FRAC 0.50
 #endif
@@ -84,26 +70,28 @@
 #define CIRCLE_CENTER_Y_FRAC 0.50
 #endif
 
-/* growing-radius parameters, measured relative to ny */
-#ifndef R0_FRAC_Y
-#define R0_FRAC_Y 0.10
+/* radius measured in cell units, relative to ny */
+#ifndef CIRCLE_RADIUS_FRAC_Y
+#define CIRCLE_RADIUS_FRAC_Y 0.22
 #endif
 
-#ifndef R_GROWTH_FRAC_Y_PER_T
-#define R_GROWTH_FRAC_Y_PER_T 0.0002
+/* smooth texture initialization parameters */
+#ifndef TEXTURE_CORE_MZ
+#define TEXTURE_CORE_MZ -0.998
 #endif
 
-#ifndef WALL_WIDTH_FRAC_Y
-#define WALL_WIDTH_FRAC_Y 0.06
+#ifndef TEXTURE_OUTER_MZ
+#define TEXTURE_OUTER_MZ 0.998
 #endif
 
-#ifndef SEED_AMP
-#define SEED_AMP 0.20
+/* transition width as a fraction of radius */
+#ifndef TEXTURE_WIDTH_FRAC
+#define TEXTURE_WIDTH_FRAC 0.35
 #endif
 
-/* optional tiny background cant */
-#ifndef INIT_MY
-#define INIT_MY 0.0
+/* tiny bias to avoid exact singularity at center */
+#ifndef TEXTURE_EPS
+#define TEXTURE_EPS 1.0e-12
 #endif
 
 /* typed constant memory */
@@ -142,19 +130,11 @@ __constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
 
 /* user data */
 typedef struct {
-  int nx;
-  int ny;
-  int ng;
-  int ncell;
-  int neq;
-
-  sunrealtype cx;
-  sunrealtype cy;
-
-  sunrealtype r0;
-  sunrealtype r_rate;
-  sunrealtype wall_w;
-  sunrealtype seed_amp;
+  int nx;      /* old scalar width = 3 * ng */
+  int ny;      /* number of rows */
+  int ng;      /* number of physical cells per row */
+  int ncell;   /* total physical cells = ng * ny */
+  int neq;     /* total equations = 3 * ncell */
 } UserData;
 
 /* SoA indexing helpers */
@@ -186,19 +166,11 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
  *
  * Boundary policy:
  *   periodic in x and y (toroidal domain)
- *
- * Extra driven term:
- *   smooth Neel-like circular texture with growing radius
  */
 __global__ static void f_kernel_group_soa_periodic(
     const sunrealtype* __restrict__ y,
     sunrealtype* __restrict__ yd,
-    int ng, int ny, int ncell,
-    sunrealtype t,
-    sunrealtype cx, sunrealtype cy,
-    sunrealtype r0, sunrealtype r_rate,
-    sunrealtype wall_w,
-    sunrealtype seed_amp) {
+    int ng, int ny, int ncell) {
 
   const int gx = blockIdx.x * blockDim.x + threadIdx.x;
   const int gy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -242,7 +214,6 @@ __global__ static void f_kernel_group_soa_periodic(
   const int uz = idx_mz(up_cell,    ncell);
   const int dz = idx_mz(down_cell,  ncell);
 
-  /* original local field */
   const sunrealtype h1 =
       c_che * (y[lx] + y[rx] + y[ux] + y[dx]) +
       c_msk[0] * (c_chk * m3 + c_cha) +
@@ -260,39 +231,15 @@ __global__ static void f_kernel_group_soa_periodic(
 
   const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
 
-  /* ---------------- growing smooth circular texture ---------------- */
-  const sunrealtype dx0 = (sunrealtype)gx - cx;
-  const sunrealtype dy0 = (sunrealtype)gy - cy;
-  const sunrealtype rr  = sqrt(dx0 * dx0 + dy0 * dy0);
-
-  const sunrealtype Rt = r0 + r_rate * t;
-
-  /* center -> theta ~ pi ; outside -> theta ~ 0 */
-  const sunrealtype theta =
-      SUN_RCONST(M_PI) *
-      SUN_RCONST(0.5) *
-      (SUN_RCONST(1.0) - tanh((rr - Rt) / wall_w));
-
-  sunrealtype phi = atan2(dy0, dx0);
-  if (rr < SUN_RCONST(1.0e-12)) phi = ZERO;
-
-  /* Neel-like radial target texture */
-  const sunrealtype mtx = sin(theta) * cos(phi);
-  const sunrealtype mty = sin(theta) * sin(phi);
-  const sunrealtype mtz = cos(theta);
-
-  /* relaxation toward target texture */
-  const sunrealtype relax_x = seed_amp * (mtx - m1);
-  const sunrealtype relax_y = seed_amp * (mty - m2);
-  const sunrealtype relax_z = seed_amp * (mtz - m3);
-
-  yd[mx] = c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1) + relax_x;
-  yd[my] = c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2) + relax_y;
-  yd[mz] = c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3) + relax_z;
+  yd[mx] = c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1);
+  yd[my] = c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2);
+  yd[mz] = c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3);
 }
 
 /* RHS wrapper for CVODE */
 static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
+  (void)t;
+
   UserData* udata = (UserData*)user_data;
   sunrealtype* ydata    = N_VGetDeviceArrayPointer_Cuda(y);
   sunrealtype* ydotdata = N_VGetDeviceArrayPointer_Cuda(ydot);
@@ -308,13 +255,7 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
             (udata->ny + block.y - 1) / block.y);
 
   f_kernel_group_soa_periodic<<<grid, block>>>(
-      ydata, ydotdata,
-      udata->ng, udata->ny, udata->ncell,
-      t,
-      udata->cx, udata->cy,
-      udata->r0, udata->r_rate,
-      udata->wall_w,
-      udata->seed_amp);
+      ydata, ydotdata, udata->ng, udata->ny, udata->ncell);
 
   cudaError_t cuerr = cudaPeekAtLastError();
   if (cuerr != cudaSuccess) {
@@ -353,7 +294,7 @@ int main(int argc, char* argv[]) {
   SUNContext sunctx = NULL;
   sunrealtype *ydata = NULL, *abstol_data = NULL;
   sunrealtype t = T0, tout = T1;
-  sunrealtype ttotal = SUN_RCONST(T_TOTAL);
+  sunrealtype ttotal = SUN_RCONST(1000.0);
 
   N_Vector y = NULL, abstol = NULL;
   SUNLinearSolver LS = NULL;
@@ -394,12 +335,12 @@ int main(int argc, char* argv[]) {
   setvbuf(fp, NULL, _IOFBF, 1 << 20);
 #endif
 
-  /* geometry + growth parameters */
-  const double cx     = CIRCLE_CENTER_X_FRAC * (double)(ng - 1);
-  const double cy     = CIRCLE_CENTER_Y_FRAC * (double)(ny - 1);
-  const double r0     = R0_FRAC_Y * (double)ny;
-  const double r_rate = R_GROWTH_FRAC_Y_PER_T * (double)ny;
-  const double wall_w = WALL_WIDTH_FRAC_Y * (double)ny;
+  /* circle geometry */
+  const double cx = CIRCLE_CENTER_X_FRAC * (double)(ng - 1);
+  const double cy = CIRCLE_CENTER_Y_FRAC * (double)(ny - 1);
+  const double radius = CIRCLE_RADIUS_FRAC_Y * (double)ny;
+  const double r2 = radius * radius;
+  (void)r2; /* radius still useful conceptually even though init uses rho */
 
   /* fill user data */
   udata.nx    = nx;
@@ -407,13 +348,6 @@ int main(int argc, char* argv[]) {
   udata.ng    = ng;
   udata.ncell = ncell;
   udata.neq   = neq;
-
-  udata.cx       = SUN_RCONST(cx);
-  udata.cy       = SUN_RCONST(cy);
-  udata.r0       = SUN_RCONST(r0);
-  udata.r_rate   = SUN_RCONST(r_rate);
-  udata.wall_w   = SUN_RCONST(wall_w);
-  udata.seed_amp = SUN_RCONST(SEED_AMP);
 
   CHECK_SUNDIALS(SUNContext_Create(SUN_COMM_NULL, &sunctx));
 
@@ -439,30 +373,100 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  /* initial state:
-   * start from nearly uniform up background;
-   * the growing circular texture is imposed through the RHS driving term.
+  /* Initialize y and abstol in SoA layout
+   *
+   * Smooth Néel-like radial texture:
+   *   - center: approximately downward
+   *   - far away: approximately upward
+   *   - transition region: continuous rotation
+   *
+   * Construction:
+   *   Let rho = distance from circle center.
+   *   Define a smooth profile s(rho) in [0,1], where
+   *       s ~ 1 near center
+   *       s ~ 0 far outside
+   *
+   *   Then interpolate mz between core and outer values:
+   *       mz = outer + (core - outer) * s
+   *
+   *   and assign the in-plane part radially:
+   *       (mx, my) = m_perp * (dx, dy) / rho
    */
-  for (int j = 0; j < ny; j++) {
-    for (int i = 0; i < ng; i++) {
-      cell = j * ng + i;
+  {
+    const double core_mz  = (double)TEXTURE_CORE_MZ;
+    const double outer_mz = (double)TEXTURE_OUTER_MZ;
 
-      const int mx = idx_mx(cell, ncell);
-      const int my = idx_my(cell, ncell);
-      const int mz = idx_mz(cell, ncell);
+    double width = (double)TEXTURE_WIDTH_FRAC * radius;
+    if (width < 1.0) width = 1.0;
 
-      ydata[mx] = ZERO;
-      ydata[my] = SUN_RCONST(INIT_MY);
-      ydata[mz] = SUN_RCONST(1.0);
+    for (int j = 0; j < ny; j++) {
+      for (int i = 0; i < ng; i++) {
+        cell = j * ng + i;
 
-      abstol_data[mx] = ATOL1;
-      abstol_data[my] = ATOL2;
-      abstol_data[mz] = ATOL3;
+        const int mx = idx_mx(cell, ncell);
+        const int my = idx_my(cell, ncell);
+        const int mz = idx_mz(cell, ncell);
+
+        const double dx = (double)i - cx;
+        const double dy = (double)j - cy;
+        const double rho = sqrt(dx * dx + dy * dy);
+
+        /* Smooth profile:
+         *   s ≈ 1 deep inside
+         *   s ≈ 0 far outside
+         */
+        const double u = (rho - radius) / width;
+        const double s = 0.5 * (1.0 - tanh(u));
+
+        /* Interpolate mz smoothly from center-down to outer-up */
+        double mz0 = outer_mz + (core_mz - outer_mz) * s;
+
+        if (mz0 >  1.0) mz0 =  1.0;
+        if (mz0 < -1.0) mz0 = -1.0;
+
+        /* in-plane magnitude from unit-length condition */
+        double mperp = sqrt(fmax(0.0, 1.0 - mz0 * mz0));
+
+        double mx0, my0;
+
+        if (rho > (double)TEXTURE_EPS) {
+          /* Néel-like radial in-plane direction */
+          mx0 = mperp * (dx / rho);
+          my0 = mperp * (dy / rho);
+        } else {
+          /* exact center: direction undefined */
+          mx0 = 0.0;
+          my0 = 0.0;
+        }
+
+        ydata[mx] = SUN_RCONST(mx0);
+        ydata[my] = SUN_RCONST(my0);
+        ydata[mz] = SUN_RCONST(mz0);
+
+        abstol_data[mx] = ATOL1;
+        abstol_data[my] = ATOL2;
+        abstol_data[mz] = ATOL3;
+      }
     }
   }
 
   N_VCopyToDevice_Cuda(y);
   N_VCopyToDevice_Cuda(abstol);
+#if ENABLE_OUTPUT
+  {
+    fprintf(fp, "%f %d %d\n", (double)T0, nx, ny);
+    for (int jp = 0; jp < ny; jp++) {
+      for (int ip = 0; ip < ng; ip++) {
+        int cell_out = jp * ng + ip;
+        fprintf(fp, "%f %f %f\n",
+                (double)ydata[idx_mx(cell_out, ncell)],
+                (double)ydata[idx_my(cell_out, ncell)],
+                (double)ydata[idx_mz(cell_out, ncell)]);
+      }
+    }
+    fprintf(fp, "\n");
+  }
+#endif
 
   cvode_mem = CVodeCreate(CV_BDF, sunctx);
   if (cvode_mem == NULL) {
@@ -488,17 +492,15 @@ int main(int argc, char* argv[]) {
   }
   CHECK_SUNDIALS(CVodeSetLinearSolver(cvode_mem, LS, NULL));
 
-  printf("\n2D periodic growing-circle texture solver (SoA)\n\n");
+  printf("\n2D periodic smooth-texture solver (SoA)\n\n");
   printf("scalar width nx = %d, rows ny = %d, groups/row = %d, ncell = %d, neq = %d\n",
          nx, ny, ng, ncell, neq);
   printf("periodic BC: x and y\n");
-  printf("circle center = (%.2f, %.2f)\n", cx, cy);
-  printf("R(t) = R0 + rate * t\n");
-  printf("R0       = %.6f cells\n", r0);
-  printf("rate     = %.6f cells / time-unit\n", r_rate);
-  printf("wall_w   = %.6f cells\n", wall_w);
-  printf("seed_amp = %.6f\n", (double)SEED_AMP);
-  printf("INIT_MY  = %.6f\n", (double)INIT_MY);
+  printf("circle center = (%.2f, %.2f), radius = %.2f cells\n", cx, cy, radius);
+  printf("smooth radial texture init\n");
+  printf("core mz    = %.4f\n", (double)TEXTURE_CORE_MZ);
+  printf("outer mz   = %.4f\n", (double)TEXTURE_OUTER_MZ);
+  printf("width frac = %.4f\n", (double)TEXTURE_WIDTH_FRAC);
 
   NOUT = (int)(ttotal / T1 + SUN_RCONST(0.5));
   iout = 0;

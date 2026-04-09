@@ -1,0 +1,49 @@
+Generating SQLite file profile_small.sqlite from profile_small.nsys-rep
+Processing [profile_small.sqlite] with [/opt/nvidia/nsight-systems/2025.1.3/host-linux-x64/reports/cuda_api_sum.py]... 
+
+ ** CUDA API Summary (cuda_api_sum):
+
+ Time (%)  Total Time (ns)  Num Calls   Avg (ns)    Med (ns)  Min (ns)   Max (ns)   StdDev (ns)            Name         
+ --------  ---------------  ---------  -----------  --------  --------  ----------  ------------  ----------------------
+     68.1    5,752,263,514    259,647     22,154.2  21,332.0     2,201     102,917       5,984.3  cudaStreamSynchronize 
+     20.9    1,765,076,945    998,910      1,767.0   1,695.0     1,516     804,398       3,122.8  cudaLaunchKernel      
+     10.1      855,726,784    519,292      1,647.9   1,596.0     1,230   1,194,632       3,275.6  cudaMemcpyAsync       
+      0.9       77,678,225         42  1,849,481.5   2,660.5     1,447  77,516,800  11,960,497.0  cudaMalloc            
+      0.0          628,565         14     44,897.5   4,146.5     2,610     570,615     151,321.2  cudaMallocHost        
+      0.0          301,073         42      7,168.4   2,819.5     1,816     130,443      20,340.1  cudaFree              
+      0.0          272,776         14     19,484.0   3,255.5     2,336     227,179      59,797.6  cudaFreeHost          
+      0.0           60,913        419        145.4     102.0        49         538          87.9  cuGetProcAddress_v2   
+      0.0           20,552          2     10,276.0  10,276.0       431      20,121      13,922.9  cudaEventCreate       
+      0.0           18,261          2      9,130.5   9,130.5     8,087      10,174       1,475.7  cudaEventRecord       
+      0.0            2,916          1      2,916.0   2,916.0     2,916       2,916           0.0  cudaEventSynchronize  
+      0.0              964          1        964.0     964.0       964         964           0.0  cuInit                
+      0.0              825          2        412.5     412.5        56         769         504.2  cuModuleGetLoadingMode
+
+Processing [profile_small.sqlite] with [/opt/nvidia/nsight-systems/2025.1.3/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+
+ ** CUDA GPU Kernel Summary (cuda_gpu_kern_sum):
+
+ Time (%)  Total Time (ns)  Instances  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  --------  --------  --------  --------  -----------  ----------------------------------------------------------------------------------------------------
+     33.8      493,122,669    405,118   1,217.2   1,216.0     1,184     1,280         17.7  void sundials::cuda::impl::linearSumKernel<double, int>(T1, const T1 *, T1, const T1 *, T1 *, T2)   
+     24.1      352,383,852    192,229   1,833.1   1,824.0     1,760     1,889         25.5  void sundials::cuda::impl::dotProdKernel<double, int, sundials::cuda::impl::GridReducerAtomic>(cons…
+     12.4      180,612,391    163,148   1,107.0   1,120.0     1,056     1,472         16.3  void sundials::cuda::impl::scaleKernel<double, int>(T1, const T1 *, T1 *, T2)                       
+      9.5      139,226,611     67,414   2,065.2   2,080.0     2,016     2,113         18.1  void sundials::cuda::impl::wL2NormSquareKernel<double, int, sundials::cuda::impl::GridReducerAtomic…
+      7.2      105,132,803     45,085   2,331.9   2,336.0     2,304     2,560         16.2  f_kernel_group_soa(const double *, double *, int, int, int)                                         
+      7.0      101,899,138     45,009   2,264.0   2,272.0     2,240     2,336         15.7  void sundials::cuda::impl::divKernel<double, int>(const T1 *, const T1 *, T1 *, T2)                 
+      3.5       51,232,439     45,008   1,138.3   1,152.0     1,120     1,184         16.0  void sundials::cuda::impl::prodKernel<double, int>(const T1 *, const T1 *, T1 *, T2)                
+      1.4       20,460,576     22,264     919.0     928.0       896       960         15.4  void sundials::cuda::impl::setConstKernel<double, int>(T1, T1 *, T2)                                
+      0.6        9,130,979      6,816   1,339.6   1,344.0     1,312     1,376         16.1  void sundials::cuda::impl::invKernel<double, int>(const T1 *, T1 *, T2)                             
+      0.5        7,558,459      6,817   1,108.8   1,120.0     1,088     1,152         15.6  void sundials::cuda::impl::absKernel<double, int>(const T1 *, T1 *, T2)                             
+      0.0            2,560          1   2,560.0   2,560.0     2,560     2,560          0.0  void sundials::cuda::impl::findMinKernel<double, int, sundials::cuda::impl::GridReducerAtomic>(T1, …
+      0.0            2,272          1   2,272.0   2,272.0     2,272     2,272          0.0  void sundials::cuda::impl::maxNormKernel<double, int, sundials::cuda::impl::GridReducerAtomic>(cons…
+
+Processing [profile_small.sqlite] with [/opt/nvidia/nsight-systems/2025.1.3/host-linux-x64/reports/cuda_gpu_mem_time_sum.py]... 
+
+ ** CUDA GPU MemOps Summary (by Time) (cuda_gpu_mem_time_sum):
+
+ Time (%)  Total Time (ns)   Count   Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)           Operation          
+ --------  ---------------  -------  --------  --------  --------  --------  -----------  ----------------------------
+     53.5      268,254,144  259,647   1,033.1   1,120.0       352     5,216        272.1  [CUDA memcpy Host-to-Device]
+     46.5      232,700,825  259,645     896.2     896.0       480     1,952         34.3  [CUDA memcpy Device-to-Host]
+

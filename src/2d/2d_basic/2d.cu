@@ -276,9 +276,16 @@ int main(int argc, char* argv[]) {
   cudaEvent_t start, stop;
   float elapsedTime = 0.0f;
 
+#ifndef NX_VAL
+#define NX_VAL 1536
+#endif
+
+#ifndef NY_VAL
+#define NY_VAL 128
+#endif
   /* problem size */
-  const int nx = 1536;       /* old scalar width */
-  const int ny = 128;
+  const int nx = NX_VAL;       /* old scalar width */
+  const int ny = NY_VAL;
 
   if (nx % GROUPSIZE != 0) {
     fprintf(stderr, "nx must be a multiple of GROUPSIZE=%d\n", GROUPSIZE);
