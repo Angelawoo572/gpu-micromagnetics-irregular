@@ -20,10 +20,13 @@ CUDA_ARCH ?= -arch=sm_89
 BUILD ?= release
 PRINT ?= 0
 
-# ====== Solver / kernel params ======
+# ====== Problem size / solver / kernel params ======
+NX ?= 3000
+NY ?= 1280
 BLOCK_X ?= 16
 BLOCK_Y ?= 8
-
+TILE_X ?= 16
+TILE_Y ?= 8
 RTOL_VAL ?= 1.0e-4
 ATOL_VAL ?= 1.0e-4
 T_TOTAL  ?= 1000.0
@@ -32,11 +35,21 @@ T_TOTAL  ?= 1000.0
 CIRCLE_CENTER_X_FRAC ?= 0.50
 CIRCLE_CENTER_Y_FRAC ?= 0.50
 CIRCLE_RADIUS_FRAC_Y ?= 0.22
-
-TEXTURE_CORE_MZ   ?= -0.998
-TEXTURE_OUTER_MZ  ?= 0.998
+TEXTURE_CORE_MZ    ?= -0.998
+TEXTURE_OUTER_MZ   ?= 0.998
 TEXTURE_WIDTH_FRAC ?= 0.35
-TEXTURE_EPS       ?= 1.0e-12
+TEXTURE_EPS        ?= 1.0e-12
+
+# ====== Ring-aware tile scheduling params ======
+# REGION_MODE:
+#   0 = uniform full-grid baseline
+#   1 = halo-aware binary ring tile partition
+REGION_MODE ?= 0
+ACTIVE_RING_RADIUS_FRAC_Y ?= $(CIRCLE_RADIUS_FRAC_Y)
+ACTIVE_RING_HALF_WIDTH_FRAC_Y ?= 0.08
+CHEAP_MODE ?= 0
+HALO_W ?= 1
+TILE_SAFETY_FRAC_Y ?= 0.02
 
 # ====== Output schedule ======
 EARLY_SAVE_UNTIL ?= 80.0
@@ -50,7 +63,9 @@ else
 endif
 
 NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
+              -DNX=$(NX) -DNY=$(NY) \
               -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) \
+              -DTILE_X=$(TILE_X) -DTILE_Y=$(TILE_Y) \
               -DRTOL_VAL=$(RTOL_VAL) -DATOL_VAL=$(ATOL_VAL) \
               -DT_TOTAL=$(T_TOTAL) \
               -DCIRCLE_CENTER_X_FRAC=$(CIRCLE_CENTER_X_FRAC) \
@@ -60,6 +75,12 @@ NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DTEXTURE_OUTER_MZ=$(TEXTURE_OUTER_MZ) \
               -DTEXTURE_WIDTH_FRAC=$(TEXTURE_WIDTH_FRAC) \
               -DTEXTURE_EPS=$(TEXTURE_EPS) \
+              -DREGION_MODE=$(REGION_MODE) \
+              -DACTIVE_RING_RADIUS_FRAC_Y=$(ACTIVE_RING_RADIUS_FRAC_Y) \
+              -DACTIVE_RING_HALF_WIDTH_FRAC_Y=$(ACTIVE_RING_HALF_WIDTH_FRAC_Y) \
+              -DCHEAP_MODE=$(CHEAP_MODE) \
+              -DHALO_W=$(HALO_W) \
+              -DTILE_SAFETY_FRAC_Y=$(TILE_SAFETY_FRAC_Y) \
               -DEARLY_SAVE_UNTIL=$(EARLY_SAVE_UNTIL) \
               -DEARLY_SAVE_EVERY=$(EARLY_SAVE_EVERY) \
               -DLATE_SAVE_EVERY=$(LATE_SAVE_EVERY)
@@ -73,20 +94,17 @@ ARGS ?=
 NSYS ?= /opt/nvidia/nsight-systems/2025.1.3/bin/nsys
 NCU  ?= /opt/nvidia/nsight-compute/2025.3.1/ncu
 NSYS_UI ?= /usr/local/cuda/bin/nsight-sys
-
 PROFILE_OUT ?= profile_$(TARGET)
-
 NSYS_FLAGS_LIGHT := profile --trace=cuda -o $(PROFILE_OUT)
 NSYS_FLAGS_STD   := profile --trace=cuda --cuda-memory-usage=true -o $(PROFILE_OUT)
 NSYS_FLAGS_EXT   := profile --trace=cuda --cuda-memory-usage=true \
                     --cuda-um-cpu-page-faults=true -o $(PROFILE_OUT)
-
 NCU_FLAGS ?= --set roofline -o ncu_$(TARGET)
 
 .PHONY: all run run-debug build-debug build-release \
-        run-print run-noprint \
-        sweep-block sweep-tol sweep-circle \
-        profile profile-light profile-ext stats \
+        run-print run-noprint bench \
+        sweep-block sweep-tol sweep-circle sweep-size sweep-ring \
+        profile profile-short profile-light profile-ext stats \
         export-csv export-sqlite ui compute \
         show-config clean reallyclean reports
 
@@ -119,6 +137,11 @@ run-noprint:
 	$(MAKE) PRINT=0
 	$(MAKE) run PRINT=0
 
+bench:
+	$(MAKE) clean >/dev/null 2>&1
+	$(MAKE) BUILD=release PRINT=0 >/dev/null
+	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee bench_$(TARGET).txt
+
 # ====== Parameter sweeps ======
 sweep-block:
 	@for bx in 32 16; do \
@@ -128,7 +151,7 @@ sweep-block:
 	      echo "========================================"; \
 	      echo "Testing BLOCK_X=$$bx BLOCK_Y=$$by"; \
 	      $(MAKE) clean >/dev/null 2>&1; \
-	      $(MAKE) BUILD=release PRINT=0 BLOCK_X=$$bx BLOCK_Y=$$by >/dev/null && \
+	      $(MAKE) BUILD=release PRINT=0 BLOCK_X=$$bx BLOCK_Y=$$by TILE_X=$$bx TILE_Y=$$by >/dev/null && \
 	      LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_bx$${bx}_by$${by}.txt; \
 	    fi; \
 	  done; \
@@ -137,9 +160,9 @@ sweep-block:
 sweep-tol:
 	@for tol in 1.0e-4 1.0e-5 1.0e-6; do \
 	  echo "========================================"; \
-	  echo "Testing RTOL_VAL=$$tol ATOL_VAL=$$tol BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y)"; \
+	  echo "Testing RTOL_VAL=$$tol ATOL_VAL=$$tol"; \
 	  $(MAKE) clean >/dev/null 2>&1; \
-	  $(MAKE) BUILD=release PRINT=0 BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y) RTOL_VAL=$$tol ATOL_VAL=$$tol >/dev/null && \
+	  $(MAKE) BUILD=release PRINT=0 RTOL_VAL=$$tol ATOL_VAL=$$tol >/dev/null && \
 	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_tol_$${tol}.txt; \
 	done
 
@@ -148,22 +171,40 @@ sweep-circle:
 	  echo "========================================"; \
 	  echo "Testing CIRCLE_RADIUS_FRAC_Y=$$r"; \
 	  $(MAKE) clean >/dev/null 2>&1; \
-	  $(MAKE) BUILD=release PRINT=0 \
-	    BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y) \
-	    RTOL_VAL=$(RTOL_VAL) ATOL_VAL=$(ATOL_VAL) \
-	    T_TOTAL=$(T_TOTAL) \
-	    CIRCLE_CENTER_X_FRAC=$(CIRCLE_CENTER_X_FRAC) \
-	    CIRCLE_CENTER_Y_FRAC=$(CIRCLE_CENTER_Y_FRAC) \
-	    CIRCLE_RADIUS_FRAC_Y=$$r \
-	    TEXTURE_CORE_MZ=$(TEXTURE_CORE_MZ) \
-	    TEXTURE_OUTER_MZ=$(TEXTURE_OUTER_MZ) \
-	    TEXTURE_WIDTH_FRAC=$(TEXTURE_WIDTH_FRAC) \
-	    TEXTURE_EPS=$(TEXTURE_EPS) >/dev/null && \
+	  $(MAKE) BUILD=release PRINT=0 CIRCLE_RADIUS_FRAC_Y=$$r ACTIVE_RING_RADIUS_FRAC_Y=$$r >/dev/null && \
 	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_circle_r_$${r}.txt; \
+	done
+
+sweep-size:
+	@for nx in 600 1024 1536; do \
+	  echo "========================================"; \
+	  echo "Testing NX=$$nx NY=$(NY)"; \
+	  $(MAKE) clean >/dev/null 2>&1; \
+	  $(MAKE) BUILD=release PRINT=0 NX=$$nx >/dev/null && \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_nx$${nx}_ny$(NY).txt; \
+	done
+
+sweep-ring:
+	@for halfw in 0.06 0.08 0.10; do \
+	  for halo in 1 2; do \
+	    echo "========================================"; \
+	    echo "Testing REGION_MODE=1 ACTIVE_RING_HALF_WIDTH_FRAC_Y=$$halfw HALO_W=$$halo"; \
+	    $(MAKE) clean >/dev/null 2>&1; \
+	    $(MAKE) BUILD=release PRINT=0 REGION_MODE=1 CHEAP_MODE=$(CHEAP_MODE) \
+	      ACTIVE_RING_HALF_WIDTH_FRAC_Y=$$halfw HALO_W=$$halo >/dev/null && \
+	    LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_ring_hw$${halfw}_halo$${halo}.txt; \
+	  done; \
 	done
 
 # ====== Nsight Systems ======
 profile: $(TARGET)
+	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
+	$(NSYS) $(NSYS_FLAGS_STD) ./$(TARGET) $(ARGS)
+	@echo "Generated: $(PROFILE_OUT).nsys-rep"
+
+profile-short:
+	$(MAKE) clean >/dev/null 2>&1
+	$(MAKE) BUILD=release PRINT=0 T_TOTAL=20.0 >/dev/null && \
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
 	$(NSYS) $(NSYS_FLAGS_STD) ./$(TARGET) $(ARGS)
 	@echo "Generated: $(PROFILE_OUT).nsys-rep"
@@ -180,7 +221,7 @@ profile-ext: $(TARGET)
 
 # ====== Stats ======
 stats:
-	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: $(PROFILE_OUT).nsys-rep not found. Run 'make profile' first."; exit 1)
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: $(PROFILE_OUT).nsys-rep not found. Run 'make profile' or 'make profile-short' first."; exit 1)
 	nsys stats --report cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum $(PROFILE_OUT).nsys-rep > nsys_report.txt
 	@echo "Wrote: nsys_report.txt"
 
@@ -215,27 +256,37 @@ compute: $(TARGET)
 
 # ====== Show config ======
 show-config:
-	@echo "TARGET                = $(TARGET)"
-	@echo "SRC                   = $(SRC)"
-	@echo "BUILD                 = $(BUILD)"
-	@echo "PRINT                 = $(PRINT)"
-	@echo "CUDA_ARCH             = $(CUDA_ARCH)"
-	@echo "BLOCK_X               = $(BLOCK_X)"
-	@echo "BLOCK_Y               = $(BLOCK_Y)"
-	@echo "RTOL_VAL              = $(RTOL_VAL)"
-	@echo "ATOL_VAL              = $(ATOL_VAL)"
-	@echo "T_TOTAL               = $(T_TOTAL)"
-	@echo "CIRCLE_CENTER_X_FRAC  = $(CIRCLE_CENTER_X_FRAC)"
-	@echo "CIRCLE_CENTER_Y_FRAC  = $(CIRCLE_CENTER_Y_FRAC)"
-	@echo "CIRCLE_RADIUS_FRAC_Y  = $(CIRCLE_RADIUS_FRAC_Y)"
-	@echo "TEXTURE_CORE_MZ       = $(TEXTURE_CORE_MZ)"
-	@echo "TEXTURE_OUTER_MZ      = $(TEXTURE_OUTER_MZ)"
-	@echo "TEXTURE_WIDTH_FRAC    = $(TEXTURE_WIDTH_FRAC)"
-	@echo "TEXTURE_EPS           = $(TEXTURE_EPS)"
-	@echo "EARLY_SAVE_UNTIL      = $(EARLY_SAVE_UNTIL)"
-	@echo "EARLY_SAVE_EVERY      = $(EARLY_SAVE_EVERY)"
-	@echo "LATE_SAVE_EVERY       = $(LATE_SAVE_EVERY)"
-	@echo "PROFILE_OUT           = $(PROFILE_OUT)"
+	@echo "TARGET                          = $(TARGET)"
+	@echo "SRC                             = $(SRC)"
+	@echo "BUILD                           = $(BUILD)"
+	@echo "PRINT                           = $(PRINT)"
+	@echo "CUDA_ARCH                       = $(CUDA_ARCH)"
+	@echo "NX                              = $(NX)"
+	@echo "NY                              = $(NY)"
+	@echo "BLOCK_X                         = $(BLOCK_X)"
+	@echo "BLOCK_Y                         = $(BLOCK_Y)"
+	@echo "TILE_X                          = $(TILE_X)"
+	@echo "TILE_Y                          = $(TILE_Y)"
+	@echo "RTOL_VAL                        = $(RTOL_VAL)"
+	@echo "ATOL_VAL                        = $(ATOL_VAL)"
+	@echo "T_TOTAL                         = $(T_TOTAL)"
+	@echo "REGION_MODE                     = $(REGION_MODE)"
+	@echo "ACTIVE_RING_RADIUS_FRAC_Y       = $(ACTIVE_RING_RADIUS_FRAC_Y)"
+	@echo "ACTIVE_RING_HALF_WIDTH_FRAC_Y   = $(ACTIVE_RING_HALF_WIDTH_FRAC_Y)"
+	@echo "CHEAP_MODE                      = $(CHEAP_MODE)"
+	@echo "HALO_W                          = $(HALO_W)"
+	@echo "TILE_SAFETY_FRAC_Y              = $(TILE_SAFETY_FRAC_Y)"
+	@echo "CIRCLE_CENTER_X_FRAC            = $(CIRCLE_CENTER_X_FRAC)"
+	@echo "CIRCLE_CENTER_Y_FRAC            = $(CIRCLE_CENTER_Y_FRAC)"
+	@echo "CIRCLE_RADIUS_FRAC_Y            = $(CIRCLE_RADIUS_FRAC_Y)"
+	@echo "TEXTURE_CORE_MZ                 = $(TEXTURE_CORE_MZ)"
+	@echo "TEXTURE_OUTER_MZ                = $(TEXTURE_OUTER_MZ)"
+	@echo "TEXTURE_WIDTH_FRAC              = $(TEXTURE_WIDTH_FRAC)"
+	@echo "TEXTURE_EPS                     = $(TEXTURE_EPS)"
+	@echo "EARLY_SAVE_UNTIL                = $(EARLY_SAVE_UNTIL)"
+	@echo "EARLY_SAVE_EVERY                = $(EARLY_SAVE_EVERY)"
+	@echo "LATE_SAVE_EVERY                 = $(LATE_SAVE_EVERY)"
+	@echo "PROFILE_OUT                     = $(PROFILE_OUT)"
 
 # ====== Clean ======
 clean:
@@ -244,7 +295,8 @@ clean:
 reallyclean: clean
 	rm -f $(PROFILE_OUT).nsys-rep $(PROFILE_OUT).qdrep $(PROFILE_OUT).sqlite ncu_$(TARGET).ncu-rep
 	rm -rf csv_out
-	rm -f output.txt run_bx*.txt run_tol_*.txt run_circle_r_*.txt
+	rm -f output.txt bench_$(TARGET).txt
+	rm -f run_bx*.txt run_tol_*.txt run_circle_r_*.txt run_nx*.txt run_ring_*.txt
 
 reports:
 	$(NSYS) stats --help-reports || true
