@@ -42,8 +42,9 @@
 #include <sunnonlinsol/sunnonlinsol_newton.h>
 #include <sundials/sundials_iterative.h>   /* SUN_CLASSICAL_GS */
 
-#include "deferred_nvector.h" /* <<< FUSED: Tier 1 + Tier 3 header */
+#include "deferred_nvector.h"   /* <<< FUSED: Tier 1 + Tier 3 header */
 #include "precond.h"        /* <<< PRECOND: 3x3 block Jacobi preconditioner */
+#include "jtv.h"           /* <<< JTV:    analytic Jacobian-times-vector */
 
 /* Problem constants */
 #define GROUPSIZE 3
@@ -352,7 +353,7 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
 static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
   (void)LS;
 
-  long int nst, nfe, nsetups, nni, ncfn, netf, nge;
+  long int nst, nfe, nsetups, nni, ncfn, netf, nge, nli, nlcf, njvevals;
 
   CVodeGetNumSteps(cvode_mem, &nst);
   CVodeGetNumRhsEvals(cvode_mem, &nfe);
@@ -361,11 +362,17 @@ static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
   CVodeGetNumNonlinSolvIters(cvode_mem, &nni);
   CVodeGetNumNonlinSolvConvFails(cvode_mem, &ncfn);
   CVodeGetNumGEvals(cvode_mem, &nge);
+  CVodeGetNumLinIters(cvode_mem, &nli);
+  CVodeGetNumLinConvFails(cvode_mem, &nlcf);
+  CVodeGetNumJtimesEvals(cvode_mem, &njvevals);   /* <<< JTV: analytic Jv calls */
 
   printf("\nFinal Statistics:\n");
   printf("nst = %-6ld nfe  = %-6ld nsetups = %-6ld ", nst, nfe, nsetups);
   printf("nni = %-6ld ncfn = %-6ld netf = %-6ld nge = %ld\n",
          nni, ncfn, netf, nge);
+  printf("nli = %-6ld nlcf = %-6ld njvevals = %ld  "
+         "(analytic Jv; FD would have cost %ld extra f() calls)\n",
+         nli, nlcf, njvevals, njvevals);
 }
 
 #if ENABLE_OUTPUT
@@ -597,6 +604,12 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
   CHECK_SUNDIALS(CVodeSetLinearSolver(cvode_mem, LS, NULL));
+  /* <<< JTV: register analytic Jv — eliminates ~20K extra f() calls.
+   * First arg NULL means no jtsetup callback needed.
+   * user_data (UserData*) is already registered via CVodeSetUserData;
+   * JtvProduct casts it to JtvUserData* which has the same memory layout
+   * for the fields it uses (ng, ny, ncell). */
+  CHECK_SUNDIALS(CVodeSetJacTimes(cvode_mem, NULL, JtvProduct)); /* <<< JTV */
   CHECK_SUNDIALS(CVodeSetPreconditioner(cvode_mem, PrecondSetup, PrecondSolve)); /* <<< PRECOND */
 
   /* -------------------------------------------------------

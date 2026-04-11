@@ -14,7 +14,7 @@ LDLIBS := -lsundials_cvode -lsundials_nveccuda \
           -lm -lcufft
 
 NVCC := nvcc
-CUDA_ARCH ?= -arch=sm_89
+CUDA_ARCH ?= -gencode arch=compute_89,code=sm_89
 
 # ====== Build mode ======
 BUILD ?= release
@@ -69,10 +69,12 @@ TARGET       := 2d_p
 SRC          := 2d_p.cu
 FUSED_SRC    := deferred_nvector.cu
 PRECOND_SRC  := precond.cu
+JTV_SRC      := jtv.cu
 
 FUSED_OBJ    := deferred_nvector.o
 PRECOND_OBJ  := precond.o
-OBJS         := $(FUSED_OBJ) $(PRECOND_OBJ)
+JTV_OBJ      := jtv.o
+OBJS         := $(FUSED_OBJ) $(PRECOND_OBJ) $(JTV_OBJ)
 
 ARGS ?=
 
@@ -99,12 +101,6 @@ NCU_FLAGS ?= --set roofline -o ncu_$(TARGET)
         bench-fused
 
 # ====== Build ======
-#
-# NOTE on SUNDIALS_ENABLE_PACKAGE_FUSED_KERNELS (optional, Tier 1 bonus):
-#   For CVODE-level BDF-update fused kernels, rebuild SUNDIALS with:
-#     cmake ... -DSUNDIALS_ENABLE_PACKAGE_FUSED_KERNELS=ON
-#   and reinstall. Tier 3 (our custom kernels) works WITHOUT this flag.
-
 all: $(TARGET)
 
 # compile fused NVector layer
@@ -112,13 +108,19 @@ $(FUSED_OBJ): $(FUSED_SRC) deferred_nvector.h
 	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
 	    $(INCLUDE_FLAGS) -c $< -o $@
 
-# compile preconditioner
+# compile 3x3 block Jacobi preconditioner
 $(PRECOND_OBJ): $(PRECOND_SRC) precond.h
 	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
 	    $(INCLUDE_FLAGS) -c $< -o $@
 
+# compile analytic Jacobian-times-vector
+# <<< JTV: eliminates ~20K extra f() calls per run
+$(JTV_OBJ): $(JTV_SRC) jtv.h
+	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
+	    $(INCLUDE_FLAGS) -c $< -o $@
+
 # compile and link main binary
-$(TARGET): $(SRC) $(OBJS) deferred_nvector.h precond.h
+$(TARGET): $(SRC) $(OBJS) deferred_nvector.h precond.h jtv.h
 	$(NVCC) $(NVCC_FLAGS) $(INCLUDE_FLAGS) -o $@ $< $(OBJS) \
 	    $(LIBRARY_FLAGS) $(LDLIBS)
 
@@ -147,7 +149,7 @@ run-noprint:
 
 # ====== Quick benchmark target ======
 bench-fused: $(TARGET)
-	@echo "=== Tier 1 + Tier 3 fused run ==="
+	@echo "=== Fused + Precond + Analytic Jv ==="
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
 # ====== Parameter sweeps ======
@@ -168,9 +170,9 @@ sweep-block:
 sweep-tol:
 	@for tol in 1.0e-4 1.0e-5 1.0e-6; do \
 	  echo "========================================"; \
-	  echo "Testing RTOL_VAL=$$tol ATOL_VAL=$$tol BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y)"; \
+	  echo "Testing RTOL_VAL=$$tol ATOL_VAL=$$tol"; \
 	  $(MAKE) clean >/dev/null 2>&1; \
-	  $(MAKE) BUILD=release PRINT=0 BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y) RTOL_VAL=$$tol ATOL_VAL=$$tol >/dev/null && \
+	  $(MAKE) BUILD=release PRINT=0 RTOL_VAL=$$tol ATOL_VAL=$$tol >/dev/null && \
 	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_tol_$${tol}.txt; \
 	done
 
@@ -180,16 +182,7 @@ sweep-circle:
 	  echo "Testing CIRCLE_RADIUS_FRAC_Y=$$r"; \
 	  $(MAKE) clean >/dev/null 2>&1; \
 	  $(MAKE) BUILD=release PRINT=0 \
-	    BLOCK_X=$(BLOCK_X) BLOCK_Y=$(BLOCK_Y) \
-	    RTOL_VAL=$(RTOL_VAL) ATOL_VAL=$(ATOL_VAL) \
-	    T_TOTAL=$(T_TOTAL) \
-	    CIRCLE_CENTER_X_FRAC=$(CIRCLE_CENTER_X_FRAC) \
-	    CIRCLE_CENTER_Y_FRAC=$(CIRCLE_CENTER_Y_FRAC) \
-	    CIRCLE_RADIUS_FRAC_Y=$$r \
-	    TEXTURE_CORE_MZ=$(TEXTURE_CORE_MZ) \
-	    TEXTURE_OUTER_MZ=$(TEXTURE_OUTER_MZ) \
-	    TEXTURE_WIDTH_FRAC=$(TEXTURE_WIDTH_FRAC) \
-	    TEXTURE_EPS=$(TEXTURE_EPS) >/dev/null && \
+	    CIRCLE_RADIUS_FRAC_Y=$$r >/dev/null && \
 	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_circle_r_$${r}.txt; \
 	done
 
@@ -211,38 +204,32 @@ profile-ext: $(TARGET)
 
 # ====== Stats ======
 stats:
-	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: $(PROFILE_OUT).nsys-rep not found. Run 'make profile' first."; exit 1)
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: run make profile first."; exit 1)
 	nsys stats --report cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum $(PROFILE_OUT).nsys-rep > nsys_report.txt
 	@echo "Wrote: nsys_report.txt"
 
 # ====== Export ======
 export-csv:
-	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: $(PROFILE_OUT).nsys-rep not found. Run 'make profile' first."; exit 1)
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: run make profile first."; exit 1)
 	nsys export --type csv --output ./csv_out $(PROFILE_OUT).nsys-rep
 	@echo "CSV out -> ./csv_out/"
 
 export-sqlite:
-	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: $(PROFILE_OUT).nsys-rep not found. Run 'make profile' first."; exit 1)
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: run make profile first."; exit 1)
 	nsys export --sqlite $(PROFILE_OUT).sqlite $(PROFILE_OUT).nsys-rep
 	@echo "SQLite -> $(PROFILE_OUT).sqlite"
 
 # ====== GUI ======
 ui:
-	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: $(PROFILE_OUT).nsys-rep not found. Run 'make profile' first."; exit 1)
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: run make profile first."; exit 1)
 	$(NSYS_UI) $(PROFILE_OUT).nsys-rep
 
 # ====== Nsight Compute ======
 compute: $(TARGET)
 	@echo "Running Nsight Compute..."
-	@echo "If this fails with ERR_NVGPUCTRPERM, the machine lacks permission for GPU performance counters."
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
 	$(NCU) $(NCU_FLAGS) ./$(TARGET) $(ARGS) || \
-	(echo ""; \
-	 echo "Nsight Compute failed."; \
-	 echo "Likely causes:"; \
-	 echo "  1) no permission for GPU performance counters"; \
-	 echo "  2) driver / ncu version mismatch"; \
-	 exit 1)
+	(echo "Nsight Compute failed (check GPU counter permissions)"; exit 1)
 
 # ====== Show config ======
 show-config:
@@ -250,25 +237,14 @@ show-config:
 	@echo "SRC                   = $(SRC)"
 	@echo "FUSED_SRC             = $(FUSED_SRC)"
 	@echo "PRECOND_SRC           = $(PRECOND_SRC)"
+	@echo "JTV_SRC               = $(JTV_SRC)   (analytic Jv)"
 	@echo "OBJS                  = $(OBJS)"
 	@echo "BUILD                 = $(BUILD)"
-	@echo "PRINT                 = $(PRINT)"
 	@echo "CUDA_ARCH             = $(CUDA_ARCH)"
-	@echo "BLOCK_X               = $(BLOCK_X)"
-	@echo "BLOCK_Y               = $(BLOCK_Y)"
+	@echo "BLOCK_X               = $(BLOCK_X)   BLOCK_Y = $(BLOCK_Y)"
 	@echo "RTOL_VAL              = $(RTOL_VAL)"
 	@echo "ATOL_VAL              = $(ATOL_VAL)"
 	@echo "T_TOTAL               = $(T_TOTAL)"
-	@echo "CIRCLE_CENTER_X_FRAC  = $(CIRCLE_CENTER_X_FRAC)"
-	@echo "CIRCLE_CENTER_Y_FRAC  = $(CIRCLE_CENTER_Y_FRAC)"
-	@echo "CIRCLE_RADIUS_FRAC_Y  = $(CIRCLE_RADIUS_FRAC_Y)"
-	@echo "TEXTURE_CORE_MZ       = $(TEXTURE_CORE_MZ)"
-	@echo "TEXTURE_OUTER_MZ      = $(TEXTURE_OUTER_MZ)"
-	@echo "TEXTURE_WIDTH_FRAC    = $(TEXTURE_WIDTH_FRAC)"
-	@echo "TEXTURE_EPS           = $(TEXTURE_EPS)"
-	@echo "EARLY_SAVE_UNTIL      = $(EARLY_SAVE_UNTIL)"
-	@echo "EARLY_SAVE_EVERY      = $(EARLY_SAVE_EVERY)"
-	@echo "LATE_SAVE_EVERY       = $(LATE_SAVE_EVERY)"
 	@echo "PROFILE_OUT           = $(PROFILE_OUT)"
 
 # ====== Clean ======
