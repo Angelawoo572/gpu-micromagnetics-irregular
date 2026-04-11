@@ -42,10 +42,30 @@
 #include <sunnonlinsol/sunnonlinsol_newton.h>
 #include <sundials/sundials_iterative.h>   /* SUN_CLASSICAL_GS */
 
-#include "deferred_nvector.h"     /* <<< FUSED: Tier 1 + Tier 3 header */
+#include "deferred_nvector.h" /* <<< FUSED: Tier 1 + Tier 3 header */
+#include "precond.h"        /* <<< PRECOND: 3x3 block Jacobi preconditioner */
 
 /* Problem constants */
 #define GROUPSIZE 3
+
+/* -------------------------------------------------------
+ * Solver tuning knobs (set via Makefile or -D flags)
+ *
+ * KRYLOV_DIM   : max Krylov dimension for SPGMR.
+ *                0 = SUNDIALS default (min(neq, 5)).
+ *                With a good preconditioner, 3 often suffices.
+ *
+ * MAX_BDF_ORDER: max BDF order.  5 = CVODE default.
+ *                2 reduces per-step vector-op count at cost of
+ *                possibly more steps (test both for your problem).
+ * ------------------------------------------------------- */
+#ifndef KRYLOV_DIM
+#define KRYLOV_DIM 0
+#endif
+
+#ifndef MAX_BDF_ORDER
+#define MAX_BDF_ORDER 5
+#endif
 
 #ifndef RTOL_VAL
 #define RTOL_VAL 1.0e-5
@@ -163,13 +183,20 @@ __constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
     }                                                                        \
   } while (0)
 
-/* user data */
+/* user data
+ *
+ * IMPORTANT: PrecondData *pd MUST be the first field.
+ * PrecondSetup/PrecondSolve in precond.cu cast user_data to
+ * PrecondData** and dereference it to get pd. This only works
+ * correctly when pd is at offset 0 in the struct.
+ */
 typedef struct {
-  int nx;      /* old scalar width = 3 * ng */
-  int ny;      /* number of rows */
-  int ng;      /* number of physical cells per row */
-  int ncell;   /* total physical cells = ng * ny */
-  int neq;     /* total equations = 3 * ncell */
+  PrecondData *pd;  /* first field: 3x3 block Jacobi preconditioner data   */
+  int nx;           /* old scalar width = 3 * ng                           */
+  int ny;           /* number of rows                                       */
+  int ng;           /* number of physical cells per row                    */
+  int ncell;        /* total physical cells = ng * ny                      */
+  int neq;          /* total equations = 3 * ncell                         */
 } UserData;
 
 /* SoA indexing helpers */
@@ -302,6 +329,25 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   return 0;
 }
 
+/*
+ * Preconditioner callbacks are defined in precond.cu / precond.h.
+ * They implement a 3x3 block-diagonal Jacobi preconditioner:
+ *   P_cell = I - gamma * J_local  (analytic 3x3 block per cell)
+ *   psetup: compute P^{-1} via Cramer's rule, store 9 doubles/cell
+ *   psolve: z = P^{-1} r  (one matrix-vector multiply per cell)
+ *
+ * Why 3x3 block beats scalar Jacobi
+ * ------------------------------------
+ * Scalar version used M_i = 1 + gamma*alpha*|H|^2 (same for mx,my,mz).
+ * It ignores the precession cross-terms:
+ *   J[0][1] = -c_chg*h3  (dominant for large grids)
+ *   J[1][0] = +c_chg*h3
+ *   J[0][2], J[1][2], J[2][0], J[2][1]  (damping cross-terms)
+ * Without these, GMRES still needs 4-5 iterations.
+ * With 3x3 block: 1-2 iterations suffice.
+ * Expected speedup for large problems: 2-3x over scalar precond.
+ */
+
 /* final stats */
 static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
   (void)LS;
@@ -376,8 +422,8 @@ int main(int argc, char* argv[]) {
   float elapsedTime = 0.0f;
 
   /* problem size */
-  const int nx = 600;
-  const int ny = 128;
+  const int nx = 3000;
+  const int ny = 1280;
 
   if (nx % GROUPSIZE != 0) {
     fprintf(stderr, "nx must be a multiple of GROUPSIZE=%d\n", GROUPSIZE);
@@ -409,8 +455,13 @@ int main(int argc, char* argv[]) {
   udata.ng    = ng;
   udata.ncell = ncell;
   udata.neq   = neq;
+  udata.pd = NULL;
 
   CHECK_SUNDIALS(SUNContext_Create(SUN_COMM_NULL, &sunctx));
+
+  /* allocate 3x3 block Jacobi preconditioner (9 doubles per cell) */
+  udata.pd = Precond_Create(ng, ny, ncell);   /* <<< PRECOND: 3x3 block */
+  if (!udata.pd) { fprintf(stderr, "Precond_Create failed\n"); return 1; }
 
   y      = N_VNew_Cuda(neq, sunctx);
   abstol = N_VNew_Cuda(neq, sunctx);
@@ -524,40 +575,50 @@ int main(int argc, char* argv[]) {
   }
   CHECK_SUNDIALS(CVodeSetNonlinearSolver(cvode_mem, NLS));
 
-  LS = SUNLinSol_SPGMR(y, SUN_PREC_NONE, 0, sunctx);
+  /* -------------------------------------------------------
+   * Linear solver: SPGMR with LEFT Jacobi preconditioner
+   *
+   * SUN_PREC_LEFT: CVODE applies M^{-1} to the residual before
+   * each GMRES iteration.  PrecondSetup builds the per-cell 3x3
+   * block P=(I-gamma*J_local) and inverts it (Cramer's rule).
+   * PrecondSolve applies z = P^{-1} r (one matmul per cell).
+   *
+   * Expected effect on large problems (bandwidth-limited):
+   *   Without precond: SPGMR needs K~5 Krylov iters to converge.
+   *   With Jacobi:     K~1-2 iters suffice.
+   *   → linearSumKernel, dotProdKernel, wL2NormSquare calls drop ~60%.
+   *
+   * KRYLOV_DIM=0 → SUNDIALS default (min(neq, SUNSPGMR_MAXL_DEFAULT=5))
+   * Set KRYLOV_DIM=3 in Makefile for a tighter cap.
+   * ------------------------------------------------------- */
+  LS = SUNLinSol_SPGMR(y, SUN_PREC_LEFT, KRYLOV_DIM, sunctx);
   if (LS == NULL) {
     fprintf(stderr, "SUNLinSol_SPGMR failed.\n");
     goto cleanup;
   }
-  /* <<< FUSED: switch to Classical Gram-Schmidt so SPGMR calls
-   * N_VDotProdMulti (batched) instead of K sequential N_VDotProd.
-   * Classical GS computes all K projections against the unmodified
-   * vector first, then applies corrections — allowing one fused
-   * multi_dot_kernel + one sync to replace K individual kernels + K syncs.
-   * Numerical stability is adequate for tolerance 1e-4 to 1e-5. */
   CHECK_SUNDIALS(CVodeSetLinearSolver(cvode_mem, LS, NULL));
+  CHECK_SUNDIALS(CVodeSetPreconditioner(cvode_mem, PrecondSetup, PrecondSolve)); /* <<< PRECOND */
 
-  /* <<< FUSED: Classical GS only in the overhead-limited regime.
-   *
-   * Classical GS calls N_VDotProdMulti (one batch kernel, one sync)
-   * instead of K individual N_VDotProd calls (K syncs).  This wins
-   * when the problem is small and sync overhead dominates.
-   *
-   * For large problems (bandwidth-limited), Classical GS forces
-   * N_VLinearCombination for the GMRES correction step.  That kernel
-   * reads K large arrays simultaneously and hits L2 cache thrashing
-   * (~17% bandwidth efficiency vs 88% for the sequential linearSum
-   * approach used by Modified GS).  Net result: 2× SLOWER on
-   * 3000×1280 even though sync count is lower.
-   *
-   * Rule: CGS when neq < FUSED_SMALL_NEQ_THRESHOLD (500K), else MGS.
-   */
+  /* -------------------------------------------------------
+   * Adaptive GS: CGS for small problems (overhead-limited),
+   * MGS for large problems (bandwidth-limited).
+   * With a preconditioner, CGS is less necessary even for small
+   * problems, but we keep the adaptive logic for generality.
+   * ------------------------------------------------------- */
   if (neq < 500000) {
       CHECK_SUNDIALS(SUNLinSol_SPGMRSetGSType(LS, SUN_CLASSICAL_GS));
       printf("GS type: Classical (overhead-limited, neq=%d)\n", neq);
   } else {
       printf("GS type: Modified  (bandwidth-limited, neq=%d)\n", neq);
   }
+
+  /* -------------------------------------------------------
+   * BDF order cap: BDF-2 reduces Nordsieck array size and
+   * per-step N_VLinearCombination work.  Trade-off: may need
+   * slightly more steps.  Set MAX_BDF_ORDER=5 to disable.
+   * ------------------------------------------------------- */
+  CHECK_SUNDIALS(CVodeSetMaxOrd(cvode_mem, MAX_BDF_ORDER));
+  printf("Max BDF order: %d   Krylov dim: %d\n", MAX_BDF_ORDER, KRYLOV_DIM);
 
   printf("\n2D periodic smooth-texture solver (SoA) — Tier 1+3 fused (adaptive GS)\n\n");
   printf("scalar width nx = %d, rows ny = %d, groups/row = %d, ncell = %d, neq = %d\n",
@@ -614,6 +675,7 @@ cleanup:
   if (y) N_VDestroy(y);
   if (abstol) N_VDestroy(abstol);
   if (sunctx) SUNContext_Free(&sunctx);
+  Precond_Destroy(udata.pd);                   /* <<< PRECOND */
 
   FusedNVec_FreePool();   /* <<< FUSED: release persistent device buffers */
 

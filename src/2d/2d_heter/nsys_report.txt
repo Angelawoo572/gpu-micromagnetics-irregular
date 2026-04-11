@@ -5,22 +5,22 @@ Processing [profile_2d_p.sqlite] with [/opt/nvidia/nsight-systems/2025.6.3/host-
 
  Time (%)  Total Time (ns)  Num Calls   Avg (ns)    Med (ns)   Min (ns)   Max (ns)   StdDev (ns)            Name         
  --------  ---------------  ---------  -----------  ---------  --------  ----------  ------------  ----------------------
-     94.7   44,005,377,599    269,667    163,184.1   79,543.0     1,415   1,032,916     162,648.0  cudaStreamSynchronize 
-      3.3    1,542,311,918    852,309      1,809.6    1,734.0     1,581   1,174,169       2,682.3  cudaLaunchKernel      
-      1.8      838,501,802    514,160      1,630.8    1,582.0     1,286   2,002,629       4,699.6  cudaMemcpyAsync       
-      0.2       84,897,387         56  1,516,024.8   33,375.0     1,862  82,996,172  11,086,485.3  cudaMalloc            
-      0.0       16,466,001         56    294,035.7   97,057.5     2,175     613,996     298,817.4  cudaFree              
-      0.0        2,104,992     42,702         49.3       47.0        39       1,749          17.1  cuKernelGetName       
-      0.0          684,055         28     24,430.5    3,512.5     2,681     216,968      48,874.8  cudaFreeHost          
-      0.0          627,077         28     22,395.6    3,750.0     2,632     514,074      96,370.4  cudaMallocHost        
-      0.0          185,607          1    185,607.0  185,607.0   185,607     185,607           0.0  cudaEventSynchronize  
-      0.0           64,925        474        137.0       95.0        49       2,235         129.8  cuGetProcAddress_v2   
-      0.0           38,743          1     38,743.0   38,743.0    38,743      38,743           0.0  cuLibraryLoadData     
-      0.0           15,200          2      7,600.0    7,600.0     7,356       7,844         345.1  cudaEventRecord       
-      0.0            6,703          2      3,351.5    3,351.5     1,347       5,356       2,834.8  cudaEventCreate       
-      0.0              871          1        871.0      871.0       871         871           0.0  cuInit                
-      0.0              742          2        371.0      371.0        50         692         454.0  cuModuleGetLoadingMode
-      0.0              233          1        233.0      233.0       233         233           0.0  cuLibraryGetKernel    
+     95.5   26,680,388,489    132,642    201,145.9   70,676.5     1,406   1,324,786     218,257.5  cudaStreamSynchronize 
+      2.7      741,198,791    411,534      1,801.1    1,726.0     1,577   1,152,974       2,548.5  cudaLaunchKernel      
+      1.5      405,233,995    248,283      1,632.1    1,581.0     1,288   2,157,313       6,341.3  cudaMemcpyAsync       
+      0.3       82,279,396         57  1,443,498.2   32,378.0     2,131  80,399,458  10,644,997.6  cudaMalloc            
+      0.1       18,205,426         57    319,393.4  117,994.0     2,087   1,750,762     353,362.9  cudaFree              
+      0.0        1,892,503     41,196         45.9       45.0        38       1,537          13.7  cuKernelGetName       
+      0.0          685,948         28     24,498.1    3,565.0     2,806     239,367      51,596.4  cudaFreeHost          
+      0.0          638,889         28     22,817.5    3,712.5     2,973     524,319      98,296.6  cudaMallocHost        
+      0.0          163,344          1    163,344.0  163,344.0   163,344     163,344           0.0  cudaEventSynchronize  
+      0.0           70,142          2     35,071.0   35,071.0    33,982      36,160       1,540.1  cuLibraryLoadData     
+      0.0           63,526        419        151.6       95.0        50       4,316         241.4  cuGetProcAddress_v2   
+      0.0           17,804          2      8,902.0    8,902.0     7,586      10,218       1,861.1  cudaEventRecord       
+      0.0            5,764          2      2,882.0    2,882.0       335       5,429       3,602.0  cudaEventCreate       
+      0.0              927          2        463.5      463.5        43         884         594.7  cuModuleGetLoadingMode
+      0.0              848          1        848.0      848.0       848         848           0.0  cuInit                
+      0.0              579          3        193.0      186.0       172         221          25.2  cuLibraryGetKernel    
 
 Processing [profile_2d_p.sqlite] with [/opt/nvidia/nsight-systems/2025.6.3/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
 
@@ -28,21 +28,23 @@ Processing [profile_2d_p.sqlite] with [/opt/nvidia/nsight-systems/2025.6.3/host-
 
  Time (%)  Total Time (ns)  Instances  Avg (ns)   Med (ns)   Min (ns)  Max (ns)  StdDev (ns)                                                  Name                                                
  --------  ---------------  ---------  ---------  ---------  --------  --------  -----------  ----------------------------------------------------------------------------------------------------
-     31.6   13,588,295,424    279,349   48,642.7   47,488.0    15,456   144,992     33,334.3  void sundials::cuda::impl::linearSumKernel<double, int>(T1, const T1 *, T1, const T1 *, T1 *, T2)   
-     16.9    7,250,166,002    181,430   39,961.2   42,624.0    25,664    58,304     12,429.7  void sundials::cuda::impl::dotProdKernel<double, int, sundials::cuda::impl::GridReducerAtomic>(cons…
-      9.4    4,043,097,075     17,468  231,457.4  205,665.0    63,584   302,978     56,456.2  void sundials::cuda::impl::linearCombinationKernel<double, int>(int, T1 *, T1 **, T1 *, T2)         
-      8.5    3,653,184,130     42,702   85,550.7   85,504.0    84,865    91,232        236.2  f_kernel_group_soa_periodic(const double *, double *, int, int, int)                                
-      7.3    3,130,281,594     63,061   49,638.9   44,096.0    38,272   102,368     15,481.9  void sundials::cuda::impl::wL2NormSquareKernel<double, int, sundials::cuda::impl::GridReducerAtomic…
-      6.9    2,981,910,686    139,631   21,355.6   13,824.0    12,864    84,225     13,579.5  void sundials::cuda::impl::scaleKernel<double, int>(T1, const T1 *, T1 *, T2)                       
-      6.5    2,807,625,955     42,690   65,767.8   62,816.0    48,705    94,017     13,232.5  void sundials::cuda::impl::divKernel<double, int>(const T1 *, const T1 *, T1 *, T2)                 
-      5.9    2,516,812,341     42,689   58,956.9   58,529.0    57,024    64,640      1,234.7  void sundials::cuda::impl::prodKernel<double, int>(const T1 *, const T1 *, T1 *, T2)                
-      4.9    2,086,478,360      6,781  307,694.8  300,162.0    78,080   405,410     26,665.6  void sundials::cuda::impl::scaleAddMultiKernel<double, int>(int, T1 *, T1 *, T1 **, T1 **, T2)      
-      0.8      329,123,281     22,024   14,943.8   13,152.0    10,784    39,968      3,249.8  void sundials::cuda::impl::setConstKernel<double, int>(T1, T1 *, T2)                                
-      0.7      307,770,469      6,780   45,393.9   29,680.5    19,136   103,969     20,268.4  void sundials::cuda::impl::absKernel<double, int>(const T1 *, T1 *, T2)                             
-      0.5      210,460,448      6,779   31,045.9   31,008.0    30,656    31,904        186.5  void sundials::cuda::impl::invKernel<double, int>(const T1 *, T1 *, T2)                             
-      0.2       99,582,634        923  107,890.2  141,697.0    27,040   243,425     57,701.9  void sundials::cuda::impl::scaleVectorArrayKernel<double, int>(int, T1 *, T1 **, T1 **, T2)         
-      0.0           29,184          1   29,184.0   29,184.0    29,184    29,184          0.0  void sundials::cuda::impl::findMinKernel<double, int, sundials::cuda::impl::GridReducerAtomic>(T1, …
-      0.0           28,704          1   28,704.0   28,704.0    28,704    28,704          0.0  void sundials::cuda::impl::maxNormKernel<double, int, sundials::cuda::impl::GridReducerAtomic>(cons…
+     25.3    6,634,844,261    134,402   49,365.7   46,464.0    15,680   146,240     33,069.3  void sundials::cuda::impl::linearSumKernel<double, int>(T1, const T1 *, T1, const T1 *, T1 *, T2)   
+     16.9    4,445,362,810     20,468  217,186.0  210,657.0   206,432   256,769     14,947.0  psolve_kernel(const double *, double *, const double *, int)                                        
+     12.7    3,334,602,645     85,658   38,929.3   42,624.0    25,792    53,569     11,485.9  void sundials::cuda::impl::dotProdKernel<double, int, sundials::cuda::impl::GridReducerAtomic>(cons…
+     11.1    2,916,927,530     13,652  213,663.0  192,496.5    25,472   298,210     50,719.0  void sundials::cuda::impl::linearCombinationKernel<double, int>(int, T1 *, T1 **, T1 *, T2)         
+      6.7    1,757,188,532     20,489   85,762.5   85,761.0    84,993    90,272        317.9  f_kernel_group_soa_periodic(const double *, double *, int, int, int)                                
+      6.6    1,725,300,814     20,468   84,292.6   84,224.0    80,704    90,144      1,391.2  void sundials::cuda::impl::prodKernel<double, int>(const T1 *, const T1 *, T1 *, T2)                
+      5.8    1,530,628,829     29,981   51,053.3   43,840.0    38,496   104,577     15,864.5  void sundials::cuda::impl::wL2NormSquareKernel<double, int, sundials::cuda::impl::GridReducerAtomic…
+      4.9    1,298,270,289     20,452   63,478.9   56,320.0    48,832    84,640     12,197.6  void sundials::cuda::impl::divKernel<double, int>(const T1 *, const T1 *, T1 *, T2)                 
+      4.3    1,121,986,514     45,751   24,523.8   15,008.0    12,960    84,032     15,371.7  void sundials::cuda::impl::scaleKernel<double, int>(T1, const T1 *, T1 *, T2)                       
+      4.0    1,038,973,375      3,036  342,217.8  303,329.0    74,816   409,537     55,441.8  void sundials::cuda::impl::scaleAddMultiKernel<double, int>(int, T1 *, T1 *, T1 **, T1 **, T2)      
+      0.6      158,976,350     10,596   15,003.4   13,216.0    10,816    40,064      4,273.9  void sundials::cuda::impl::setConstKernel<double, int>(T1, T1 *, T2)                                
+      0.4      108,913,479      3,015   36,123.9   33,312.0    16,673   103,360     14,950.2  void sundials::cuda::impl::absKernel<double, int>(const T1 *, T1 *, T2)                             
+      0.4       93,355,471      3,014   30,973.9   30,944.0    30,848    32,064        103.0  void sundials::cuda::impl::invKernel<double, int>(const T1 *, T1 *, T2)                             
+      0.2       51,464,371        239  215,332.1  215,297.0   214,560   216,449        286.4  psetup_kernel(const double *, double, double *, int, int, int)                                      
+      0.1       37,302,631        311  119,944.2  140,768.0    27,136   245,121     59,622.9  void sundials::cuda::impl::scaleVectorArrayKernel<double, int>(int, T1 *, T1 **, T1 **, T2)         
+      0.0           29,344          1   29,344.0   29,344.0    29,344    29,344          0.0  void sundials::cuda::impl::findMinKernel<double, int, sundials::cuda::impl::GridReducerAtomic>(T1, …
+      0.0           28,800          1   28,800.0   28,800.0    28,800    28,800          0.0  void sundials::cuda::impl::maxNormKernel<double, int, sundials::cuda::impl::GridReducerAtomic>(cons…
 
 Processing [profile_2d_p.sqlite] with [/opt/nvidia/nsight-systems/2025.6.3/host-linux-x64/reports/cuda_gpu_mem_time_sum.py]... 
 
@@ -50,6 +52,6 @@ Processing [profile_2d_p.sqlite] with [/opt/nvidia/nsight-systems/2025.6.3/host-
 
  Time (%)  Total Time (ns)   Count   Avg (ns)  Med (ns)  Min (ns)  Max (ns)   StdDev (ns)           Operation          
  --------  ---------------  -------  --------  --------  --------  ---------  -----------  ----------------------------
-     66.3      219,177,034  244,493     896.5     896.0       480      1,984         34.4  [CUDA memcpy Device-to-Host]
-     33.7      111,404,764  269,667     413.1     384.0       352  1,933,161      5,034.5  [CUDA memcpy Host-to-Device]
+     65.0      102,735,935  115,641     888.4     896.0       480      1,920         35.3  [CUDA memcpy Device-to-Host]
+     35.0       55,415,942  132,642     417.8     384.0       352  2,067,910      7,540.0  [CUDA memcpy Host-to-Device]
 

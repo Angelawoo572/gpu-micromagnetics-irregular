@@ -33,10 +33,10 @@ CIRCLE_CENTER_X_FRAC ?= 0.50
 CIRCLE_CENTER_Y_FRAC ?= 0.50
 CIRCLE_RADIUS_FRAC_Y ?= 0.22
 
-TEXTURE_CORE_MZ   ?= -0.998
-TEXTURE_OUTER_MZ  ?= 0.998
+TEXTURE_CORE_MZ    ?= -0.998
+TEXTURE_OUTER_MZ   ?= 0.998
 TEXTURE_WIDTH_FRAC ?= 0.35
-TEXTURE_EPS       ?= 1.0e-12
+TEXTURE_EPS        ?= 1.0e-12
 
 # ====== Output schedule ======
 EARLY_SAVE_UNTIL ?= 80.0
@@ -65,12 +65,16 @@ NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DLATE_SAVE_EVERY=$(LATE_SAVE_EVERY)
 
 # ====== Target ======
-# <<< FUSED: fused_nvec.cu compiled as a separate translation unit
-TARGET    := 2d_p
-SRC       := 2d_p.cu
-FUSED_SRC := deferred_nvector.cu
-FUSED_OBJ := deferred_nvector.o
-ARGS      ?=
+TARGET       := 2d_p
+SRC          := 2d_p.cu
+FUSED_SRC    := deferred_nvector.cu
+PRECOND_SRC  := precond.cu
+
+FUSED_OBJ    := deferred_nvector.o
+PRECOND_OBJ  := precond.o
+OBJS         := $(FUSED_OBJ) $(PRECOND_OBJ)
+
+ARGS ?=
 
 # ====== Nsight tools ======
 NSYS ?= /opt/nvidia/nsight-systems/2025.1.3/bin/nsys
@@ -99,18 +103,23 @@ NCU_FLAGS ?= --set roofline -o ncu_$(TARGET)
 # NOTE on SUNDIALS_ENABLE_PACKAGE_FUSED_KERNELS (optional, Tier 1 bonus):
 #   For CVODE-level BDF-update fused kernels, rebuild SUNDIALS with:
 #     cmake ... -DSUNDIALS_ENABLE_PACKAGE_FUSED_KERNELS=ON
-#   and reinstall.  Tier 3 (our custom kernels) works WITHOUT this flag.
+#   and reinstall. Tier 3 (our custom kernels) works WITHOUT this flag.
 
 all: $(TARGET)
 
-# compile fused NVector layer (no CVODE-specific defines needed)
+# compile fused NVector layer
 $(FUSED_OBJ): $(FUSED_SRC) deferred_nvector.h
 	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
 	    $(INCLUDE_FLAGS) -c $< -o $@
 
+# compile preconditioner
+$(PRECOND_OBJ): $(PRECOND_SRC) precond.h
+	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
+	    $(INCLUDE_FLAGS) -c $< -o $@
+
 # compile and link main binary
-$(TARGET): $(SRC) $(FUSED_OBJ) deferred_nvector.h
-	$(NVCC) $(NVCC_FLAGS) $(INCLUDE_FLAGS) -o $@ $< $(FUSED_OBJ) \
+$(TARGET): $(SRC) $(OBJS) deferred_nvector.h precond.h
+	$(NVCC) $(NVCC_FLAGS) $(INCLUDE_FLAGS) -o $@ $< $(OBJS) \
 	    $(LIBRARY_FLAGS) $(LDLIBS)
 
 build-release:
@@ -239,7 +248,9 @@ compute: $(TARGET)
 show-config:
 	@echo "TARGET                = $(TARGET)"
 	@echo "SRC                   = $(SRC)"
-	@echo "FUSED_SRC             = $(FUSED_SRC)   (Tier 1+3 layer)"
+	@echo "FUSED_SRC             = $(FUSED_SRC)"
+	@echo "PRECOND_SRC           = $(PRECOND_SRC)"
+	@echo "OBJS                  = $(OBJS)"
 	@echo "BUILD                 = $(BUILD)"
 	@echo "PRINT                 = $(PRINT)"
 	@echo "CUDA_ARCH             = $(CUDA_ARCH)"
@@ -262,7 +273,7 @@ show-config:
 
 # ====== Clean ======
 clean:
-	rm -f $(TARGET) $(FUSED_OBJ)
+	rm -f $(TARGET) $(OBJS)
 
 reallyclean: clean
 	rm -f $(PROFILE_OUT).nsys-rep $(PROFILE_OUT).qdrep $(PROFILE_OUT).sqlite ncu_$(TARGET).ncu-rep
