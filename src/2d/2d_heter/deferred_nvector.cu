@@ -1,8 +1,4 @@
 /*
- * fused_nvec.cu  (v2)
- *
- * Changes from v1
- * ---------------
  * 1. Pointer arrays and coefficient arrays are passed DIRECTLY in the kernel
  *    argument space (goes into the GPU constant cache) — eliminates all
  *    per-call H2D cudaMemcpy for those small arrays.  v1 added ~1.6 s of
@@ -12,7 +8,6 @@
  *    slower than SUNDIALS' built-in (379 µs vs 307 µs avg).
  *
  * 3. Now pairs with Classical Gram-Schmidt (CGS) in SPGMR.
- *
  *    Root cause why v1 showed no speedup on dot products:
  *      Modified GS (SPGMR default) calls N_VDotProd in a sequential loop —
  *      each call returns a scalar synchronously, K calls = K syncs.
@@ -29,13 +24,11 @@
  *    (already done in the updated 2d_p.cu)
  *
  * What is still overridden
- * ------------------------
  * - nvdotprodmulti     : K dot products in 1 kernel + 1 sync (big win w/ CGS)
  * - nvlinearcombination: nv-vector combo in 1 kernel, 1 memory pass
  * - nvclone            : propagates both to all CVODE-internal vectors
  *
  * Why struct-based kernel args work for small arrays
- * --------------------------------------------------
  * CUDA copies kernel arguments into a 4 KB per-launch constant buffer.
  * A struct with 16 double-pointers = 128 bytes fits entirely there and
  * is served from the constant cache — same bandwidth as __constant__,
@@ -50,25 +43,19 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-/* =========================================================
- * Compile-time constants
- * ========================================================= */
+/* Compile-time constants */
 
 /* SPGMR default Krylov dim = 5; 16 is generous headroom.
  * Shared memory per block: 16 * 256 * 8 = 32 768 B < 48 KB.  */
 #define FUSED_MAX_VECS   16
 #define FUSED_BLOCK_SIZE 256
 
-/* =========================================================
- * Kernel argument bundles — passed by VALUE into constant cache,
- * no H2D memcpy needed.
- * ========================================================= */
+/* Kernel argument bundles — passed by VALUE into constant cache,
+ * no H2D memcpy needed. */
 typedef struct { const sunrealtype *p[FUSED_MAX_VECS]; } FusedPtrBundle;
 typedef struct { sunrealtype        c[FUSED_MAX_VECS]; } FusedCoeffBundle;
 
-/* =========================================================
- * Persistent device pool — ONLY for reduction output scalars
- * ========================================================= */
+/* Persistent device pool — ONLY for reduction output scalars */
 static sunrealtype *d_result_pool = NULL;
 static sunrealtype *h_result_pool = NULL;
 static int          g_pool_ready  = 0;
@@ -93,8 +80,7 @@ void FusedNVec_FreePool(void)
     g_pool_ready  = 0;
 }
 
-/* =========================================================
- * Kernel 1: multi_dot_kernel
+/* Kernel 1: multi_dot_kernel
  *
  * out[k] = sum_i  x[i] * Y.p[k][i]   for k = 0..K-1
  *
@@ -102,8 +88,7 @@ void FusedNVec_FreePool(void)
  * no extra H2D memcpy, no extra API call.
  * x[] read once and reused K times (stays in L1/L2 cache).
  *
- * With Classical GS this collapses K syncs to 1.
- * ========================================================= */
+ * With Classical GS this collapses K syncs to 1. */
 __global__ static void multi_dot_kernel(
     const sunrealtype* __restrict__ x,
     FusedPtrBundle                  Y,
@@ -141,14 +126,12 @@ __global__ static void multi_dot_kernel(
             atomicAdd(&out[k], smem[k * bsz]);
 }
 
-/* =========================================================
- * Kernel 2: linear_comb_kernel
+/* Kernel 2: linear_comb_kernel
  *
  * z[i] = sum_{j} C.c[j] * X.p[j][i]
  *
  * Coefficients and pointers both in the constant-cache bundle.
- * Single memory pass.
- * ========================================================= */
+ * Single memory pass. */
 __global__ static void linear_comb_kernel(
     int              nv,
     FusedCoeffBundle C,
@@ -167,9 +150,7 @@ __global__ static void linear_comb_kernel(
     }
 }
 
-/* =========================================================
- * Helper
- * ========================================================= */
+/* Helper */
 static int grid_for(sunindextype n)
 {
     int g = (int)((n + FUSED_BLOCK_SIZE - 1) / FUSED_BLOCK_SIZE);
@@ -181,12 +162,9 @@ static N_Vector FusedNVec_Clone(N_Vector w);
 static N_Vector FusedNVec_Clone_impl(N_Vector w, int use_lc);
 static N_Vector (*g_original_clone)(N_Vector) = NULL;
 
-/* =========================================================
- * N_VDotProdMulti override
- *
+/* N_VDotProdMulti override
  * Called by SPGMR Classical GS when nvdotprodmulti != NULL.
- * K × N_VDotProd (K syncs)  →  1 kernel + 1 sync.
- * ========================================================= */
+ * K × N_VDotProd (K syncs)  →  1 kernel + 1 sync. */
 static SUNErrCode FusedNVec_DotProdMulti(
     int nvec, N_Vector x, N_Vector *Y, sunrealtype *dotprods)
 {
@@ -223,12 +201,11 @@ static SUNErrCode FusedNVec_DotProdMulti(
     return SUN_SUCCESS;
 }
 
-/* =========================================================
+/* 
  * N_VLinearCombination override
  *
  * z = sum_{j} c[j] * X[j]  in one kernel, one memory pass.
- * Bundles go via kernel arg space — zero H2D overhead.
- * ========================================================= */
+ * Bundles go via kernel arg space — zero H2D overhead. */
 static SUNErrCode FusedNVec_LinearCombination(
     int nv, sunrealtype *c, N_Vector *X, N_Vector z)
 {
@@ -257,7 +234,6 @@ static SUNErrCode FusedNVec_LinearCombination(
     /* async — no sync needed, result stays on device */
     return SUN_SUCCESS;
 }
-
 
 /*
  * Threshold between overhead-limited and bandwidth-limited regimes.
@@ -302,12 +278,11 @@ static N_Vector FusedNVec_Clone(N_Vector w)
     return FusedNVec_Clone_impl(w, g_use_lc_override);
 }
 
-/* =========================================================
- * Public entry point
+/* Public entry point
  *
  * neq  : total number of equations (N_VGetLength(v)).
  *        Used to choose the right regime automatically.
- * ========================================================= */
+ */
 void FusedNVec_Init(N_Vector v)
 {
     if (!v) return;

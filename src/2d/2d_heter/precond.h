@@ -7,7 +7,6 @@
  * 3×3 Block-Diagonal Jacobi Preconditioner — with correct gamma handling.
  *
  * Key fix over v1
- * ---------------
  * v1 returned immediately when jok=SUNTRUE, reusing P^{-1} from the
  * previous call.  This is WRONG: jok=SUNTRUE means J is structurally
  * unchanged (y hasn't moved much), but gamma changes every Newton step,
@@ -23,7 +22,6 @@
  * Memory: 2 × 9 × ncell × 8 bytes = ~174 MB for 1.28M cells.
  *
  * Effect on GMRES convergence
- * ---------------------------
  * With wrong gamma:  preconditioner approximates (I - gamma_old * J)^{-1}
  *                    applied to a system with (I - gamma_new * J).
  *                    The residual after preconditioning is not small,
@@ -32,7 +30,6 @@
  *                     GMRES should converge in 2-3 iterations.
  *
  * API (unchanged from v1 — drop-in replacement)
- * -----------------------------------------------
  *   PrecondData* Precond_Create(int ng, int ny, int ncell);
  *   void         Precond_Destroy(PrecondData *pd);
  *   int          PrecondSetup(...);   // CVODE psetup callback

@@ -1,13 +1,9 @@
 /*
  * jtv.cu  —  Analytic Jacobian-times-vector for the 2D periodic LLG solver.
  *
- * =========================================================================
  * Why this exists
- * =========================================================================
  * CVODE's default Jv approximation:
- *
- *   Jv ≈ [f(y + ε·v) - f(y)] / ε
- *
+    Jv ≈ [f(y + ε·v) - f(y)] / ε
  * costs one full RHS evaluation per GMRES iteration.  With 20 468 GMRES
  * iterations observed in profiling, that is 20 468 extra launches of
  * f_kernel_group_soa_periodic (~85 µs each) = ~1.74 s spent purely on
@@ -19,10 +15,7 @@
  *   - runs in the same time as one RHS evaluation
  *   - is registered via CVodeSetJacTimes(cvode_mem, NULL, JtvProduct)
  *
- * =========================================================================
  * Full analytic derivation
- * =========================================================================
- *
  * LLG RHS (cell i, SoA layout):
  *   f1 = c_chg*(m3*h2 - m2*h3) + c_alpha*(h1 - mh*m1)
  *   f2 = c_chg*(m1*h3 - m3*h1) + c_alpha*(h2 - mh*m2)
@@ -65,9 +58,7 @@
  * This is computed in one CUDA kernel with the same stencil structure
  * as the RHS kernel.  No extra f() call, no ε.
  *
- * =========================================================================
  * Connection to parallel-systems theory (15-418 / PMPP)
- * =========================================================================
  * From the PMPP slides perspective, analytic Jv is "work elimination":
  * we remove 20 K redundant stencil kernel launches (the FD evaluations)
  * by exploiting problem structure.  This is the GPU analog of Halide's
@@ -86,10 +77,8 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-/* =========================================================
- * Physical constants — must match 2d_p.cu exactly.
- * Stored in __constant__ memory for broadcast efficiency.
- * ========================================================= */
+/* Physical constants — must match 2d_p.cu exactly.
+ * Stored in __constant__ memory for broadcast efficiency. */
 __constant__ sunrealtype jc_msk[3]  = {0.0, 0.0, 1.0};
 __constant__ sunrealtype jc_nsk[3]  = {1.0, 0.0, 0.0};
 __constant__ sunrealtype jc_chk     = 1.0;
@@ -99,9 +88,7 @@ __constant__ sunrealtype jc_chg     = 1.0;
 __constant__ sunrealtype jc_cha     = 0.0;
 __constant__ sunrealtype jc_chb     = 0.3;
 
-/* =========================================================
- * Index / wrap helpers (SoA, same as 2d_p.cu)
- * ========================================================= */
+/* Index / wrap helpers (SoA, same as 2d_p.cu) */
 __device__ static inline int jidx_mx(int c, int nc) { return c; }
 __device__ static inline int jidx_my(int c, int nc) { return nc + c; }
 __device__ static inline int jidx_mz(int c, int nc) { return 2*nc + c; }
@@ -113,8 +100,7 @@ __device__ static inline int jwrap_y(int y, int ny) {
     return (y < 0) ? (y+ny) : ((y >= ny) ? (y-ny) : y);
 }
 
-/* =========================================================
- * jtv_kernel
+/* jtv_kernel
  *
  * Computes (J·v)_i analytically for each cell i.
  *
@@ -125,7 +111,7 @@ __device__ static inline int jwrap_y(int y, int ny) {
  *   Jv — result J(y)·v (device pointer, SoA)
  *
  * One thread per cell, same 2-D launch as f_kernel.
- * ========================================================= */
+ */
 __global__ static void jtv_kernel(
     const sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ v,
@@ -231,18 +217,14 @@ __global__ static void jtv_kernel(
             + jc_alpha * (dh3 - dmh*m3 - mh*v3);
 }
 
-/* =========================================================
- * UserData forward declaration
- * (mirrors the struct in 2d_p.cu; only ng/ny/ncell are needed)
- * ========================================================= */
+/* UserData forward declaration
+ * (mirrors the struct in 2d_p.cu; only ng/ny/ncell are needed) */
 typedef struct {
     void *pd_opaque;   /* PrecondData* — not used here */
     int   nx, ny, ng, ncell, neq;
 } JtvUserData;
 
-/* =========================================================
- * JtvProduct  —  CVODE jtimes callback
- * ========================================================= */
+/* JtvProduct  —  CVODE jtimes callback */
 int JtvProduct(N_Vector v,  N_Vector Jv,
                sunrealtype t,
                N_Vector y,  N_Vector fy,

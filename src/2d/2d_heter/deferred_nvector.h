@@ -1,10 +1,7 @@
 #ifndef FUSED_NVEC_H
 #define FUSED_NVEC_H
 
-/*
- * fused_nvec.h
- *
- * Tier 1 + Tier 3 optimization layer on top of SUNDIALS NVECTOR_CUDA.
+/* Tier 1 + Tier 3 optimization layer on top of SUNDIALS NVECTOR_CUDA.
  *
  * Tier 1 (inside FusedNVec_Init):
  *   Calls N_VEnableFusedOps_Cuda(v, 1) to activate SUNDIALS' own

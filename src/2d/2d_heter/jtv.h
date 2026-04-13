@@ -5,7 +5,6 @@
  * jtv.h  —  Analytic Jacobian-times-vector (Jv) for the 2D LLG solver.
  *
  * Problem
- * -------
  * By default CVODE approximates  Jv ≈ [f(y + ε·v) - f(y)] / ε  (finite
  * difference).  This calls the RHS function f() once per GMRES iteration
  * just to get Jv, on top of the f() call that already happened in the
@@ -14,14 +13,12 @@
  * differencing overhead plus the ε-perturbation error.
  *
  * Solution
- * --------
  * Supply an analytic Jv kernel.  The LLG Jacobian has a known stencil
  * structure (self block + 4-neighbor exchange coupling), so Jv can be
  * evaluated exactly in a single CUDA kernel with no extra f() call and
  * no finite-difference error.
  *
  * Derivation summary (see jtv.cu for full details)
- * -------------------------------------------------
  * LLG RHS at cell i:
  *   f_i = c_chg*(m_i × H_i) + c_alpha*(H_i - (m_i·H_i)*m_i)
  *
@@ -42,7 +39,6 @@
  * cost as one RHS evaluation — but without calling f() at all.
  *
  * Registration
- * ------------
  * After CVodeSetLinearSolver:
  *   CVodeSetJacTimes(cvode_mem, NULL, JtvProduct);
  *
@@ -50,7 +46,6 @@
  * the second is the analytic jtimes callback defined here.
  *
  * Correctness
- * -----------
  * Mathematical output is identical to the exact Jacobian applied to v;
  * no ε approximation is involved.  The simulation trajectory is unchanged
  * (same Newton convergence, same step sizes) — only the way Jv is

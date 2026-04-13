@@ -480,16 +480,15 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  /* -------------------------------------------------------
-   * <<< FUSED  Tier 1 + Tier 3: install fused ops on y.
+  /* FUSED  Tier 1 + Tier 3: install fused ops on y.
    *
    * Must be called AFTER N_VNew_Cuda and BEFORE CVodeInit,
    * so that all vectors CVODE clones from y (Krylov basis,
    * work arrays, weight/error vectors) inherit the overrides.
    * We do NOT call it on abstol — abstol is read-only for
    * tolerances and is not cloned for arithmetic work.
-   * ------------------------------------------------------- */
-  FusedNVec_Init(y);   /* <<< FUSED */
+   */
+  FusedNVec_Init(y);   /* FUSED */
 
   ydata       = N_VGetHostArrayPointer_Cuda(y);
   abstol_data = N_VGetHostArrayPointer_Cuda(abstol);
@@ -504,7 +503,6 @@ int main(int argc, char* argv[]) {
   }
 
   /* Initialize y and abstol in SoA layout
-   *
    * Smooth Néel-like radial texture:
    *   - center: approximately downward
    *   - far away: approximately upward
@@ -582,8 +580,7 @@ int main(int argc, char* argv[]) {
   }
   CHECK_SUNDIALS(CVodeSetNonlinearSolver(cvode_mem, NLS));
 
-  /* -------------------------------------------------------
-   * Linear solver: SPGMR with LEFT Jacobi preconditioner
+  /* Linear solver: SPGMR with LEFT Jacobi preconditioner
    *
    * SUN_PREC_LEFT: CVODE applies M^{-1} to the residual before
    * each GMRES iteration.  PrecondSetup builds the per-cell 3x3
@@ -593,31 +590,30 @@ int main(int argc, char* argv[]) {
    * Expected effect on large problems (bandwidth-limited):
    *   Without precond: SPGMR needs K~5 Krylov iters to converge.
    *   With Jacobi:     K~1-2 iters suffice.
-   *   → linearSumKernel, dotProdKernel, wL2NormSquare calls drop ~60%.
+   *   - linearSumKernel, dotProdKernel, wL2NormSquare calls drop ~60%.
    *
    * KRYLOV_DIM=0 → SUNDIALS default (min(neq, SUNSPGMR_MAXL_DEFAULT=5))
    * Set KRYLOV_DIM=3 in Makefile for a tighter cap.
-   * ------------------------------------------------------- */
+   */
   LS = SUNLinSol_SPGMR(y, SUN_PREC_LEFT, KRYLOV_DIM, sunctx);
   if (LS == NULL) {
     fprintf(stderr, "SUNLinSol_SPGMR failed.\n");
     goto cleanup;
   }
   CHECK_SUNDIALS(CVodeSetLinearSolver(cvode_mem, LS, NULL));
-  /* <<< JTV: register analytic Jv — eliminates ~20K extra f() calls.
+  /* JTV: register analytic Jv — eliminates ~20K extra f() calls.
    * First arg NULL means no jtsetup callback needed.
    * user_data (UserData*) is already registered via CVodeSetUserData;
    * JtvProduct casts it to JtvUserData* which has the same memory layout
    * for the fields it uses (ng, ny, ncell). */
-  CHECK_SUNDIALS(CVodeSetJacTimes(cvode_mem, NULL, JtvProduct)); /* <<< JTV */
-  CHECK_SUNDIALS(CVodeSetPreconditioner(cvode_mem, PrecondSetup, PrecondSolve)); /* <<< PRECOND */
+  CHECK_SUNDIALS(CVodeSetJacTimes(cvode_mem, NULL, JtvProduct)); /* JTV */
+  CHECK_SUNDIALS(CVodeSetPreconditioner(cvode_mem, PrecondSetup, PrecondSolve)); /* PRECOND */
 
-  /* -------------------------------------------------------
-   * Adaptive GS: CGS for small problems (overhead-limited),
+  /* Adaptive GS: CGS for small problems (overhead-limited),
    * MGS for large problems (bandwidth-limited).
    * With a preconditioner, CGS is less necessary even for small
    * problems, but we keep the adaptive logic for generality.
-   * ------------------------------------------------------- */
+   */
   if (neq < 500000) {
       CHECK_SUNDIALS(SUNLinSol_SPGMRSetGSType(LS, SUN_CLASSICAL_GS));
       printf("GS type: Classical (overhead-limited, neq=%d)\n", neq);
@@ -625,11 +621,10 @@ int main(int argc, char* argv[]) {
       printf("GS type: Modified  (bandwidth-limited, neq=%d)\n", neq);
   }
 
-  /* -------------------------------------------------------
-   * BDF order cap: BDF-2 reduces Nordsieck array size and
+  /* BDF order cap: BDF-2 reduces Nordsieck array size and
    * per-step N_VLinearCombination work.  Trade-off: may need
    * slightly more steps.  Set MAX_BDF_ORDER=5 to disable.
-   * ------------------------------------------------------- */
+   */
   CHECK_SUNDIALS(CVodeSetMaxOrd(cvode_mem, MAX_BDF_ORDER));
   printf("Max BDF order: %d   Krylov dim: %d\n", MAX_BDF_ORDER, KRYLOV_DIM);
 
@@ -688,9 +683,9 @@ cleanup:
   if (y) N_VDestroy(y);
   if (abstol) N_VDestroy(abstol);
   if (sunctx) SUNContext_Free(&sunctx);
-  Precond_Destroy(udata.pd);                   /* <<< PRECOND */
+  Precond_Destroy(udata.pd);                   /* PRECOND */
 
-  FusedNVec_FreePool();   /* <<< FUSED: release persistent device buffers */
+  FusedNVec_FreePool();   /* FUSED: release persistent device buffers */
 
 #if ENABLE_OUTPUT
   if (fp) fclose(fp);

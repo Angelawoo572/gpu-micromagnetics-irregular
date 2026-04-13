@@ -4,7 +4,6 @@
  * Fix: separate J storage from P^{-1}.
  *
  * Root cause of v1 failure
- * -------------------------
  * Profiling showed psetup_kernel launched only 266 times vs
  * psolve_kernel 20,207 times (nni~3753).  This means CVODE was
  * sending jok=SUNTRUE ~93% of the time, and v1 returned immediately,
@@ -17,7 +16,6 @@
  *                 => Must recompute P = I - gamma*J even when jok=TRUE.
  *
  * v2 solution: two-kernel approach
- * ----------------------------------
  * Kernel 1  build_J_kernel   : reads y, computes J(y), stores to d_J.
  *                               Called only when jok=SUNFALSE.
  *
@@ -31,7 +29,6 @@
  * no global memory reads of y, just 9 doubles/cell from d_J).
  *
  * Expected outcome
- * -----------------
  * psetup now always produces P^{-1} consistent with the current gamma.
  * GMRES should converge in 2-3 iterations instead of 5, reducing:
  *   - psolve_kernel calls by ~50%
@@ -49,9 +46,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* =========================================================
- * Physical constants — must match 2d_p.cu
- * ========================================================= */
+/* Physical constants — must match 2d_p.cu */
 __constant__ sunrealtype pc_msk[3]  = {0.0, 0.0, 1.0};
 __constant__ sunrealtype pc_nsk[3]  = {1.0, 0.0, 0.0};
 __constant__ sunrealtype pc_chk     = 1.0;
@@ -61,9 +56,7 @@ __constant__ sunrealtype pc_chg     = 1.0;
 __constant__ sunrealtype pc_cha     = 0.0;
 __constant__ sunrealtype pc_chb     = 0.3;
 
-/* =========================================================
- * Index / wrap helpers
- * ========================================================= */
+/* Index / wrap helpers */
 __device__ static inline int pidx_mx(int c, int nc) { return c; }
 __device__ static inline int pidx_my(int c, int nc) { return nc + c; }
 __device__ static inline int pidx_mz(int c, int nc) { return 2*nc + c; }
@@ -75,8 +68,7 @@ __device__ static inline int pwrap_y(int y, int ny) {
     return (y < 0) ? (y+ny) : ((y >= ny) ? (y-ny) : y);
 }
 
-/* =========================================================
- * Kernel 1: build_J_kernel
+/* Kernel 1: build_J_kernel
  *
  * Computes the analytic 3×3 local Jacobian J[i] for each cell i
  * and stores it in d_J[9*cell .. 9*cell+8] (row-major).
@@ -85,8 +77,7 @@ __device__ static inline int pwrap_y(int y, int ny) {
  * This is the expensive kernel: it reads y and its 4 neighbors.
  *
  * J[row][col] = ∂f_row/∂m_col  (self-coupling only, neighbors frozen)
- * See precond.h / v1 comments for full derivation.
- * ========================================================= */
+ * See precond.h / v1 comments for full derivation. */
 __global__ static void build_J_kernel(
     const sunrealtype* __restrict__ y,
     sunrealtype*       __restrict__ d_J,   /* 9 * ncell */
@@ -149,8 +140,7 @@ __global__ static void build_J_kernel(
     d_J[b+8] = pc_alpha * (pc_msk[2]*pc_chk - d3*m3 - mh);
 }
 
-/* =========================================================
- * Kernel 2: build_Pinv_kernel
+/* Kernel 2: build_Pinv_kernel
  *
  * Reads d_J (the stored Jacobian) and the current gamma.
  * Computes P = I - gamma * J per cell and stores P^{-1}
@@ -160,8 +150,7 @@ __global__ static void build_J_kernel(
  * gamma changes every Newton step.
  *
  * This kernel is cheap: only reads 9 doubles/cell from d_J,
- * no y stencil reads. Purely arithmetic.
- * ========================================================= */
+ * no y stencil reads. Purely arithmetic. */
 __global__ static void build_Pinv_kernel(
     const sunrealtype* __restrict__ d_J,
     sunrealtype                     gamma,
@@ -203,9 +192,7 @@ __global__ static void build_Pinv_kernel(
     d_Pinv[b+8] =  inv_det * (P00*P11 - P01*P10);
 }
 
-/* =========================================================
- * Kernel 3: psolve_kernel — unchanged from v1
- * ========================================================= */
+/* Kernel 3: psolve_kernel — unchanged from v1 */
 __global__ static void psolve_kernel(
     const sunrealtype* __restrict__ r,
     sunrealtype*       __restrict__ z,
@@ -229,10 +216,7 @@ __global__ static void psolve_kernel(
     z[i2] = Pinv[b+6]*r0 + Pinv[b+7]*r1 + Pinv[b+8]*r2;
 }
 
-/* =========================================================
- * Public API
- * ========================================================= */
-
+/* Public API */
 PrecondData* Precond_Create(int ng, int ny, int ncell)
 {
     PrecondData *pd = (PrecondData*)malloc(sizeof(PrecondData));
@@ -270,16 +254,14 @@ void Precond_Destroy(PrecondData *pd)
     free(pd);
 }
 
-/* =========================================================
- * PrecondSetup — CVODE psetup callback
+/* PrecondSetup — CVODE psetup callback
  *
  * Two-phase approach:
  *   Phase 1 (jok=SUNFALSE): rebuild J from y (expensive stencil read)
  *   Phase 2 (always):       rebuild P^{-1} from J and current gamma
  *
  * This ensures P^{-1} always matches the current gamma, which is
- * the key fix over v1.
- * ========================================================= */
+ * the key fix over v1. */
 int PrecondSetup(sunrealtype t,
                  N_Vector y, N_Vector fy,
                  sunbooleantype jok, sunbooleantype *jcurPtr,
@@ -332,9 +314,7 @@ int PrecondSetup(sunrealtype t,
     return 0;
 }
 
-/* =========================================================
- * PrecondSolve — unchanged from v1
- * ========================================================= */
+/* PrecondSolve */
 int PrecondSolve(sunrealtype t,
                  N_Vector y, N_Vector fy,
                  N_Vector r, N_Vector z,
