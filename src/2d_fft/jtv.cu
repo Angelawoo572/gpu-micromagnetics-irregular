@@ -1,14 +1,16 @@
 /*
  * jtv.cu  —  Analytic Jacobian-times-vector for the 2D periodic LLG solver.
  *
- * FIX: JtvUserData now mirrors the FULL UserData struct layout from 2d_fft.cu.
- * When DemagData* and d_hdmag* were added to UserData, the old JtvUserData
- * (which only had pd_opaque + ints) caused field offset mismatches, making
- * ng/ny/ncell read garbage values → jtv_kernel launch failed with
- * "invalid argument".
- *
- * Rule: JtvUserData must have the SAME pointer fields as UserData, in the
- * SAME order, before the int fields. Only the int fields are actually used.
+ * JtvUserData must mirror UserData from 2d_fft.cu EXACTLY.
+ * Current UserData layout:
+ *   PrecondData  *pd;        // +0  (8 bytes)
+ *   DemagData    *demag;     // +8  (8 bytes)
+ *   sunrealtype  *d_hdmag;   // +16 (8 bytes)
+ *   int nx;                  // +24
+ *   int ny;                  // +28
+ *   int ng;                  // +32
+ *   int ncell;               // +36
+ *   int neq;                 // +40
  */
 
 #include "jtv.h"
@@ -19,7 +21,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-/* Physical constants — must match 2d_fft.cu exactly */
+/* Physical constants — must match 2d_fft.cu */
 __constant__ sunrealtype jc_msk[3]  = {0.0, 0.0, 1.0};
 __constant__ sunrealtype jc_nsk[3]  = {1.0, 0.0, 0.0};
 __constant__ sunrealtype jc_chk     = 1.0;
@@ -29,7 +31,6 @@ __constant__ sunrealtype jc_chg     = 1.0;
 __constant__ sunrealtype jc_cha     = 0.0;
 __constant__ sunrealtype jc_chb     = 0.3;
 
-/* Index / wrap helpers (SoA, same as 2d_fft.cu) */
 __device__ static inline int jidx_mx(int c, int nc) { return c; }
 __device__ static inline int jidx_my(int c, int nc) { return nc + c; }
 __device__ static inline int jidx_mz(int c, int nc) { return 2*nc + c; }
@@ -41,9 +42,6 @@ __device__ static inline int jwrap_y(int y, int ny) {
     return (y < 0) ? (y+ny) : ((y >= ny) ? (y-ny) : y);
 }
 
-/*
- * jtv_kernel — unchanged from original, one thread per cell.
- */
 __global__ static void jtv_kernel(
     const sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ v,
@@ -55,97 +53,67 @@ __global__ static void jtv_kernel(
     if (gx >= ng || gy >= ny) return;
 
     const int cell = gy * ng + gx;
-
     const int mx = jidx_mx(cell, ncell);
     const int my = jidx_my(cell, ncell);
     const int mz = jidx_mz(cell, ncell);
 
-    const int xl   = jwrap_x(gx-1, ng),  xr   = jwrap_x(gx+1, ng);
-    const int yu   = jwrap_y(gy-1, ny),  ydn  = jwrap_y(gy+1, ny);
-    const int lc   = gy*ng + xl,          rc   = gy*ng + xr;
-    const int uc   = yu*ng + gx,          dc   = ydn*ng + gx;
+    const int xl  = jwrap_x(gx-1, ng), xr  = jwrap_x(gx+1, ng);
+    const int yu  = jwrap_y(gy-1, ny), ydn = jwrap_y(gy+1, ny);
+    const int lc  = gy*ng + xl,        rc  = gy*ng + xr;
+    const int uc  = yu*ng + gx,        dc  = ydn*ng + gx;
 
-    const sunrealtype m1 = y[mx];
-    const sunrealtype m2 = y[my];
-    const sunrealtype m3 = y[mz];
+    const sunrealtype m1 = y[mx], m2 = y[my], m3 = y[mz];
+    const sunrealtype v1 = v[mx], v2 = v[my], v3 = v[mz];
 
-    const sunrealtype v1 = v[mx];
-    const sunrealtype v2 = v[my];
-    const sunrealtype v3 = v[mz];
-
-    const sunrealtype v1L = v[jidx_mx(lc, ncell)],  v1R = v[jidx_mx(rc, ncell)];
-    const sunrealtype v1U = v[jidx_mx(uc, ncell)],  v1D = v[jidx_mx(dc, ncell)];
-    const sunrealtype v2L = v[jidx_my(lc, ncell)],  v2R = v[jidx_my(rc, ncell)];
-    const sunrealtype v2U = v[jidx_my(uc, ncell)],  v2D = v[jidx_my(dc, ncell)];
-    const sunrealtype v3L = v[jidx_mz(lc, ncell)],  v3R = v[jidx_mz(rc, ncell)];
-    const sunrealtype v3U = v[jidx_mz(uc, ncell)],  v3D = v[jidx_mz(dc, ncell)];
+    const sunrealtype v1L=v[jidx_mx(lc,ncell)], v1R=v[jidx_mx(rc,ncell)];
+    const sunrealtype v1U=v[jidx_mx(uc,ncell)], v1D=v[jidx_mx(dc,ncell)];
+    const sunrealtype v2L=v[jidx_my(lc,ncell)], v2R=v[jidx_my(rc,ncell)];
+    const sunrealtype v2U=v[jidx_my(uc,ncell)], v2D=v[jidx_my(dc,ncell)];
+    const sunrealtype v3L=v[jidx_mz(lc,ncell)], v3R=v[jidx_mz(rc,ncell)];
+    const sunrealtype v3U=v[jidx_mz(uc,ncell)], v3D=v[jidx_mz(dc,ncell)];
 
     const sunrealtype che_chb = jc_che + jc_chb;
 
     const sunrealtype h1 =
-        che_chb * (y[jidx_mx(lc,ncell)] + y[jidx_mx(rc,ncell)]) +
-        jc_che  * (y[jidx_mx(uc,ncell)] + y[jidx_mx(dc,ncell)]);
+        che_chb*(y[jidx_mx(lc,ncell)]+y[jidx_mx(rc,ncell)]) +
+        jc_che *(y[jidx_mx(uc,ncell)]+y[jidx_mx(dc,ncell)]);
 
     const sunrealtype h2 =
-        jc_che * (y[jidx_my(lc,ncell)] + y[jidx_my(rc,ncell)] +
-                  y[jidx_my(uc,ncell)] + y[jidx_my(dc,ncell)]);
+        jc_che*(y[jidx_my(lc,ncell)]+y[jidx_my(rc,ncell)]+
+                y[jidx_my(uc,ncell)]+y[jidx_my(dc,ncell)]);
 
     const sunrealtype h3 =
-        jc_che * (y[jidx_mz(lc,ncell)] + y[jidx_mz(rc,ncell)] +
-                  y[jidx_mz(uc,ncell)] + y[jidx_mz(dc,ncell)])
-        + m3;
+        jc_che*(y[jidx_mz(lc,ncell)]+y[jidx_mz(rc,ncell)]+
+                y[jidx_mz(uc,ncell)]+y[jidx_mz(dc,ncell)]) + m3;
 
     const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
 
-    const sunrealtype dh1 =
-        che_chb * (v1L + v1R) +
-        jc_che  * (v1U + v1D);
+    const sunrealtype dh1 = che_chb*(v1L+v1R) + jc_che*(v1U+v1D);
+    const sunrealtype dh2 = jc_che*(v2L+v2R+v2U+v2D);
+    const sunrealtype dh3 = jc_che*(v3L+v3R+v3U+v3D) + v3;
 
-    const sunrealtype dh2 =
-        jc_che * (v2L + v2R + v2U + v2D);
+    const sunrealtype dmh = (v1*h1+v2*h2+v3*h3) + (m1*dh1+m2*dh2+m3*dh3);
 
-    const sunrealtype dh3 =
-        jc_che * (v3L + v3R + v3U + v3D) + v3;
-
-    const sunrealtype dmh = (v1*h1 + v2*h2 + v3*h3)
-                           + (m1*dh1 + m2*dh2 + m3*dh3);
-
-    Jv[mx] = jc_chg * (v3*h2 + m3*dh2 - v2*h3 - m2*dh3)
-            + jc_alpha * (dh1 - dmh*m1 - mh*v1);
-
-    Jv[my] = jc_chg * (v1*h3 + m1*dh3 - v3*h1 - m3*dh1)
-            + jc_alpha * (dh2 - dmh*m2 - mh*v2);
-
-    Jv[mz] = jc_chg * (v2*h1 + m2*dh1 - v1*h2 - m1*dh2)
-            + jc_alpha * (dh3 - dmh*m3 - mh*v3);
+    Jv[mx] = jc_chg*(v3*h2+m3*dh2-v2*h3-m2*dh3) + jc_alpha*(dh1-dmh*m1-mh*v1);
+    Jv[my] = jc_chg*(v1*h3+m1*dh3-v3*h1-m3*dh1) + jc_alpha*(dh2-dmh*m2-mh*v2);
+    Jv[mz] = jc_chg*(v2*h1+m2*dh1-v1*h2-m1*dh2) + jc_alpha*(dh3-dmh*m3-mh*v3);
 }
 
 /*
- * JtvUserData — mirrors the FULL UserData layout from 2d_fft.cu.
- *
- * UserData layout (2d_fft.cu):
- *   PrecondData  *pd;        // pointer  (8 bytes)
- *   DemagData    *demag;     // pointer  (8 bytes)   <<< NEW
- *   sunrealtype  *d_hdmag;   // pointer  (8 bytes)   <<< NEW
- *   int nx, ny, ng, ncell, neq;
- *
- * We must match all pointer fields BEFORE the ints, or the int offsets
- * will be wrong and ng/ny/ncell will read garbage → invalid kernel args.
- *
- * Fields we don't use are declared as void* to consume the right space.
+ * JtvUserData — mirrors UserData from 2d_fft.cu exactly.
+ * Three pointer fields before the ints.
  */
 typedef struct {
-    void *pd_opaque;       /* PrecondData*   — offset 0  */
-    void *demag_opaque;    /* DemagData*     — offset 8  (NEW) */
-    void *d_hdmag_opaque;  /* sunrealtype*   — offset 16 (NEW) */
-    int   nx;              /* offset 24 */
-    int   ny;              /* offset 28 */
-    int   ng;              /* offset 32 */
-    int   ncell;           /* offset 36 */
-    int   neq;             /* offset 40 */
+    void *pd_opaque;        /* PrecondData*  — offset 0  */
+    void *demag_opaque;     /* DemagData*    — offset 8  */
+    void *d_hdmag_opaque;   /* sunrealtype*  — offset 16 */
+    int   nx;               /* offset 24 */
+    int   ny;               /* offset 28 */
+    int   ng;               /* offset 32 */
+    int   ncell;            /* offset 36 */
+    int   neq;              /* offset 40 */
 } JtvUserData;
 
-/* JtvProduct — CVODE jtimes callback */
 int JtvProduct(N_Vector v,  N_Vector Jv,
                sunrealtype t,
                N_Vector y,  N_Vector fy,
@@ -164,8 +132,7 @@ int JtvProduct(N_Vector v,  N_Vector Jv,
     const dim3 grid((ud->ng + block.x - 1) / block.x,
                     (ud->ny + block.y - 1) / block.y);
 
-    jtv_kernel<<<grid, block>>>(yd, vd, Jvd,
-                                ud->ng, ud->ny, ud->ncell);
+    jtv_kernel<<<grid, block>>>(yd, vd, Jvd, ud->ng, ud->ny, ud->ncell);
 
     const cudaError_t e = cudaPeekAtLastError();
     if (e != cudaSuccess) {

@@ -1,67 +1,46 @@
 /*
- * fft_demag.cu  —  FFT-based demagnetization field for 2D periodic LLG
+ * demag_fft.cu  —  FFT demagnetization field, professor's Newell tensor method
  *
- * Physics / Math (from the handwritten derivation in the images):
- * ----------------------------------------------------------------
- *  Space domain:
- *    h_dmag(i,j) = Σ_{m,n}  D(i-m, j-n) · M(m,n)          [convolution]
  *
- *  Convolution theorem (DFT both sides):
- *    Σ_{i,j} h(i,j) e^{-i(kx·i + ky·j)} = ĥ(kx, ky)
+ * PHYSICS
  *
- *  Factor the double sum:
- *    = Σ_{m,n} M(m,n) Σ_{i,j} D(i-m, j-n) e^{-i(kx·i + ky·j)}
- *    = Σ_{m,n} M(m,n) e^{-i(kx·m + ky·n)} · D̂(kx, ky)
- *    = M̂(kx, ky) · D̂(kx, ky)
+ * The demagnetization field is the convolution:
  *
- *  Therefore:
- *    h_dmag(i,j) = IFFT[ D̂(kx,ky) · M̂(kx,ky) ]
+ *   h_dmag,α(i,j) = Σ_{m,n}  N_αβ(i-m, j-n) · M_β(m,n)
  *
- * Algorithm (one call to Demag_Apply per timestep):
- *   1.  R2C FFT of mx, my, mz separately  →  M̂x, M̂y, M̂z
- *   2.  Pointwise multiply with precomputed D̂ (3×3 tensor in k-space):
- *         Ĥx = D̂xx·M̂x + D̂xy·M̂y + D̂xz·M̂z
- *         Ĥy = D̂yx·M̂x + D̂yy·M̂y + D̂yz·M̂z
- *         Ĥz = D̂zx·M̂x + D̂zy·M̂y + D̂zz·M̂z
- *   3.  C2R IFFT of Ĥx, Ĥy, Ĥz  →  h_dmag_x, h_dmag_y, h_dmag_z
- *   4.  Normalize by 1/(nx*ny)
+ * Via the convolution theorem:
  *
- * Demag tensor D (2D film, periodic boundary, dipole-dipole):
- *   For a 2D thin-film periodic system the real-space dipolar kernel is:
- *     D_αβ(r) = (3 r_α r_β / r^5) - δ_αβ / r^3
- *   We compute D̂_αβ(k) analytically in k-space for the periodic case.
- *   The standard result for a 2D periodic dipolar system is:
- *     D̂_xx(kx,ky) = 2π * kx^2 / k   (k = sqrt(kx^2+ky^2))
- *     D̂_yy(kx,ky) = 2π * ky^2 / k
- *     D̂_zz(kx,ky) = -2π * k         (out-of-plane)
- *     D̂_xy(kx,ky) = 2π * kx*ky / k
- *     D̂_xz = D̂_yz = 0              (in-plane k, uniform thickness)
- *   At k=0 (uniform mode): D̂_xx=D̂_yy=0, D̂_zz depends on sample shape.
- *   For a laterally infinite thin film: D̂_zz(0)=0, demagnetization fully
- *   accounted for by the c_chk easy-plane term in the RHS.
+ *   h_dmag,α = IFFT[ N̂_αβ(k) · M̂_β(k) ]
  *
- * Integration into 2d_p.cu:
- *   Add  Demag_Apply(udata->demag, y, ydot_or_hfield)  inside f()
- *   after the exchange stencil, adding h_dmag_x/y/z to the effective field.
+ * N_αβ(r) is the demag tensor computed by professor's calt/ctt functions
+ * (Newell et al. analytic integrals for a rectangular prism source cell).
  *
- * Memory layout:
- *   SoA: [mx_0..mx_{N-1}][my_0..my_{N-1}][mz_0..mz_{N-1}]  (same as 2d_p)
- *   FFT buffers: separate padded real arrays per component (nx * ny doubles)
- *   Spectral:    complex arrays of size nx * (ny/2+1) per component
  *
- * cuFFT types used (double precision, matching sunrealtype = double):
- *   cufftPlan2d(ny, nx, CUFFT_D2Z)   forward R→C
- *   cufftPlan2d(ny, nx, CUFFT_Z2D)   inverse C→R
- *   (Note: cuFFT nx is the slowest / row dimension = ny in our notation)
+ * PROFESSOR'S ALGORITHM (faithfully reproduced from pseudocode)
  *
- * Performance notes:
- *   - D̂ is precomputed once in Demag_Init, stored on device (6 arrays,
- *     each nx*(ny/2+1) complex doubles = 6 * nx*(ny/2+1)*16 bytes).
- *   - Forward/inverse FFTs: 6 plans × 1 call per f() evaluation.
- *   - Pointwise multiply: 1 kernel, reads 3 M̂ + 6 D̂, writes 3 Ĥ.
- *   - For nx=1000, ny=1280 on sm_89: expect ~2ms per f() call for FFTs.
  *
- * Compile:  nvcc -O3 -arch=sm_89 fft_demag.cu -lcufft -o test_demag
+ * ctt(b, a, sx, sy, dm[]):
+ *   Computes the 9 demag tensor components for a displacement (sx,sy,0)
+ *   using closed-form atan/log integrals for a prism of half-size (a,a,b).
+ *   a = 0.49999  (half-cell size in x and y)
+ *   b = 0.5*thick (half-cell size in z)
+ *
+ * calt(thick, nx, ny, taa..tcc):
+ *   For each grid point (i,j), samples the ctt kernel on a 9×9 sub-grid
+ *   (jx,jy = -4..4 in steps of 0.1*cell) and averages (divides by 81).
+ *   This is a numerical integration to reduce aliasing of the singular
+ *   demag kernel at short range.
+ *
+ *
+ * cuFFT USAGE
+ *
+ * Uses C2C (Z2Z) plans, matching the professor's cufftPlan2d CUFFT_Z2Z.
+ * The real-valued tensor components are zero-padded into complex arrays
+ * (imaginary part = 0) before FFT, exactly as in the pseudocode.
+ *
+ * Plan:  cufftPlan2d(&plan, ny, nx, CUFFT_Z2Z)
+ * Forward: cufftExecZ2Z(..., CUFFT_FORWARD)
+ * Inverse: cufftExecZ2Z(..., CUFFT_INVERSE)  + normalize by 1/(nx*ny)
  */
 
 #include "demag_fft.h"
@@ -71,195 +50,226 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <nvector/nvector_cuda.h>
 
-/* -----------------------------------------------------------------------
- * Internal error macros
- * --------------------------------------------------------------------- */
-#define CHECK_CUDA_FD(call) do {                                            \
+/* ─── internal macros ─────────────────────────────────────────────────── */
+#define CHECK_CUDA(call) do {                                               \
     cudaError_t _e = (call);                                                \
     if (_e != cudaSuccess) {                                                \
-        fprintf(stderr, "[fft_demag] CUDA error %s:%d: %s\n",              \
-                __FILE__, __LINE__, cudaGetErrorString(_e));                \
+        fprintf(stderr,"[demag] CUDA %s:%d: %s\n",                         \
+                __FILE__,__LINE__,cudaGetErrorString(_e));                  \
         return NULL;                                                        \
     }                                                                      \
+} while(0)
+
+#define CHECK_CUDA_V(call) do {                                             \
+    cudaError_t _e = (call);                                                \
+    if (_e != cudaSuccess)                                                  \
+        fprintf(stderr,"[demag] CUDA %s:%d: %s\n",                         \
+                __FILE__,__LINE__,cudaGetErrorString(_e));                  \
 } while(0)
 
 #define CHECK_CUFFT(call) do {                                              \
     cufftResult _r = (call);                                                \
     if (_r != CUFFT_SUCCESS) {                                              \
-        fprintf(stderr, "[fft_demag] cuFFT error %s:%d: code=%d\n",        \
-                __FILE__, __LINE__, (int)_r);                               \
+        fprintf(stderr,"[demag] cuFFT %s:%d: code=%d\n",                   \
+                __FILE__,__LINE__,(int)_r);                                 \
         return NULL;                                                        \
     }                                                                      \
 } while(0)
 
-#define CHECK_CUDA_VOID(call) do {                                          \
-    cudaError_t _e = (call);                                                \
-    if (_e != cudaSuccess) {                                                \
-        fprintf(stderr, "[fft_demag] CUDA error %s:%d: %s\n",              \
-                __FILE__, __LINE__, cudaGetErrorString(_e));                \
-    }                                                                      \
+#define CHECK_CUFFT_V(call) do {                                            \
+    cufftResult _r = (call);                                                \
+    if (_r != CUFFT_SUCCESS)                                                \
+        fprintf(stderr,"[demag] cuFFT %s:%d: code=%d\n",                   \
+                __FILE__,__LINE__,(int)_r);                                 \
 } while(0)
 
-/* -----------------------------------------------------------------------
- * DemagData struct (opaque to caller — defined here, declared in header)
- * --------------------------------------------------------------------- */
-struct DemagData {
-    int nx;              /* number of columns (fast index in LLG) */
-    int ny;              /* number of rows    (slow index in LLG) */
-    int ncell;           /* nx * ny                               */
-    int nk;              /* nx * (ny/2 + 1)   = complex spectrum size */
+/* safe log — avoids log(0) */
+static inline double salog(double x) {
+    return (x > 1e-300) ? log(x) : -300.0*log(10.0);
+}
 
-    /* cuFFT plans: forward (real → complex) and inverse (complex → real) */
-    cufftHandle planR2C;   /* D2Z: ny × nx real  →  ny × (nx/2+1) complex */
-    cufftHandle planC2R;   /* Z2D: ny × (nx/2+1) complex → ny × nx real   */
-
-    /* Device buffers: real scratch (one component at a time) */
-    double *d_real;        /* nx * ny doubles  */
-
-    /* Device buffers: complex spectra for M and H (3 components each) */
-    cufftDoubleComplex *d_Mhat[3];   /* M̂x, M̂y, M̂z */
-    cufftDoubleComplex *d_Hhat[3];   /* Ĥx, Ĥy, Ĥz  */
-
-    /* Precomputed demag tensor in k-space (6 independent components,
-     * symmetric: Dxx, Dyy, Dzz, Dxy, Dxz, Dyz) */
-    cufftDoubleComplex *d_Dhat[6];
-    /* Index mapping: 0=xx, 1=yy, 2=zz, 3=xy, 4=xz, 5=yz */
-
-    double scale;     /* normalization: 1.0/(nx*ny) after IFFT */
-    double demag_strength; /* prefactor for demag field (default 1.0) */
-};
-
-/* -----------------------------------------------------------------------
- * Kernel: precompute demag tensor D̂ in k-space
+/*
+ * ctt  —  analytic demag tensor for one displacement (sx, sy)
  *
- * For a 2D periodic dipolar thin film the analytical k-space demag tensor
- * (Newell et al., or equivalent) is:
+ * Directly translated from professor's Fortran-style pseudocode.
+ * Computes dm[0..8] = [Nxx, Nxy, Nxz, Nyx, Nyy, Nyz, Nzx, Nzy, Nzz]
+ * (0-indexed here, professor used 1-indexed)
  *
- *   kx_phys = 2π * kx_idx / nx    (wavenumber in x, in units of 1/cell)
- *   ky_phys = 2π * ky_idx / ny
- *   k = sqrt(kx^2 + ky^2)
- *
- *   D̂_xx = 2π * kx^2 / k        D̂_yy = 2π * ky^2 / k
- *   D̂_zz = -2π * k              D̂_xy = 2π * kx*ky / k
- *   D̂_xz = D̂_yz = 0
- *
- * At k=0: D̂_xx = D̂_yy = D̂_zz = 0 (handled by shape anisotropy term c_chk)
- *
- * The result is purely real (no imaginary part) because the dipolar kernel
- * is symmetric about the origin.  We store as cufftDoubleComplex with im=0.
- *
- * Grid: one thread per k-space point (ky_idx, kx_idx)
- *   kx_idx runs 0..nx/2   (R2C output, only half-spectrum)
- *   ky_idx runs 0..ny-1
- * --------------------------------------------------------------------- */
-__global__ static void demag_build_Dhat_kernel(
-    cufftDoubleComplex *Dxx,
-    cufftDoubleComplex *Dyy,
-    cufftDoubleComplex *Dzz,
-    cufftDoubleComplex *Dxy,
-    cufftDoubleComplex *Dxz,
-    cufftDoubleComplex *Dyz,
-    int nx, int ny,   /* physical grid: nx cols, ny rows */
-    int nkx)          /* number of kx points = nx/2+1 */
+ * b = half-thickness in z  (= 0.5 * thick)
+ * a = half-cell size in x,y (= 0.49999)
+ * */
+static void ctt(double b, double a, double sx, double sy, double dm[9])
 {
-    const int ikx = blockIdx.x * blockDim.x + threadIdx.x;  /* 0..nkx-1 */
-    const int iky = blockIdx.y * blockDim.y + threadIdx.y;  /* 0..ny-1  */
+    double sz = 0.0;
 
-    if (ikx >= nkx || iky >= ny) return;
+    double xn = sx - a,  xp = sx + a;
+    double yn = sy - a,  yp = sy + a;
+    double zn = sz - b,  zp = sz + b;
 
-    const int idx = iky * nkx + ikx;   /* linear index in half-spectrum */
+    double xn2 = xn*xn, xp2 = xp*xp;
+    double yn2 = yn*yn, yp2 = yp*yp;
+    double zn2 = zn*zn, zp2 = zp*zp;
 
-    /* Physical wavenumbers in units of [1/cell spacing]
-     * ky: use negative frequencies for iky > ny/2 */
-    double kx = (2.0 * M_PI / nx) * ikx;
-    double ky_raw = (iky <= ny/2) ? (double)iky : (double)(iky - ny);
-    double ky = (2.0 * M_PI / ny) * ky_raw;
+    double dnnn = sqrt(xn2+yn2+zn2);
+    double dpnn = sqrt(xp2+yn2+zn2);
+    double dnpn = sqrt(xn2+yp2+zn2);
+    double dnnp = sqrt(xn2+yn2+zp2);
+    double dppn = sqrt(xp2+yp2+zn2);
+    double dnpp = sqrt(xn2+yp2+zp2);
+    double dpnp = sqrt(xp2+yn2+zp2);
+    double dppp = sqrt(xp2+yp2+zp2);
 
-    double k2 = kx*kx + ky*ky;
-    double k  = sqrt(k2);
+    /* dm[0] = Nxx */
+    dm[0] =  atan2(zn*yn, xn*dnnn) - atan2(zp*yn, xn*dnnp)
+            -atan2(zn*yp, xn*dnpn) + atan2(zp*yp, xn*dnpp)
+            -atan2(zn*yn, xp*dpnn) + atan2(zp*yn, xp*dpnp)
+            +atan2(zn*yp, xp*dppn) - atan2(zp*yp, xp*dppp);
 
-    double Dxx_val, Dyy_val, Dzz_val, Dxy_val;
+    /* dm[1] = Nxy */
+    dm[1] =  salog(dnnn-zn) - salog(dnnp-zp)
+            -salog(dpnn-zn) + salog(dpnp-zp)
+            -salog(dnpn-zn) + salog(dnpp-zp)
+            +salog(dppn-zn) - salog(dppp-zp);
 
-    if (k < 1.0e-14) {
-        /* k=0: uniform mode — set to zero (shape anisotropy handled by c_chk) */
-        Dxx_val = 0.0;
-        Dyy_val = 0.0;
-        Dzz_val = 0.0;
-        Dxy_val = 0.0;
-    } else {
-        /* Standard 2D dipolar demag tensor (thin film, periodic) */
-        double inv_k = 1.0 / k;
-        Dxx_val =  2.0 * M_PI * kx * kx * inv_k;   /* > 0 */
-        Dyy_val =  2.0 * M_PI * ky * ky * inv_k;   /* > 0 */
-        Dzz_val = -2.0 * M_PI * k;                  /* < 0 */
-        Dxy_val =  2.0 * M_PI * kx * ky * inv_k;
+    /* dm[2] = Nxz */
+    dm[2] =  salog(dnnn-yn) - salog(dnpn-yp)
+            -salog(dpnn-yn) + salog(dppn-yp)
+            -salog(dnnp-yn) + salog(dnpp-yp)
+            +salog(dpnp-yn) - salog(dppp-yp);
+
+    /* dm[3] = Nyx  (= Nxy by symmetry, kept separate for clarity) */
+    dm[3] =  salog(dnnn-zn) - salog(dnnp-zp)
+            -salog(dnpn-zn) + salog(dnpp-zp)
+            -salog(dpnn-zn) + salog(dpnp-zp)
+            +salog(dppn-zn) - salog(dppp-zp);
+
+    /* dm[4] = Nyy */
+    dm[4] =  atan2(zn*xn, yn*dnnn) - atan2(zp*xn, yn*dnnp)
+            -atan2(zn*xp, yn*dpnn) + atan2(zp*xp, yn*dpnp)
+            -atan2(zn*xn, yp*dnpn) + atan2(zp*xn, yp*dnpp)
+            +atan2(zn*xp, yp*dppn) - atan2(zp*xp, yp*dppp);
+
+    /* dm[5] = Nyz */
+    dm[5] =  salog(dnnn-xn) - salog(dpnn-xp)
+            -salog(dnpn-xn) + salog(dppn-xp)
+            -salog(dnnp-xn) + salog(dpnp-xp)
+            +salog(dnpp-xn) - salog(dppp-xp);
+
+    /* dm[6] = Nzx */
+    dm[6] =  salog(dnnn-yn) - salog(dnpn-yp)
+            -salog(dnnp-yn) + salog(dnpp-yp)
+            -salog(dpnn-yn) + salog(dppn-yp)
+            +salog(dpnp-yn) - salog(dppp-yp);
+
+    /* dm[7] = Nzy */
+    dm[8-1] =  salog(dnnn-xn) - salog(dpnn-xp)     /* note: dm[7] */
+            -salog(dnnp-xn) + salog(dpnp-xp)
+            -salog(dnpn-xn) + salog(dppn-xp)
+            +salog(dnpp-xn) - salog(dppp-xp);
+
+    /* dm[8] = Nzz */
+    dm[8] =  atan2(xn*yn, zn*dnnn) - atan2(xp*yn, zn*dpnn)
+            -atan2(xn*yp, zn*dnpn) + atan2(xp*yp, zn*dppn)
+            -atan2(xn*yn, zp*dnnp) + atan2(xp*yn, zp*dpnp)
+            +atan2(xn*yp, zp*dnpp) - atan2(xp*yp, zp*dppp);
+}
+
+/* 
+ * calt  —  compute demag tensor on the full nx×ny grid
+ *
+ * Faithfully implements professor's pseudocode:
+ *   For each cell (i,j), sample ctt on a 9×9 sub-grid (ix,jy = -4..4)
+ *   at offsets 0.1*ix, 0.1*jy — then average (divide by 81).
+ *
+ * The cell displacement is (i - nx/2) + 0.1*ix  etc., which centres
+ * the origin at the middle of the grid (matching professor's ix-mdx2).
+ *
+ * Output arrays: taa..tcc [nx*ny doubles], laid out as taa[j*nx+i].
+ */
+static void calt(double thick, int nx, int ny,
+                 double *taa, double *tab, double *tac,
+                 double *tba, double *tbb, double *tbc,
+                 double *tca, double *tcb, double *tcc)
+{
+    const int nx2 = nx / 2;
+    const int ny2 = ny / 2;
+    const double a = 0.49999;          /* half-cell in x,y */
+    const double b = 0.5 * thick;     /* half-cell in z   */
+    double dm[9];
+
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            int ikn = j * nx + i;
+
+            /* zero all 9 components */
+            taa[ikn] = tbb[ikn] = tcc[ikn] = 0.0;
+            tab[ikn] = tac[ikn] = 0.0;
+            tba[ikn] = tbc[ikn] = 0.0;
+            tca[ikn] = tcb[ikn] = 0.0;
+
+            /* 9×9 sub-grid averaging (professor's loop ix,jy = -4..4) */
+            for (int jy = -4; jy <= 4; jy++) {
+                double sy = (double)(j - ny2) + 0.1*(double)jy;
+                for (int ix = -4; ix <= 4; ix++) {
+                    double sx = (double)(i - nx2) + 0.1*(double)ix;
+
+                    ctt(b, a, sx, sy, dm);
+
+                    taa[ikn] += dm[0];
+                    tab[ikn] += dm[1];
+                    tac[ikn] += dm[2];
+                    tba[ikn] += dm[3];
+                    tbb[ikn] += dm[4];
+                    tbc[ikn] += dm[5];
+                    tca[ikn] += dm[6];
+                    tcb[ikn] += dm[7];
+                    tcc[ikn] += dm[8];
+                }
+            }
+
+            /* average over 9*9 = 81 sub-samples */
+            taa[ikn] /= 81.0;  tab[ikn] /= 81.0;  tac[ikn] /= 81.0;
+            tba[ikn] /= 81.0;  tbb[ikn] /= 81.0;  tbc[ikn] /= 81.0;
+            tca[ikn] /= 81.0;  tcb[ikn] /= 81.0;  tcc[ikn] /= 81.0;
+        }
     }
-
-    /* Store as purely real complex numbers (imaginary part = 0) */
-    Dxx[idx].x = Dxx_val;  Dxx[idx].y = 0.0;
-    Dyy[idx].x = Dyy_val;  Dyy[idx].y = 0.0;
-    Dzz[idx].x = Dzz_val;  Dzz[idx].y = 0.0;
-    Dxy[idx].x = Dxy_val;  Dxy[idx].y = 0.0;
-    Dxz[idx].x = 0.0;      Dxz[idx].y = 0.0;   /* in-plane k → zero */
-    Dyz[idx].x = 0.0;      Dyz[idx].y = 0.0;
 }
 
-/* -----------------------------------------------------------------------
- * Kernel: copy one SoA component (stride=ncell) to a packed real buffer
- *
- * SoA layout:  y[comp*ncell + cell]   (cell = j*nx + i)
- * Packed:      buf[j*nx + i]
- *
- * These are the same layout — it's just a strided gather.
- * For mx: comp=0,  for my: comp=1,  for mz: comp=2.
- * --------------------------------------------------------------------- */
-__global__ static void demag_gather_component(
-    const double* __restrict__ y_soa,    /* full SoA state vector */
-    double*       __restrict__ buf,      /* nx*ny real scratch    */
-    int comp, int ncell)
-{
-    int cell = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cell >= ncell) return;
-    buf[cell] = y_soa[comp * ncell + cell];
-}
+/* GPU kernels  */
 
-/* -----------------------------------------------------------------------
- * Kernel: scatter one real buffer back to SoA hdmag accumulator
- *
- * Adds (not overwrites) so we can call for x, y, z sequentially.
- * --------------------------------------------------------------------- */
-__global__ static void demag_scatter_add(
-    const double* __restrict__ buf,
-    double*       __restrict__ h_soa,   /* hdmag accumulator, SoA */
-    int comp, int ncell, double scale)
-{
-    int cell = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cell >= ncell) return;
-    h_soa[comp * ncell + cell] += scale * buf[cell];
-}
-
-/* -----------------------------------------------------------------------
- * Kernel: pointwise multiply  Ĥ_α = Σ_β D̂_αβ · M̂_β
+/*
+ * pointwise_multiply_kernel
  *
  * For each k-space point:
- *   Ĥx = Dxx*Mx + Dxy*My + Dxz*Mz
- *   Ĥy = Dxy*Mx + Dyy*My + Dyz*Mz     (Dyx=Dxy by symmetry)
- *   Ĥz = Dxz*Mx + Dyz*My + Dzz*Mz     (Dzx=Dxz, Dzy=Dyz)
+ *   Ĥ_α(k) = Σ_β  N̂_αβ(k) · M̂_β(k)
  *
- * Since D̂ is purely real:  (D̂·M̂) = D̂.re * M̂
- * --------------------------------------------------------------------- */
-__global__ static void demag_multiply_kernel(
+ * N̂ arrays may be complex (result of FFT of real-valued tensor),
+ * so we do full complex×complex multiply.
+ *
+ * Tensor index map (matches professor's dm[0..8]):
+ *   N̂aa=xx, N̂ab=xy, N̂ac=xz
+ *   N̂ba=yx, N̂bb=yy, N̂bc=yz
+ *   N̂ca=zx, N̂cb=zy, N̂cc=zz
+ */
+__global__ static void pointwise_multiply_kernel(
+    /* magnetization spectra */
     const cufftDoubleComplex* __restrict__ Mx,
     const cufftDoubleComplex* __restrict__ My,
     const cufftDoubleComplex* __restrict__ Mz,
-    const cufftDoubleComplex* __restrict__ Dxx,
-    const cufftDoubleComplex* __restrict__ Dyy,
-    const cufftDoubleComplex* __restrict__ Dzz,
-    const cufftDoubleComplex* __restrict__ Dxy,
-    const cufftDoubleComplex* __restrict__ Dxz,
-    const cufftDoubleComplex* __restrict__ Dyz,
+    /* demag tensor spectra (9 components) */
+    const cufftDoubleComplex* __restrict__ Naa,
+    const cufftDoubleComplex* __restrict__ Nab,
+    const cufftDoubleComplex* __restrict__ Nac,
+    const cufftDoubleComplex* __restrict__ Nba,
+    const cufftDoubleComplex* __restrict__ Nbb,
+    const cufftDoubleComplex* __restrict__ Nbc,
+    const cufftDoubleComplex* __restrict__ Nca,
+    const cufftDoubleComplex* __restrict__ Ncb,
+    const cufftDoubleComplex* __restrict__ Ncc,
+    /* output field spectra */
     cufftDoubleComplex* __restrict__ Hx,
     cufftDoubleComplex* __restrict__ Hy,
     cufftDoubleComplex* __restrict__ Hz,
@@ -268,234 +278,283 @@ __global__ static void demag_multiply_kernel(
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= nk) return;
 
-    /* Load M̂ components */
-    const double Mxr = Mx[k].x,  Mxi = Mx[k].y;
-    const double Myr = My[k].x,  Myi = My[k].y;
-    const double Mzr = Mz[k].x,  Mzi = Mz[k].y;
+    /* helper: complex multiply (a+ib)*(c+id) = (ac-bd) + i(ad+bc) */
+#define CMUL_R(A,B) ((A)[k].x*(B)[k].x - (A)[k].y*(B)[k].y)
+#define CMUL_I(A,B) ((A)[k].x*(B)[k].y + (A)[k].y*(B)[k].x)
 
-    /* Load D̂ (purely real — .y should be 0) */
-    const double dxx = Dxx[k].x;
-    const double dyy = Dyy[k].x;
-    const double dzz = Dzz[k].x;
-    const double dxy = Dxy[k].x;
-    const double dxz = Dxz[k].x;
-    const double dyz = Dyz[k].x;
+    /* Ĥx = Naa*Mx + Nab*My + Nac*Mz */
+    Hx[k].x = CMUL_R(Naa,Mx) + CMUL_R(Nab,My) + CMUL_R(Nac,Mz);
+    Hx[k].y = CMUL_I(Naa,Mx) + CMUL_I(Nab,My) + CMUL_I(Nac,Mz);
 
-    /* Ĥα = Σ_β D̂_αβ · M̂_β  (complex multiplication with real D̂) */
-    Hx[k].x = dxx*Mxr + dxy*Myr + dxz*Mzr;
-    Hx[k].y = dxx*Mxi + dxy*Myi + dxz*Mzi;
+    /* Ĥy = Nba*Mx + Nbb*My + Nbc*Mz */
+    Hy[k].x = CMUL_R(Nba,Mx) + CMUL_R(Nbb,My) + CMUL_R(Nbc,Mz);
+    Hy[k].y = CMUL_I(Nba,Mx) + CMUL_I(Nbb,My) + CMUL_I(Nbc,Mz);
 
-    Hy[k].x = dxy*Mxr + dyy*Myr + dyz*Mzr;
-    Hy[k].y = dxy*Mxi + dyy*Myi + dyz*Mzi;
+    /* Ĥz = Nca*Mx + Ncb*My + Ncc*Mz */
+    Hz[k].x = CMUL_R(Nca,Mx) + CMUL_R(Ncb,My) + CMUL_R(Ncc,Mz);
+    Hz[k].y = CMUL_I(Nca,Mx) + CMUL_I(Ncb,My) + CMUL_I(Ncc,Mz);
 
-    Hz[k].x = dxz*Mxr + dyz*Myr + dzz*Mzr;
-    Hz[k].y = dxz*Mxi + dyz*Myi + dzz*Mzi;
+#undef CMUL_R
+#undef CMUL_I
 }
 
-/* -----------------------------------------------------------------------
- * Public API: Demag_Init
- * --------------------------------------------------------------------- */
-DemagData* Demag_Init(int nx, int ny, double demag_strength)
+/*
+ * gather_to_complex_kernel
+ * Copy one SoA real component → complex device buffer (imag=0).
+ * SoA: y_soa[comp*ncell + cell]
+ */
+__global__ static void gather_to_complex_kernel(
+    const double* __restrict__ y_soa,
+    cufftDoubleComplex* __restrict__ buf,
+    int comp, int ncell)
 {
+    int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cell >= ncell) return;
+    buf[cell].x = y_soa[comp * ncell + cell];
+    buf[cell].y = 0.0;
+}
+
+/*
+ * scatter_add_real_kernel
+ * Add the real part of a complex buffer (scaled) into a SoA field array.
+ * h_soa[comp*ncell + cell] += scale * buf[cell].x
+ * (After IFFT of a real-sourced signal the result should be real.)
+ */
+__global__ static void scatter_add_real_kernel(
+    const cufftDoubleComplex* __restrict__ buf,
+    double* __restrict__ h_soa,
+    int comp, int ncell, double scale)
+{
+    int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cell >= ncell) return;
+    h_soa[comp * ncell + cell] += scale * buf[cell].x;
+}
+
+/*
+ * DemagData struct
+ * */
+struct DemagData {
+    int nx, ny, ncell, nk;   /* nk = nx*ny (C2C uses full spectrum) */
+    double scale;             /* 1/(nx*ny) for IFFT normalization     */
+    double strength;          /* demag_strength prefactor             */
+
+    cufftHandle plan;         /* single Z2Z plan for both fwd and inv */
+
+    /* Device: magnetization spectra (3 components) */
+    cufftDoubleComplex *d_Mhat[3];
+
+    /* Device: field spectra (3 components) */
+    cufftDoubleComplex *d_Hhat[3];
+
+    /* Device: demag tensor spectra (9 components, pre-FFT'd at init) */
+    cufftDoubleComplex *d_Nhat[9];   /* aa,ab,ac,ba,bb,bc,ca,cb,cc */
+
+    /* Device: complex scratch for M gather and H scatter */
+    cufftDoubleComplex *d_buf;       /* ncell complex doubles */
+};
+
+/*
+ * Demag_Init
+ * */
+DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
+{
+    printf("[Demag] Initializing Newell tensor (calt/ctt), nx=%d ny=%d thick=%.4f\n",
+           nx, ny, thick);
+
     DemagData *d = (DemagData*)calloc(1, sizeof(DemagData));
-    if (!d) { fprintf(stderr, "[fft_demag] calloc failed\n"); return NULL; }
+    if (!d) { fprintf(stderr,"[demag] calloc failed\n"); return NULL; }
 
-    d->nx = nx;
-    d->ny = ny;
-    d->ncell = nx * ny;
-    d->nk    = ny * (nx/2 + 1);      /* half-spectrum size (R2C output) */
-    d->scale = 1.0 / (double)(nx * ny);
-    d->demag_strength = demag_strength;
+    d->nx      = nx;
+    d->ny      = ny;
+    d->ncell   = nx * ny;
+    d->nk      = nx * ny;       /* Z2Z: full complex spectrum, size = nx*ny */
+    d->scale   = 1.0 / (double)(nx * ny);
+    d->strength = demag_strength;
 
-    /* ---- cuFFT plans ----
-     * cuFFT convention for 2D:
-     *   cufftPlan2d(&plan, n0, n1, type)
-     *   n0 = slowest (row) dimension = ny in our notation
-     *   n1 = fastest (col) dimension = nx in our notation
-     *   R2C output: n0 × (n1/2+1) complex
-     * ----------------------------------------------------------------- */
-    cufftResult r;
-    r = cufftPlan2d(&d->planR2C, ny, nx, CUFFT_D2Z);
-    if (r != CUFFT_SUCCESS) {
-        fprintf(stderr, "[fft_demag] cufftPlan2d D2Z failed: %d\n", (int)r);
-        free(d); return NULL;
-    }
-    r = cufftPlan2d(&d->planC2R, ny, nx, CUFFT_Z2D);
-    if (r != CUFFT_SUCCESS) {
-        fprintf(stderr, "[fft_demag] cufftPlan2d Z2D failed: %d\n", (int)r);
-        cufftDestroy(d->planR2C); free(d); return NULL;
-    }
+    /* ── Step 1: compute real-space demag tensor on CPU (calt) ─────────── */
+    printf("[Demag] Computing calt tensor (9 components, 81-point averaging)...\n");
 
-    /* ---- Allocate real scratch (one component) ---- */
-    CHECK_CUDA_FD(cudaMalloc((void**)&d->d_real,
-                             (size_t)d->ncell * sizeof(double)));
+    double *taa = (double*)calloc(d->ncell, sizeof(double));
+    double *tab = (double*)calloc(d->ncell, sizeof(double));
+    double *tac = (double*)calloc(d->ncell, sizeof(double));
+    double *tba = (double*)calloc(d->ncell, sizeof(double));
+    double *tbb = (double*)calloc(d->ncell, sizeof(double));
+    double *tbc = (double*)calloc(d->ncell, sizeof(double));
+    double *tca = (double*)calloc(d->ncell, sizeof(double));
+    double *tcb = (double*)calloc(d->ncell, sizeof(double));
+    double *tcc = (double*)calloc(d->ncell, sizeof(double));
 
-    /* ---- Allocate M̂ and Ĥ complex buffers (3 each) ---- */
-    for (int c = 0; c < 3; c++) {
-        CHECK_CUDA_FD(cudaMalloc((void**)&d->d_Mhat[c],
-                                 (size_t)d->nk * sizeof(cufftDoubleComplex)));
-        CHECK_CUDA_FD(cudaMalloc((void**)&d->d_Hhat[c],
-                                 (size_t)d->nk * sizeof(cufftDoubleComplex)));
+    if (!taa||!tab||!tac||!tba||!tbb||!tbc||!tca||!tcb||!tcc) {
+        fprintf(stderr,"[demag] tensor CPU alloc failed\n");
+        free(taa);free(tab);free(tac);free(tba);free(tbb);
+        free(tbc);free(tca);free(tcb);free(tcc);free(d);
+        return NULL;
     }
 
-    /* ---- Allocate D̂ tensor (6 components) ---- */
-    for (int c = 0; c < 6; c++) {
-        CHECK_CUDA_FD(cudaMalloc((void**)&d->d_Dhat[c],
-                                 (size_t)d->nk * sizeof(cufftDoubleComplex)));
-    }
+    calt(thick, nx, ny, taa,tab,tac, tba,tbb,tbc, tca,tcb,tcc);
+    printf("[Demag] calt done.\n");
 
-    /* ---- Precompute D̂ on device ---- */
-    {
-        const int nkx = nx/2 + 1;
-        dim3 block(32, 8);
-        dim3 grid((nkx + block.x - 1) / block.x,
-                  (ny  + block.y - 1) / block.y);
-
-        demag_build_Dhat_kernel<<<grid, block>>>(
-            d->d_Dhat[0], d->d_Dhat[1], d->d_Dhat[2],
-            d->d_Dhat[3], d->d_Dhat[4], d->d_Dhat[5],
-            nx, ny, nkx);
-
-        cudaError_t ce = cudaPeekAtLastError();
-        if (ce != cudaSuccess) {
-            fprintf(stderr, "[fft_demag] demag_build_Dhat_kernel failed: %s\n",
-                    cudaGetErrorString(ce));
-            Demag_Destroy(d);
+    /* ── Step 2: pack into complex host arrays (imag = 0, as in pseudocode) */
+    /*  Professor's code:
+     *    hfaa[idx].x = faa[idx];
+     *    hfaa[idx].y = 0.0;
+     *  We do the same for all 9 components.
+     */
+    cufftDoubleComplex *htensor[9];
+    double *tptrs[9] = {taa,tab,tac,tba,tbb,tbc,tca,tcb,tcc};
+    for (int c = 0; c < 9; c++) {
+        htensor[c] = (cufftDoubleComplex*)malloc(
+                         (size_t)d->ncell * sizeof(cufftDoubleComplex));
+        if (!htensor[c]) {
+            fprintf(stderr,"[demag] htensor[%d] alloc failed\n", c);
+            /* cleanup */
+            for (int cc=0; cc<c; cc++) free(htensor[cc]);
+            free(taa);free(tab);free(tac);free(tba);free(tbb);
+            free(tbc);free(tca);free(tcb);free(tcc);free(d);
             return NULL;
         }
-        cudaDeviceSynchronize();
+        for (int idx = 0; idx < d->ncell; idx++) {
+            htensor[c][idx].x = tptrs[c][idx];
+            htensor[c][idx].y = 0.0;
+        }
+    }
+    free(taa);free(tab);free(tac);free(tba);free(tbb);
+    free(tbc);free(tca);free(tcb);free(tcc);
+
+    /* ── Step 3: cuFFT plan  (Z2Z, matches professor's CUFFT_Z2Z plan) ─── */
+    /*
+     * Professor:  cufftPlan2d(&plan, nn, nn, CUFFT_Z2Z)
+     * We use:     cufftPlan2d(&plan, ny, nx, CUFFT_Z2Z)
+     * cuFFT 2D convention: first arg = slower (row) dim = ny.
+     */
+    {
+        cufftResult r = cufftPlan2d(&d->plan, ny, nx, CUFFT_Z2Z);
+        if (r != CUFFT_SUCCESS) {
+            fprintf(stderr,"[demag] cufftPlan2d failed: %d\n",(int)r);
+            for (int c=0;c<9;c++) free(htensor[c]);
+            free(d); return NULL;
+        }
     }
 
-    /* ---- Report memory usage ---- */
-    size_t mem_Dhat = 6 * (size_t)d->nk * sizeof(cufftDoubleComplex);
-    size_t mem_MH   = 6 * (size_t)d->nk * sizeof(cufftDoubleComplex);
-    size_t mem_real = (size_t)d->ncell * sizeof(double);
-    size_t mem_total = mem_Dhat + mem_MH + mem_real;
+    /* ── Step 4: allocate device arrays ───────────────────────────────── */
+    size_t csz = (size_t)d->ncell * sizeof(cufftDoubleComplex);
 
-    printf("[Demag FFT] Initialized: nx=%d ny=%d ncell=%d nk=%d\n",
-           nx, ny, d->ncell, d->nk);
-    printf("[Demag FFT] Memory: Dhat=%.1f MB, MH_bufs=%.1f MB, real=%.1f MB"
-           " | total=%.1f MB\n",
-           mem_Dhat/(1.0e6), mem_MH/(1.0e6),
-           mem_real/(1.0e6), mem_total/(1.0e6));
-    printf("[Demag FFT] demag_strength = %.4f\n", demag_strength);
-    printf("[Demag FFT] Algorithm: h_dmag = IFFT[ D̂(k) · M̂(k) ]\n");
+    for (int c = 0; c < 9; c++) {
+        if (cudaMalloc((void**)&d->d_Nhat[c], csz) != cudaSuccess) {
+            fprintf(stderr,"[demag] cudaMalloc d_Nhat[%d] failed\n",c);
+            for(int cc=0;cc<c;cc++) cudaFree(d->d_Nhat[cc]);
+            for(int cc=0;cc<9;cc++) free(htensor[cc]);
+            cufftDestroy(d->plan); free(d); return NULL;
+        }
+    }
+    for (int c = 0; c < 3; c++) {
+        cudaMalloc((void**)&d->d_Mhat[c], csz);
+        cudaMalloc((void**)&d->d_Hhat[c], csz);
+    }
+    cudaMalloc((void**)&d->d_buf, csz);
+
+    /* ── Step 5: H2D copy tensor, then FFT each component ─────────────── */
+    for (int c = 0; c < 9; c++) {
+        /* copy real-space tensor component to device */
+        cudaMemcpy(d->d_Nhat[c], htensor[c], csz, cudaMemcpyHostToDevice);
+        free(htensor[c]);
+
+        /* FFT in-place: d_Nhat[c] = FFT(d_Nhat[c])
+         * Professor:  cufftExecZ2Z(plan, d_in, d_out, CUFFT_FORWARD)
+         * We do in-place so d_Nhat[c] stays as the output buffer.
+         */
+        cufftResult r = cufftExecZ2Z(d->plan,
+                                     d->d_Nhat[c],
+                                     d->d_Nhat[c],
+                                     CUFFT_FORWARD);
+        if (r != CUFFT_SUCCESS)
+            fprintf(stderr,"[demag] tensor FFT[%d] failed: %d\n",c,(int)r);
+    }
+    cudaDeviceSynchronize();
+
+    /* ── Report ─────────────────────────────────────────────────────────── */
+    size_t mem_N   = 9  * csz;
+    size_t mem_MH  = 6  * csz;
+    size_t mem_buf = csz;
+    printf("[Demag] Device memory: N̂=%.1f MB  M̂Ĥ=%.1f MB  buf=%.1f MB\n",
+           mem_N/1e6, mem_MH/1e6, mem_buf/1e6);
+    printf("[Demag] Ready. strength=%.4f\n", demag_strength);
 
     return d;
 }
 
-/* -----------------------------------------------------------------------
- * Public API: Demag_Destroy
- * --------------------------------------------------------------------- */
-void Demag_Destroy(DemagData *d)
+/* Demag_Apply
+ *
+ * Called every RHS evaluation.
+ * Adds h_dmag = N * M (convolution via FFT) to h_out. */
+void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
 {
     if (!d) return;
 
-    cufftDestroy(d->planR2C);
-    cufftDestroy(d->planC2R);
+    const int ncell = d->ncell;
+    const int block = 256;
+    const int grid  = (ncell + block - 1) / block;
 
-    if (d->d_real) cudaFree(d->d_real);
+    /* ── Step 1: FFT each magnetization component ───────────────────────
+     * gather m_α from SoA → complex buffer (imag=0) → forward FFT → M̂_α
+     * Matches professor's:
+     *   h_in[idx].x = mx[idx]; h_in[idx].y = 0;
+     *   cufftExecZ2Z(plan, h_in_dev, M_hat, CUFFT_FORWARD)
+     */
+    for (int comp = 0; comp < 3; comp++) {
+        gather_to_complex_kernel<<<grid, block>>>(
+            y_dev, d->d_Mhat[comp], comp, ncell);
 
+        cufftExecZ2Z(d->plan,
+                     d->d_Mhat[comp],
+                     d->d_Mhat[comp],
+                     CUFFT_FORWARD);
+    }
+
+    /* ── Step 2: pointwise tensor multiply in k-space ───────────────────
+     * Ĥ_α(k) = Σ_β  N̂_αβ(k) · M̂_β(k)
+     */
+    {
+        const int g = (d->nk + block - 1) / block;
+        pointwise_multiply_kernel<<<g, block>>>(
+            d->d_Mhat[0], d->d_Mhat[1], d->d_Mhat[2],
+            d->d_Nhat[0], d->d_Nhat[1], d->d_Nhat[2],   /* aa,ab,ac */
+            d->d_Nhat[3], d->d_Nhat[4], d->d_Nhat[5],   /* ba,bb,bc */
+            d->d_Nhat[6], d->d_Nhat[7], d->d_Nhat[8],   /* ca,cb,cc */
+            d->d_Hhat[0], d->d_Hhat[1], d->d_Hhat[2],
+            d->nk);
+    }
+
+    /* ── Step 3: IFFT each field component → scatter-add to h_out ───────
+     * Professor:
+     *   cufftExecZ2Z(plan, Hhat, h_buf, CUFFT_INVERSE)
+     *   result /= (nn*nn)     ← normalization
+     * We do it in-place on d_Hhat, then scatter the real part.
+     */
+    const double s = d->scale * d->strength;
+
+    for (int comp = 0; comp < 3; comp++) {
+        cufftExecZ2Z(d->plan,
+                     d->d_Hhat[comp],
+                     d->d_Hhat[comp],
+                     CUFFT_INVERSE);
+
+        scatter_add_real_kernel<<<grid, block>>>(
+            d->d_Hhat[comp], h_out, comp, ncell, s);
+    }
+    /* No explicit sync — CVODE's next CUDA call on stream 0 provides order */
+}
+
+/* Demag_Destroy */
+void Demag_Destroy(DemagData *d)
+{
+    if (!d) return;
+    cufftDestroy(d->plan);
+    for (int c = 0; c < 9; c++) if (d->d_Nhat[c]) cudaFree(d->d_Nhat[c]);
     for (int c = 0; c < 3; c++) {
         if (d->d_Mhat[c]) cudaFree(d->d_Mhat[c]);
         if (d->d_Hhat[c]) cudaFree(d->d_Hhat[c]);
     }
-    for (int c = 0; c < 6; c++) {
-        if (d->d_Dhat[c]) cudaFree(d->d_Dhat[c]);
-    }
-
+    if (d->d_buf) cudaFree(d->d_buf);
     free(d);
-}
-
-/* -----------------------------------------------------------------------
- * Public API: Demag_Apply
- *
- * Computes h_dmag = IFFT[ D̂ · FFT[m] ] and ADDS it to h_out (SoA).
- *
- * Arguments:
- *   d        : DemagData handle from Demag_Init
- *   y_dev    : device pointer to SoA state [mx...my...mz...], size 3*ncell
- *   h_out    : device pointer to SoA field  [hx...hy...hz...], size 3*ncell
- *              (must be pre-zeroed or contain the exchange field to add to)
- *
- * Note: This function ADDS to h_out.  Zero it first if needed.
- * --------------------------------------------------------------------- */
-void Demag_Apply(DemagData *d,
-                 const double *y_dev,   /* device, SoA magnetization */
-                 double       *h_out)   /* device, SoA field output  */
-{
-    const int ncell = d->ncell;
-    const int nk    = d->nk;
-
-    /* ---- Step 1: FFT each component of M ----
-     *
-     * Gather m_α from SoA stride → packed real buffer → D2Z FFT → M̂_α
-     * (α = x, y, z = 0, 1, 2)
-     * ----------------------------------------------------------------- */
-    {
-        const int block = 256;
-        const int grid  = (ncell + block - 1) / block;
-
-        for (int comp = 0; comp < 3; comp++) {
-            /* Gather: d_real[cell] = y_dev[comp*ncell + cell] */
-            demag_gather_component<<<grid, block>>>(
-                y_dev, d->d_real, comp, ncell);
-
-            /* Forward FFT: d_real (ny×nx real) → d_Mhat[comp] (ny×(nx/2+1) complex) */
-            cufftResult r = cufftExecD2Z(d->planR2C,
-                                         (cufftDoubleReal*)d->d_real,
-                                         d->d_Mhat[comp]);
-            if (r != CUFFT_SUCCESS) {
-                fprintf(stderr, "[fft_demag] cufftExecD2Z comp=%d failed: %d\n",
-                        comp, (int)r);
-                return;
-            }
-        }
-    }
-
-    /* ---- Step 2: Pointwise tensor multiply in k-space ----
-     *
-     * Ĥ_α(k) = Σ_β D̂_αβ(k) · M̂_β(k)
-     * ----------------------------------------------------------------- */
-    {
-        const int block = 256;
-        const int grid  = (nk + block - 1) / block;
-
-        demag_multiply_kernel<<<grid, block>>>(
-            d->d_Mhat[0], d->d_Mhat[1], d->d_Mhat[2],
-            d->d_Dhat[0], d->d_Dhat[1], d->d_Dhat[2],   /* xx, yy, zz */
-            d->d_Dhat[3], d->d_Dhat[4], d->d_Dhat[5],   /* xy, xz, yz */
-            d->d_Hhat[0], d->d_Hhat[1], d->d_Hhat[2],
-            nk);
-    }
-
-    /* ---- Step 3: IFFT each component of Ĥ ----
-     *
-     * d_Hhat[comp] (complex) → d_real (real) → add scaled to h_out SoA
-     * cuFFT C2R is unnormalized → divide by N = nx*ny
-     * ----------------------------------------------------------------- */
-    {
-        const int block = 256;
-        const int grid  = (ncell + block - 1) / block;
-        const double s  = d->scale * d->demag_strength;
-
-        for (int comp = 0; comp < 3; comp++) {
-            /* Inverse FFT: d_Hhat[comp] → d_real */
-            cufftResult r = cufftExecZ2D(d->planC2R,
-                                         d->d_Hhat[comp],
-                                         (cufftDoubleReal*)d->d_real);
-            if (r != CUFFT_SUCCESS) {
-                fprintf(stderr, "[fft_demag] cufftExecZ2D comp=%d failed: %d\n",
-                        comp, (int)r);
-                return;
-            }
-
-            /* Scatter-add: h_out[comp*ncell + cell] += s * d_real[cell] */
-            demag_scatter_add<<<grid, block>>>(
-                d->d_real, h_out, comp, ncell, s);
-        }
-    }
-
-    /* No explicit sync: caller (CVODE RHS) will issue the next CUDA op
-     * on stream 0, which provides ordering. */
 }
