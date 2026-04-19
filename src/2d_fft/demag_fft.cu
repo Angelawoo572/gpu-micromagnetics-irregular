@@ -1,9 +1,9 @@
 /*
  * demag_fft.cu  —  FFT demagnetization field, professor's Newell tensor method
  *
- *
+ * ═══════════════════════════════════════════════════════════════════════════
  * PHYSICS
- *
+ * ═══════════════════════════════════════════════════════════════════════════
  * The demagnetization field is the convolution:
  *
  *   h_dmag,α(i,j) = Σ_{m,n}  N_αβ(i-m, j-n) · M_β(m,n)
@@ -15,9 +15,9 @@
  * N_αβ(r) is the demag tensor computed by professor's calt/ctt functions
  * (Newell et al. analytic integrals for a rectangular prism source cell).
  *
- *
+ * ═══════════════════════════════════════════════════════════════════════════
  * PROFESSOR'S ALGORITHM (faithfully reproduced from pseudocode)
- *
+ * ═══════════════════════════════════════════════════════════════════════════
  *
  * ctt(b, a, sx, sy, dm[]):
  *   Computes the 9 demag tensor components for a displacement (sx,sy,0)
@@ -31,9 +31,9 @@
  *   This is a numerical integration to reduce aliasing of the singular
  *   demag kernel at short range.
  *
- *
+ * ═══════════════════════════════════════════════════════════════════════════
  * cuFFT USAGE
- *
+ * ═══════════════════════════════════════════════════════════════════════════
  * Uses C2C (Z2Z) plans, matching the professor's cufftPlan2d CUFFT_Z2Z.
  * The real-valued tensor components are zero-padded into complex arrays
  * (imaginary part = 0) before FFT, exactly as in the pseudocode.
@@ -91,7 +91,7 @@ static inline double salog(double x) {
     return (x > 1e-300) ? log(x) : -300.0*log(10.0);
 }
 
-/*
+/* ═══════════════════════════════════════════════════════════════════════════
  * ctt  —  analytic demag tensor for one displacement (sx, sy)
  *
  * Directly translated from professor's Fortran-style pseudocode.
@@ -100,7 +100,7 @@ static inline double salog(double x) {
  *
  * b = half-thickness in z  (= 0.5 * thick)
  * a = half-cell size in x,y (= 0.49999)
- * */
+ * ═══════════════════════════════════════════════════════════════════════════ */
 static void ctt(double b, double a, double sx, double sy, double dm[9])
 {
     double sz = 0.0;
@@ -122,11 +122,13 @@ static void ctt(double b, double a, double sx, double sy, double dm[9])
     double dpnp = sqrt(xp2+yn2+zp2);
     double dppp = sqrt(xp2+yp2+zp2);
 
-    /* dm[0] = Nxx */
-    dm[0] =  atan2(zn*yn, xn*dnnn) - atan2(zp*yn, xn*dnnp)
-            -atan2(zn*yp, xn*dnpn) + atan2(zp*yp, xn*dnpp)
-            -atan2(zn*yn, xp*dpnn) + atan2(zp*yn, xp*dpnp)
-            +atan2(zn*yp, xp*dppn) - atan2(zp*yp, xp*dppp);
+    /* dm[0] = Nxx  — use atan(y/x), NOT atan2, to match professor's formula.
+     * atan2(y,x) differs from atan(y/x) by ±π when x<0, corrupting cells
+     * in the left half of the grid (i < nx/2, where xn = sx-a < 0). */
+    dm[0] =  atan(zn*yn/(xn*dnnn)) - atan(zp*yn/(xn*dnnp))
+            -atan(zn*yp/(xn*dnpn)) + atan(zp*yp/(xn*dnpp))
+            -atan(zn*yn/(xp*dpnn)) + atan(zp*yn/(xp*dpnp))
+            +atan(zn*yp/(xp*dppn)) - atan(zp*yp/(xp*dppp));
 
     /* dm[1] = Nxy */
     dm[1] =  salog(dnnn-zn) - salog(dnnp-zp)
@@ -146,11 +148,11 @@ static void ctt(double b, double a, double sx, double sy, double dm[9])
             -salog(dpnn-zn) + salog(dpnp-zp)
             +salog(dppn-zn) - salog(dppp-zp);
 
-    /* dm[4] = Nyy */
-    dm[4] =  atan2(zn*xn, yn*dnnn) - atan2(zp*xn, yn*dnnp)
-            -atan2(zn*xp, yn*dpnn) + atan2(zp*xp, yn*dpnp)
-            -atan2(zn*xn, yp*dnpn) + atan2(zp*xn, yp*dnpp)
-            +atan2(zn*xp, yp*dppn) - atan2(zp*xp, yp*dppp);
+    /* dm[4] = Nyy  — use atan(y/x), same reason as dm[0]. */
+    dm[4] =  atan(zn*xn/(yn*dnnn)) - atan(zp*xn/(yn*dnnp))
+            -atan(zn*xp/(yn*dpnn)) + atan(zp*xp/(yn*dpnp))
+            -atan(zn*xn/(yp*dnpn)) + atan(zp*xn/(yp*dnpp))
+            +atan(zn*xp/(yp*dppn)) - atan(zp*xp/(yp*dppp));
 
     /* dm[5] = Nyz */
     dm[5] =  salog(dnnn-xn) - salog(dpnn-xp)
@@ -165,19 +167,21 @@ static void ctt(double b, double a, double sx, double sy, double dm[9])
             +salog(dpnp-yn) - salog(dppp-yp);
 
     /* dm[7] = Nzy */
-    dm[8-1] =  salog(dnnn-xn) - salog(dpnn-xp)     /* note: dm[7] */
+    dm[7] =  salog(dnnn-xn) - salog(dpnn-xp)
             -salog(dnnp-xn) + salog(dpnp-xp)
             -salog(dnpn-xn) + salog(dppn-xp)
             +salog(dnpp-xn) - salog(dppp-xp);
 
-    /* dm[8] = Nzz */
-    dm[8] =  atan2(xn*yn, zn*dnnn) - atan2(xp*yn, zn*dpnn)
-            -atan2(xn*yp, zn*dnpn) + atan2(xp*yp, zn*dppn)
-            -atan2(xn*yn, zp*dnnp) + atan2(xp*yn, zp*dpnp)
-            +atan2(xn*yp, zp*dnpp) - atan2(xp*yp, zp*dppp);
+    /* dm[8] = Nzz  — use atan(y/x), same reason as dm[0].
+     * zn = -0.5*thick < 0 always, so atan2 would differ by π whenever
+     * the numerator sign changes, producing wrong Nzz everywhere. */
+    dm[8] =  atan(xn*yn/(zn*dnnn)) - atan(xp*yn/(zn*dpnn))
+            -atan(xn*yp/(zn*dnpn)) + atan(xp*yp/(zn*dppn))
+            -atan(xn*yn/(zp*dnnp)) + atan(xp*yn/(zp*dpnp))
+            +atan(xn*yp/(zp*dnpp)) - atan(xp*yp/(zp*dppp));
 }
 
-/* 
+/* ═══════════════════════════════════════════════════════════════════════════
  * calt  —  compute demag tensor on the full nx×ny grid
  *
  * Faithfully implements professor's pseudocode:
@@ -188,7 +192,7 @@ static void ctt(double b, double a, double sx, double sy, double dm[9])
  * the origin at the middle of the grid (matching professor's ix-mdx2).
  *
  * Output arrays: taa..tcc [nx*ny doubles], laid out as taa[j*nx+i].
- */
+ * ═══════════════════════════════════════════════════════════════════════════ */
 static void calt(double thick, int nx, int ny,
                  double *taa, double *tab, double *tac,
                  double *tba, double *tbb, double *tbc,
@@ -238,7 +242,9 @@ static void calt(double thick, int nx, int ny,
     }
 }
 
-/* GPU kernels  */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * GPU kernels
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 /*
  * pointwise_multiply_kernel
@@ -330,9 +336,9 @@ __global__ static void scatter_add_real_kernel(
     h_soa[comp * ncell + cell] += scale * buf[cell].x;
 }
 
-/*
+/* ═══════════════════════════════════════════════════════════════════════════
  * DemagData struct
- * */
+ * ═══════════════════════════════════════════════════════════════════════════ */
 struct DemagData {
     int nx, ny, ncell, nk;   /* nk = nx*ny (C2C uses full spectrum) */
     double scale;             /* 1/(nx*ny) for IFFT normalization     */
@@ -353,9 +359,9 @@ struct DemagData {
     cufftDoubleComplex *d_buf;       /* ncell complex doubles */
 };
 
-/*
+/* ═══════════════════════════════════════════════════════════════════════════
  * Demag_Init
- * */
+ * ═══════════════════════════════════════════════════════════════════════════ */
 DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
 {
     printf("[Demag] Initializing Newell tensor (calt/ctt), nx=%d ny=%d thick=%.4f\n",
@@ -483,10 +489,12 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
     return d;
 }
 
-/* Demag_Apply
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Demag_Apply
  *
  * Called every RHS evaluation.
- * Adds h_dmag = N * M (convolution via FFT) to h_out. */
+ * Adds h_dmag = N * M (convolution via FFT) to h_out.
+ * ═══════════════════════════════════════════════════════════════════════════ */
 void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
 {
     if (!d) return;
@@ -545,7 +553,9 @@ void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
     /* No explicit sync — CVODE's next CUDA call on stream 0 provides order */
 }
 
-/* Demag_Destroy */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Demag_Destroy
+ * ═══════════════════════════════════════════════════════════════════════════ */
 void Demag_Destroy(DemagData *d)
 {
     if (!d) return;
@@ -555,6 +565,4 @@ void Demag_Destroy(DemagData *d)
         if (d->d_Mhat[c]) cudaFree(d->d_Mhat[c]);
         if (d->d_Hhat[c]) cudaFree(d->d_Hhat[c]);
     }
-    if (d->d_buf) cudaFree(d->d_buf);
-    free(d);
 }
