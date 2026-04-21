@@ -1,568 +1,567 @@
-/*
- * demag_fft.cu  —  FFT demagnetization field, professor's Newell tensor method
- *
- * ═══════════════════════════════════════════════════════════════════════════
- * PHYSICS
- * ═══════════════════════════════════════════════════════════════════════════
- * The demagnetization field is the convolution:
- *
- *   h_dmag,α(i,j) = Σ_{m,n}  N_αβ(i-m, j-n) · M_β(m,n)
- *
- * Via the convolution theorem:
- *
- *   h_dmag,α = IFFT[ N̂_αβ(k) · M̂_β(k) ]
- *
- * N_αβ(r) is the demag tensor computed by professor's calt/ctt functions
- * (Newell et al. analytic integrals for a rectangular prism source cell).
- *
- * ═══════════════════════════════════════════════════════════════════════════
- * PROFESSOR'S ALGORITHM (faithfully reproduced from pseudocode)
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * ctt(b, a, sx, sy, dm[]):
- *   Computes the 9 demag tensor components for a displacement (sx,sy,0)
- *   using closed-form atan/log integrals for a prism of half-size (a,a,b).
- *   a = 0.49999  (half-cell size in x and y)
- *   b = 0.5*thick (half-cell size in z)
- *
- * calt(thick, nx, ny, taa..tcc):
- *   For each grid point (i,j), samples the ctt kernel on a 9×9 sub-grid
- *   (jx,jy = -4..4 in steps of 0.1*cell) and averages (divides by 81).
- *   This is a numerical integration to reduce aliasing of the singular
- *   demag kernel at short range.
- *
- * ═══════════════════════════════════════════════════════════════════════════
- * cuFFT USAGE
- * ═══════════════════════════════════════════════════════════════════════════
- * Uses C2C (Z2Z) plans, matching the professor's cufftPlan2d CUFFT_Z2Z.
- * The real-valued tensor components are zero-padded into complex arrays
- * (imaginary part = 0) before FFT, exactly as in the pseudocode.
- *
- * Plan:  cufftPlan2d(&plan, ny, nx, CUFFT_Z2Z)
- * Forward: cufftExecZ2Z(..., CUFFT_FORWARD)
- * Inverse: cufftExecZ2Z(..., CUFFT_INVERSE)  + normalize by 1/(nx*ny)
- */
-
-#include "demag_fft.h"
-
+#include <cstdio>
+#include <cmath>
 #include <cufft.h>
 #include <cuda_runtime.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <nvector/nvector_cuda.h>
 
-/* ─── internal macros ─────────────────────────────────────────────────── */
-#define CHECK_CUDA(call) do {                                               \
-    cudaError_t _e = (call);                                                \
-    if (_e != cudaSuccess) {                                                \
-        fprintf(stderr,"[demag] CUDA %s:%d: %s\n",                         \
-                __FILE__,__LINE__,cudaGetErrorString(_e));                  \
-        return NULL;                                                        \
-    }                                                                      \
-} while(0)
-
-#define CHECK_CUDA_V(call) do {                                             \
-    cudaError_t _e = (call);                                                \
-    if (_e != cudaSuccess)                                                  \
-        fprintf(stderr,"[demag] CUDA %s:%d: %s\n",                         \
-                __FILE__,__LINE__,cudaGetErrorString(_e));                  \
-} while(0)
-
-#define CHECK_CUFFT(call) do {                                              \
-    cufftResult _r = (call);                                                \
-    if (_r != CUFFT_SUCCESS) {                                              \
-        fprintf(stderr,"[demag] cuFFT %s:%d: code=%d\n",                   \
-                __FILE__,__LINE__,(int)_r);                                 \
-        return NULL;                                                        \
-    }                                                                      \
-} while(0)
-
-#define CHECK_CUFFT_V(call) do {                                            \
-    cufftResult _r = (call);                                                \
-    if (_r != CUFFT_SUCCESS)                                                \
-        fprintf(stderr,"[demag] cuFFT %s:%d: code=%d\n",                   \
-                __FILE__,__LINE__,(int)_r);                                 \
-} while(0)
-
-/* safe log — avoids log(0) */
-static inline double salog(double x) {
-    return (x > 1e-300) ? log(x) : -300.0*log(10.0);
+static inline cufftDoubleComplex cadd(cufftDoubleComplex a, cufftDoubleComplex b)
+{
+    cufftDoubleComplex r;
+    r.x = a.x + b.x;
+    r.y = a.y + b.y;
+    return r;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * ctt  —  analytic demag tensor for one displacement (sx, sy)
- *
- * Directly translated from professor's Fortran-style pseudocode.
- * Computes dm[0..8] = [Nxx, Nxy, Nxz, Nyx, Nyy, Nyz, Nzx, Nzy, Nzz]
- * (0-indexed here, professor used 1-indexed)
- *
- * b = half-thickness in z  (= 0.5 * thick)
- * a = half-cell size in x,y (= 0.49999)
- * ═══════════════════════════════════════════════════════════════════════════ */
-static void ctt(double b, double a, double sx, double sy, double dm[9])
+static inline cufftDoubleComplex cmul(cufftDoubleComplex a, cufftDoubleComplex b)
 {
-    double sz = 0.0;
-
-    double xn = sx - a,  xp = sx + a;
-    double yn = sy - a,  yp = sy + a;
-    double zn = sz - b,  zp = sz + b;
-
-    double xn2 = xn*xn, xp2 = xp*xp;
-    double yn2 = yn*yn, yp2 = yp*yp;
-    double zn2 = zn*zn, zp2 = zp*zp;
-
-    double dnnn = sqrt(xn2+yn2+zn2);
-    double dpnn = sqrt(xp2+yn2+zn2);
-    double dnpn = sqrt(xn2+yp2+zn2);
-    double dnnp = sqrt(xn2+yn2+zp2);
-    double dppn = sqrt(xp2+yp2+zn2);
-    double dnpp = sqrt(xn2+yp2+zp2);
-    double dpnp = sqrt(xp2+yn2+zp2);
-    double dppp = sqrt(xp2+yp2+zp2);
-
-    /* dm[0] = Nxx  — use atan(y/x), NOT atan2, to match professor's formula.
-     * atan2(y,x) differs from atan(y/x) by ±π when x<0, corrupting cells
-     * in the left half of the grid (i < nx/2, where xn = sx-a < 0). */
-    dm[0] =  atan(zn*yn/(xn*dnnn)) - atan(zp*yn/(xn*dnnp))
-            -atan(zn*yp/(xn*dnpn)) + atan(zp*yp/(xn*dnpp))
-            -atan(zn*yn/(xp*dpnn)) + atan(zp*yn/(xp*dpnp))
-            +atan(zn*yp/(xp*dppn)) - atan(zp*yp/(xp*dppp));
-
-    /* dm[1] = Nxy */
-    dm[1] =  salog(dnnn-zn) - salog(dnnp-zp)
-            -salog(dpnn-zn) + salog(dpnp-zp)
-            -salog(dnpn-zn) + salog(dnpp-zp)
-            +salog(dppn-zn) - salog(dppp-zp);
-
-    /* dm[2] = Nxz */
-    dm[2] =  salog(dnnn-yn) - salog(dnpn-yp)
-            -salog(dpnn-yn) + salog(dppn-yp)
-            -salog(dnnp-yn) + salog(dnpp-yp)
-            +salog(dpnp-yn) - salog(dppp-yp);
-
-    /* dm[3] = Nyx  (= Nxy by symmetry, kept separate for clarity) */
-    dm[3] =  salog(dnnn-zn) - salog(dnnp-zp)
-            -salog(dnpn-zn) + salog(dnpp-zp)
-            -salog(dpnn-zn) + salog(dpnp-zp)
-            +salog(dppn-zn) - salog(dppp-zp);
-
-    /* dm[4] = Nyy  — use atan(y/x), same reason as dm[0]. */
-    dm[4] =  atan(zn*xn/(yn*dnnn)) - atan(zp*xn/(yn*dnnp))
-            -atan(zn*xp/(yn*dpnn)) + atan(zp*xp/(yn*dpnp))
-            -atan(zn*xn/(yp*dnpn)) + atan(zp*xn/(yp*dnpp))
-            +atan(zn*xp/(yp*dppn)) - atan(zp*xp/(yp*dppp));
-
-    /* dm[5] = Nyz */
-    dm[5] =  salog(dnnn-xn) - salog(dpnn-xp)
-            -salog(dnpn-xn) + salog(dppn-xp)
-            -salog(dnnp-xn) + salog(dpnp-xp)
-            +salog(dnpp-xn) - salog(dppp-xp);
-
-    /* dm[6] = Nzx */
-    dm[6] =  salog(dnnn-yn) - salog(dnpn-yp)
-            -salog(dnnp-yn) + salog(dnpp-yp)
-            -salog(dpnn-yn) + salog(dppn-yp)
-            +salog(dpnp-yn) - salog(dppp-yp);
-
-    /* dm[7] = Nzy */
-    dm[7] =  salog(dnnn-xn) - salog(dpnn-xp)
-            -salog(dnnp-xn) + salog(dpnp-xp)
-            -salog(dnpn-xn) + salog(dppn-xp)
-            +salog(dnpp-xn) - salog(dppp-xp);
-
-    /* dm[8] = Nzz  — use atan(y/x), same reason as dm[0].
-     * zn = -0.5*thick < 0 always, so atan2 would differ by π whenever
-     * the numerator sign changes, producing wrong Nzz everywhere. */
-    dm[8] =  atan(xn*yn/(zn*dnnn)) - atan(xp*yn/(zn*dpnn))
-            -atan(xn*yp/(zn*dnpn)) + atan(xp*yp/(zn*dppn))
-            -atan(xn*yn/(zp*dnnp)) + atan(xp*yn/(zp*dpnp))
-            +atan(xn*yp/(zp*dnpp)) - atan(xp*yp/(zp*dppp));
+    cufftDoubleComplex r;
+    r.x = a.x * b.x - a.y * b.y;
+    r.y = a.x * b.y + a.y * b.x;
+    return r;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * calt  —  compute demag tensor on the full nx×ny grid
- *
- * Faithfully implements professor's pseudocode:
- *   For each cell (i,j), sample ctt on a 9×9 sub-grid (ix,jy = -4..4)
- *   at offsets 0.1*ix, 0.1*jy — then average (divide by 81).
- *
- * The cell displacement is (i - nx/2) + 0.1*ix  etc., which centres
- * the origin at the middle of the grid (matching professor's ix-mdx2).
- *
- * Output arrays: taa..tcc [nx*ny doubles], laid out as taa[j*nx+i].
- * ═══════════════════════════════════════════════════════════════════════════ */
-static void calt(double thick, int nx, int ny,
-                 double *taa, double *tab, double *tac,
-                 double *tba, double *tbb, double *tbc,
-                 double *tca, double *tcb, double *tcc)
+int calt(double thik, int mdx, int mdy,
+         double taa[], double tab[], double tac[],
+         double tba[], double tbb[], double tbc[],
+         double tca[], double tcb[], double tcc[]);
+
+void ctt(double b, double a, double sx, double sy, double dm[]);
+
+int main()
 {
-    const int nx2 = nx / 2;
-    const int ny2 = ny / 2;
-    const double a = 0.49999;          /* half-cell in x,y */
-    const double b = 0.5 * thick;     /* half-cell in z   */
-    double dm[9];
+    const int nn = 64;
+    int demagstatus = 0;
+    int idx = 0;
+    int i = 0, j = 0;
 
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            int ikn = j * nx + i;
+    double faa[nn * nn], fab[nn * nn], fac[nn * nn];
+    double fba[nn * nn], fbb[nn * nn], fbc[nn * nn];
+    double fca[nn * nn], fcb[nn * nn], fcc[nn * nn];
 
-            /* zero all 9 components */
-            taa[ikn] = tbb[ikn] = tcc[ikn] = 0.0;
-            tab[ikn] = tac[ikn] = 0.0;
-            tba[ikn] = tbc[ikn] = 0.0;
-            tca[ikn] = tcb[ikn] = 0.0;
+    cufftDoubleComplex* hfaa = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hfab = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hfac = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hfba = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hfbb = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hfbc = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hfca = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hfcb = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hfcc = new cufftDoubleComplex[nn * nn];
 
-            /* 9×9 sub-grid averaging (professor's loop ix,jy = -4..4) */
-            for (int jy = -4; jy <= 4; jy++) {
-                double sy = (double)(j - ny2) + 0.1*(double)jy;
-                for (int ix = -4; ix <= 4; ix++) {
-                    double sx = (double)(i - nx2) + 0.1*(double)ix;
+    cufftDoubleComplex* hofaa = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hofab = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hofac = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hofba = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hofbb = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hofbc = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hofca = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hofcb = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hofcc = new cufftDoubleComplex[nn * nn];
 
+    cufftDoubleComplex* hrha = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hrhb = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hrhc = new cufftDoubleComplex[nn * nn];
+
+    cufftDoubleComplex* hrhx = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hrhy = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hrhz = new cufftDoubleComplex[nn * nn];
+
+    int nn8 = nn / 8;
+    int nn2 = nn / 2;
+
+    double thick = 100.0;
+
+    // Calculate FFT of Demagnetization Matrix
+    demagstatus = calt(thick, nn, nn,
+                       faa, fab, fac,
+                       fba, fbb, fbc,
+                       fca, fcb, fcc);
+
+    for (int j = 0; j < nn; j++) {
+        for (int i = 0; i < nn; i++) {
+            idx = j * nn + i;
+            hfaa[idx].x = faa[idx];
+            hfab[idx].x = fab[idx];
+            hfac[idx].x = fac[idx];
+            hfaa[idx].y = 0.0;
+            hfab[idx].y = 0.0;
+            hfac[idx].y = 0.0;
+
+            hfba[idx].x = fba[idx];
+            hfbb[idx].x = fbb[idx];
+            hfbc[idx].x = fbc[idx];
+            hfba[idx].y = 0.0;
+            hfbb[idx].y = 0.0;
+            hfbc[idx].y = 0.0;
+
+            hfca[idx].x = fca[idx];
+            hfcb[idx].x = fcb[idx];
+            hfcc[idx].x = fcc[idx];
+            hfca[idx].y = 0.0;
+            hfcb[idx].y = 0.0;
+            hfcc[idx].y = 0.0;
+        }
+    }
+
+    cufftDoubleComplex* difaa = nullptr;
+    cufftDoubleComplex* difab = nullptr;
+    cufftDoubleComplex* difac = nullptr;
+    cufftDoubleComplex* difba = nullptr;
+    cufftDoubleComplex* difbb = nullptr;
+    cufftDoubleComplex* difbc = nullptr;
+    cufftDoubleComplex* difca = nullptr;
+    cufftDoubleComplex* difcb = nullptr;
+    cufftDoubleComplex* difcc = nullptr;
+
+    cufftDoubleComplex* dofaa = nullptr;
+    cufftDoubleComplex* dofab = nullptr;
+    cufftDoubleComplex* dofac = nullptr;
+    cufftDoubleComplex* dofba = nullptr;
+    cufftDoubleComplex* dofbb = nullptr;
+    cufftDoubleComplex* dofbc = nullptr;
+    cufftDoubleComplex* dofca = nullptr;
+    cufftDoubleComplex* dofcb = nullptr;
+    cufftDoubleComplex* dofcc = nullptr;
+
+    cudaError_t cuda_status;
+
+    cuda_status = cudaMalloc((void**)&difaa, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&difab, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&difac, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&difba, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&difbb, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&difbc, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&difca, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&difcb, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&difcc, nn * nn * sizeof(cufftDoubleComplex));
+
+    cuda_status = cudaMalloc((void**)&dofaa, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dofab, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dofac, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dofba, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dofbb, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dofbc, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dofca, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dofcb, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dofcc, nn * nn * sizeof(cufftDoubleComplex));
+
+    if (cuda_status != cudaSuccess) {
+        std::printf("cudaMalloc d_in failed\n");
+        return 1;
+    }
+
+    cuda_status = cudaMemcpy(difaa, hfaa, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(difab, hfab, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(difac, hfac, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(difba, hfba, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(difbb, hfbb, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(difbc, hfbc, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(difca, hfca, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(difcb, hfcb, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(difcc, hfcc, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+
+    cufftHandle plan;
+    cufftResult fft_status;
+    fft_status = cufftPlan2d(&plan, nn, nn, CUFFT_Z2Z);
+
+    if (fft_status != CUFFT_SUCCESS) {
+        std::printf("cufftPlan2d failed\n");
+        return 1;
+    }
+
+    fft_status = cufftExecZ2Z(plan, difaa, dofaa, CUFFT_FORWARD);
+    fft_status = cufftExecZ2Z(plan, difab, dofab, CUFFT_FORWARD);
+    fft_status = cufftExecZ2Z(plan, difac, dofac, CUFFT_FORWARD);
+    fft_status = cufftExecZ2Z(plan, difba, dofba, CUFFT_FORWARD);
+    fft_status = cufftExecZ2Z(plan, difbb, dofbb, CUFFT_FORWARD);
+    fft_status = cufftExecZ2Z(plan, difbc, dofbc, CUFFT_FORWARD);
+    fft_status = cufftExecZ2Z(plan, difca, dofca, CUFFT_FORWARD);
+    fft_status = cufftExecZ2Z(plan, difcb, dofcb, CUFFT_FORWARD);
+    fft_status = cufftExecZ2Z(plan, difcc, dofcc, CUFFT_FORWARD);
+
+    cuda_status = cudaMemcpy(hofaa, dofaa, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(hofab, dofab, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(hofac, dofac, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(hofba, dofba, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(hofbb, dofbb, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(hofbc, dofbc, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(hofca, dofca, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(hofcb, dofcb, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(hofcc, dofcc, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+
+    if (fft_status != CUFFT_SUCCESS) {
+        std::printf("cufftExecZ2Z failed\n");
+        cufftDestroy(plan);
+        cudaFree(dofaa);
+        cudaFree(dofab);
+        cudaFree(dofac);
+        cudaFree(dofba);
+        cudaFree(dofbb);
+        cudaFree(dofbc);
+        cudaFree(dofca);
+        cudaFree(dofcb);
+        cudaFree(dofcc);
+        cudaFree(difaa);
+        cudaFree(difab);
+        cudaFree(difac);
+        cudaFree(difba);
+        cudaFree(difbb);
+        cudaFree(difbc);
+        cudaFree(difca);
+        cudaFree(difcb);
+        cudaFree(difcc);
+        return 1;
+    }
+
+
+
+    double* hma = new double[nn * nn];
+    double* hmb = new double[nn * nn];
+    double* hmc = new double[nn * nn];
+
+    cufftDoubleComplex* hma_c = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hmb_c = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hmc_c = new cufftDoubleComplex[nn * nn];
+
+    cufftDoubleComplex* homa = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* homb = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* homc = new cufftDoubleComplex[nn * nn];
+
+    cufftDoubleComplex* hkha = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hkhb = new cufftDoubleComplex[nn * nn];
+    cufftDoubleComplex* hkhc = new cufftDoubleComplex[nn * nn];
+
+    int i1 = nn / 3;
+    int i2 = 2 * nn / 3;
+    int j1 = nn / 3;
+    int j2 = 2 * nn / 3;
+
+    for (j = 0; j < nn; j++) {
+        for (i = 0; i < nn; i++) {
+            idx = j * nn + i;
+            hma[idx] = 1.0;
+            hmb[idx] = 0.0;
+            hmc[idx] = 0.0;
+            if (i > i1 && i < i2) {
+                if (j > j1 && j < j2) {
+                    hma[idx] = 0.0;
+                }
+            }
+            hma_c[idx].x = hma[idx];
+            hma_c[idx].y = 0.0;
+            hmb_c[idx].x = hmb[idx];
+            hmb_c[idx].y = 0.0;
+            hmc_c[idx].x = hmc[idx];
+            hmc_c[idx].y = 0.0;
+        }
+    }
+
+    // FFT for magnetization ma, mb, mc
+    cufftDoubleComplex* dima = nullptr;
+    cufftDoubleComplex* dimb = nullptr;
+    cufftDoubleComplex* dimc = nullptr;
+
+    cufftDoubleComplex* doma = nullptr;
+    cufftDoubleComplex* domb = nullptr;
+    cufftDoubleComplex* domc = nullptr;
+
+    cuda_status = cudaMalloc((void**)&dima, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dimb, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dimc, nn * nn * sizeof(cufftDoubleComplex));
+
+    cuda_status = cudaMalloc((void**)&doma, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&domb, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&domc, nn * nn * sizeof(cufftDoubleComplex));
+
+    cuda_status = cudaMemcpy(dima, hma_c, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(dimb, hmb_c, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(dimc, hmc_c, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+
+    fft_status = cufftExecZ2Z(plan, dima, doma, CUFFT_FORWARD);
+    fft_status = cufftExecZ2Z(plan, dimb, domb, CUFFT_FORWARD);
+    fft_status = cufftExecZ2Z(plan, dimc, domc, CUFFT_FORWARD);
+
+    cuda_status = cudaMemcpy(homa, doma, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(homb, domb, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(homc, domc, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+
+
+    for (j = 0; j < nn; j++) {
+        for (i = 0; i < nn; i++) {
+            idx = j * nn + i;
+            hkha[idx] = cadd(cadd(cmul(hofaa[idx], homa[idx]), cmul(hofab[idx], homb[idx])), cmul(hofac[idx], homc[idx]));
+            hkhb[idx] = cadd(cadd(cmul(hofba[idx], homa[idx]), cmul(hofbb[idx], homb[idx])), cmul(hofbc[idx], homc[idx]));
+            hkhc[idx] = cadd(cadd(cmul(hofca[idx], homa[idx]), cmul(hofcb[idx], homb[idx])), cmul(hofcc[idx], homc[idx]));
+        }
+    }
+
+    cufftDoubleComplex* dkha = nullptr;
+    cufftDoubleComplex* dkhb = nullptr;
+    cufftDoubleComplex* dkhc = nullptr;
+    cufftDoubleComplex* drha = nullptr;
+    cufftDoubleComplex* drhb = nullptr;
+    cufftDoubleComplex* drhc = nullptr;
+
+    cuda_status = cudaMalloc((void**)&dkha, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dkhb, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&dkhc, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&drha, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&drhb, nn * nn * sizeof(cufftDoubleComplex));
+    cuda_status = cudaMalloc((void**)&drhc, nn * nn * sizeof(cufftDoubleComplex));
+
+    cuda_status = cudaMemcpy(dkha, hkha, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(dkhb, hkhb, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+    cuda_status = cudaMemcpy(dkhc, hkhc, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice);
+
+    // Inverse FFT for Field  dkh -> drh
+    fft_status = cufftExecZ2Z(plan, dkha, drha, CUFFT_INVERSE);
+    fft_status = cufftExecZ2Z(plan, dkhb, drhb, CUFFT_INVERSE);
+    fft_status = cufftExecZ2Z(plan, dkhc, drhc, CUFFT_INVERSE);
+
+    if (cuda_status != cudaSuccess) {
+        std::printf("cudaMemcpy D2H failedx\n");
+        cufftDestroy(plan);
+        return 1;
+    }
+
+    cuda_status = cudaMemcpy(hrha, drha, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(hrhb, drhb, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+    cuda_status = cudaMemcpy(hrhc, drhc, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
+
+    int idxnew=0;
+    int ix=0;
+    int jy=0;
+    std::printf("%d %d %d\n", nn, nn, nn);
+    for (int j = 0; j < nn; j++) {
+	if ( j < nn2 ) {  
+		jy = nn2 -j ; 
+	}
+	else{
+		jy = nn -j + nn2 -1 ;
+        }
+        for (int i = 0; i < nn; i++) {
+		if ( i < nn2 ) {  
+		   ix = nn2-i ; 
+		}
+		else{
+		   ix = nn -i + nn2 -1 ;
+        	}
+                idx = j * nn + i;
+                idxnew = jy * nn + ix;
+            double hx = (hrha[idxnew].x) / (nn * nn);
+            double hy = (hrhb[idxnew].x) / (nn * nn);
+            double hz = (hrhc[idxnew].x) / (nn * nn);
+            std::printf("%f %f %f\n", hx, hy, hz);
+        }
+    }
+
+    if (cuda_status != cudaSuccess) {
+        std::printf("cudaMemcpy D2H failedx\n");
+        cufftDestroy(plan);
+        return 1;
+    }
+
+    cufftDestroy(plan);
+
+    cudaFree(difaa);
+    cudaFree(difab);
+    cudaFree(difac);
+    cudaFree(difba);
+    cudaFree(difbb);
+    cudaFree(difbc);
+    cudaFree(difca);
+    cudaFree(difcb);
+    cudaFree(difcc);
+
+    cudaFree(dofaa);
+    cudaFree(dofab);
+    cudaFree(dofac);
+    cudaFree(dofba);
+    cudaFree(dofbb);
+    cudaFree(dofbc);
+    cudaFree(dofca);
+    cudaFree(dofcb);
+    cudaFree(dofcc);
+
+    cudaFree(dima);
+    cudaFree(dimb);
+    cudaFree(dimc);
+    cudaFree(doma);
+    cudaFree(domb);
+    cudaFree(domc);
+
+    cudaFree(dkha);
+    cudaFree(dkhb);
+    cudaFree(dkhc);
+    cudaFree(drha);
+    cudaFree(drhb);
+    cudaFree(drhc);
+
+    delete[] hfaa;
+    delete[] hfab;
+    delete[] hfac;
+    delete[] hfba;
+    delete[] hfbb;
+    delete[] hfbc;
+    delete[] hfca;
+    delete[] hfcb;
+    delete[] hfcc;
+
+    delete[] hofaa;
+    delete[] hofab;
+    delete[] hofac;
+    delete[] hofba;
+    delete[] hofbb;
+    delete[] hofbc;
+    delete[] hofca;
+    delete[] hofcb;
+    delete[] hofcc;
+
+    delete[] hrha;
+    delete[] hrhb;
+    delete[] hrhc;
+    delete[] hrhx;
+    delete[] hrhy;
+    delete[] hrhz;
+
+    delete[] hma;
+    delete[] hmb;
+    delete[] hmc;
+    delete[] hma_c;
+    delete[] hmb_c;
+    delete[] hmc_c;
+    delete[] homa;
+    delete[] homb;
+    delete[] homc;
+    delete[] hkha;
+    delete[] hkhb;
+    delete[] hkhc;
+
+    return 0;
+}
+
+int calt(double thik, int mdx, int mdy,
+         double taa[], double tab[], double tac[],
+         double tba[], double tbb[], double tbc[],
+         double tca[], double tcb[], double tcc[])
+{
+    int i, j, ix, jy, ikn;
+    int mdx2 = mdx / 2;
+    int mdy2 = mdy / 2;
+    double sx, sy;
+    double a = 0.49999;
+    double b = 0.5 * thik;
+    double dm[10];
+
+    for (j = 0; j < mdy; j++) {
+        for (i = 0; i < mdx; i++) {
+            ikn = j * mdx + i;
+            taa[ikn] = 0.0;
+            tab[ikn] = 0.0;
+            tac[ikn] = 0.0;
+            tba[ikn] = 0.0;
+            tbb[ikn] = 0.0;
+            tbc[ikn] = 0.0;
+            tca[ikn] = 0.0;
+            tcb[ikn] = 0.0;
+            tcc[ikn] = 0.0;
+
+            for (jy = -4; jy <= 4; jy++) {
+                sy = double(j - mdy2) + 0.1 * double(jy);
+                for (ix = -4; ix <= 4; ix++) {
+                    sx = double(i - mdx2) + 0.1 * double(ix);
                     ctt(b, a, sx, sy, dm);
-
-                    taa[ikn] += dm[0];
-                    tab[ikn] += dm[1];
-                    tac[ikn] += dm[2];
-                    tba[ikn] += dm[3];
-                    tbb[ikn] += dm[4];
-                    tbc[ikn] += dm[5];
-                    tca[ikn] += dm[6];
-                    tcb[ikn] += dm[7];
-                    tcc[ikn] += dm[8];
+                    taa[ikn] = taa[ikn] + dm[1];
+                    tab[ikn] = tab[ikn] + dm[2];
+                    tac[ikn] = tac[ikn] + dm[3];
+                    tba[ikn] = tba[ikn] + dm[4];
+                    tbb[ikn] = tbb[ikn] + dm[5];
+                    tbc[ikn] = tbc[ikn] + dm[6];
+                    tca[ikn] = tca[ikn] + dm[7];
+                    tcb[ikn] = tcb[ikn] + dm[8];
+                    tcc[ikn] = tcc[ikn] + dm[9];
                 }
             }
 
-            /* average over 9*9 = 81 sub-samples */
-            taa[ikn] /= 81.0;  tab[ikn] /= 81.0;  tac[ikn] /= 81.0;
-            tba[ikn] /= 81.0;  tbb[ikn] /= 81.0;  tbc[ikn] /= 81.0;
-            tca[ikn] /= 81.0;  tcb[ikn] /= 81.0;  tcc[ikn] /= 81.0;
+            taa[ikn] = taa[ikn] / 81.0;
+            tab[ikn] = tab[ikn] / 81.0;
+            tac[ikn] = tac[ikn] / 81.0;
+            tba[ikn] = tba[ikn] / 81.0;
+            tbb[ikn] = tbb[ikn] / 81.0;
+            tbc[ikn] = tbc[ikn] / 81.0;
+            tca[ikn] = tca[ikn] / 81.0;
+            tcb[ikn] = tcb[ikn] / 81.0;
+            tcc[ikn] = tcc[ikn] / 81.0;
         }
     }
+    return 1;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * GPU kernels
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/*
- * pointwise_multiply_kernel
- *
- * For each k-space point:
- *   Ĥ_α(k) = Σ_β  N̂_αβ(k) · M̂_β(k)
- *
- * N̂ arrays may be complex (result of FFT of real-valued tensor),
- * so we do full complex×complex multiply.
- *
- * Tensor index map (matches professor's dm[0..8]):
- *   N̂aa=xx, N̂ab=xy, N̂ac=xz
- *   N̂ba=yx, N̂bb=yy, N̂bc=yz
- *   N̂ca=zx, N̂cb=zy, N̂cc=zz
- */
-__global__ static void pointwise_multiply_kernel(
-    /* magnetization spectra */
-    const cufftDoubleComplex* __restrict__ Mx,
-    const cufftDoubleComplex* __restrict__ My,
-    const cufftDoubleComplex* __restrict__ Mz,
-    /* demag tensor spectra (9 components) */
-    const cufftDoubleComplex* __restrict__ Naa,
-    const cufftDoubleComplex* __restrict__ Nab,
-    const cufftDoubleComplex* __restrict__ Nac,
-    const cufftDoubleComplex* __restrict__ Nba,
-    const cufftDoubleComplex* __restrict__ Nbb,
-    const cufftDoubleComplex* __restrict__ Nbc,
-    const cufftDoubleComplex* __restrict__ Nca,
-    const cufftDoubleComplex* __restrict__ Ncb,
-    const cufftDoubleComplex* __restrict__ Ncc,
-    /* output field spectra */
-    cufftDoubleComplex* __restrict__ Hx,
-    cufftDoubleComplex* __restrict__ Hy,
-    cufftDoubleComplex* __restrict__ Hz,
-    int nk)
+void ctt(double b, double a, double sx, double sy, double dm[])
 {
-    int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= nk) return;
+    double sz = 0.0;
 
-    /* helper: complex multiply (a+ib)*(c+id) = (ac-bd) + i(ad+bc) */
-#define CMUL_R(A,B) ((A)[k].x*(B)[k].x - (A)[k].y*(B)[k].y)
-#define CMUL_I(A,B) ((A)[k].x*(B)[k].y + (A)[k].y*(B)[k].x)
+    double xn = sx - a;
+    double xp = sx + a;
+    double yn = sy - a;
+    double yp = sy + a;
+    double zn = sz - b;
+    double zp = sz + b;
 
-    /* Ĥx = Naa*Mx + Nab*My + Nac*Mz */
-    Hx[k].x = CMUL_R(Naa,Mx) + CMUL_R(Nab,My) + CMUL_R(Nac,Mz);
-    Hx[k].y = CMUL_I(Naa,Mx) + CMUL_I(Nab,My) + CMUL_I(Nac,Mz);
+    double xn2 = xn * xn;
+    double xp2 = xp * xp;
+    double yn2 = yn * yn;
+    double yp2 = yp * yp;
+    double zn2 = zn * zn;
+    double zp2 = zp * zp;
 
-    /* Ĥy = Nba*Mx + Nbb*My + Nbc*Mz */
-    Hy[k].x = CMUL_R(Nba,Mx) + CMUL_R(Nbb,My) + CMUL_R(Nbc,Mz);
-    Hy[k].y = CMUL_I(Nba,Mx) + CMUL_I(Nbb,My) + CMUL_I(Nbc,Mz);
+    double dnnn = std::sqrt(xn2 + yn2 + zn2);
+    double dpnn = std::sqrt(xp2 + yn2 + zn2);
+    double dnpn = std::sqrt(xn2 + yp2 + zn2);
+    double dnnp = std::sqrt(xn2 + yn2 + zp2);
+    double dppn = std::sqrt(xp2 + yp2 + zn2);
+    double dnpp = std::sqrt(xn2 + yp2 + zp2);
+    double dpnp = std::sqrt(xp2 + yn2 + zp2);
+    double dppp = std::sqrt(xp2 + yp2 + zp2);
 
-    /* Ĥz = Nca*Mx + Ncb*My + Ncc*Mz */
-    Hz[k].x = CMUL_R(Nca,Mx) + CMUL_R(Ncb,My) + CMUL_R(Ncc,Mz);
-    Hz[k].y = CMUL_I(Nca,Mx) + CMUL_I(Ncb,My) + CMUL_I(Ncc,Mz);
+    dm[1] =
+        std::atan(zn * yn / (xn * dnnn)) - std::atan(zp * yn / (xn * dnnp))
+        - std::atan(zn * yp / (xn * dnpn)) + std::atan(zp * yp / (xn * dnpp))
+        - std::atan(zn * yn / (xp * dpnn)) + std::atan(zp * yn / (xp * dpnp))
+        + std::atan(zn * yp / (xp * dppn)) - std::atan(zp * yp / (xp * dppp));
 
-#undef CMUL_R
-#undef CMUL_I
-}
+    dm[2] =
+        std::log((dnnn - zn) / (dnnp - zp)) - std::log((dpnn - zn) / (dpnp - zp))
+        - std::log((dnpn - zn) / (dnpp - zp)) + std::log((dppn - zn) / (dppp - zp));
 
-/*
- * gather_to_complex_kernel
- * Copy one SoA real component → complex device buffer (imag=0).
- * SoA: y_soa[comp*ncell + cell]
- */
-__global__ static void gather_to_complex_kernel(
-    const double* __restrict__ y_soa,
-    cufftDoubleComplex* __restrict__ buf,
-    int comp, int ncell)
-{
-    int cell = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cell >= ncell) return;
-    buf[cell].x = y_soa[comp * ncell + cell];
-    buf[cell].y = 0.0;
-}
+    dm[3] =
+        std::log((dnnn - yn) / (dnpn - yp)) - std::log((dpnn - yn) / (dppn - yp))
+        - std::log((dnnp - yn) / (dnpp - yp)) + std::log((dpnp - yn) / (dppp - yp));
 
-/*
- * scatter_add_real_kernel
- * Add the real part of a complex buffer (scaled) into a SoA field array.
- * h_soa[comp*ncell + cell] += scale * buf[cell].x
- * (After IFFT of a real-sourced signal the result should be real.)
- */
-__global__ static void scatter_add_real_kernel(
-    const cufftDoubleComplex* __restrict__ buf,
-    double* __restrict__ h_soa,
-    int comp, int ncell, double scale)
-{
-    int cell = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cell >= ncell) return;
-    h_soa[comp * ncell + cell] += scale * buf[cell].x;
-}
+    dm[4] =
+        std::log((dnnn - zn) / (dnnp - zp)) - std::log((dnpn - zn) / (dnpp - zp))
+        - std::log((dpnn - zn) / (dpnp - zp)) + std::log((dppn - zn) / (dppp - zp));
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * DemagData struct
- * ═══════════════════════════════════════════════════════════════════════════ */
-struct DemagData {
-    int nx, ny, ncell, nk;   /* nk = nx*ny (C2C uses full spectrum) */
-    double scale;             /* 1/(nx*ny) for IFFT normalization     */
-    double strength;          /* demag_strength prefactor             */
+    dm[5] =
+        std::atan(zn * xn / (yn * dnnn)) - std::atan(zp * xn / (yn * dnnp))
+        - std::atan(zn * xp / (yn * dpnn)) + std::atan(zp * xp / (yn * dpnp))
+        - std::atan(zn * xn / (yp * dnpn)) + std::atan(zp * xn / (yp * dnpp))
+        + std::atan(zn * xp / (yp * dppn)) - std::atan(zp * xp / (yp * dppp));
 
-    cufftHandle plan;         /* single Z2Z plan for both fwd and inv */
+    dm[6] =
+        std::log((dnnn - xn) / (dpnn - xp)) - std::log((dnpn - xn) / (dppn - xp))
+        - std::log((dnnp - xn) / (dpnp - xp)) + std::log((dnpp - xn) / (dppp - xp));
 
-    /* Device: magnetization spectra (3 components) */
-    cufftDoubleComplex *d_Mhat[3];
+    dm[7] =
+        std::log((dnnn - yn) / (dnpn - yp)) - std::log((dnnp - yn) / (dnpp - yp))
+        - std::log((dpnn - yn) / (dppn - yp)) + std::log((dpnp - yn) / (dppp - yp));
 
-    /* Device: field spectra (3 components) */
-    cufftDoubleComplex *d_Hhat[3];
+    dm[8] =
+        std::log((dnnn - xn) / (dpnn - xp)) - std::log((dnnp - xn) / (dpnp - xp))
+        - std::log((dnpn - xn) / (dppn - xp)) + std::log((dnpp - xn) / (dppp - xp));
 
-    /* Device: demag tensor spectra (9 components, pre-FFT'd at init) */
-    cufftDoubleComplex *d_Nhat[9];   /* aa,ab,ac,ba,bb,bc,ca,cb,cc */
-
-    /* Device: complex scratch for M gather and H scatter */
-    cufftDoubleComplex *d_buf;       /* ncell complex doubles */
-};
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Demag_Init
- * ═══════════════════════════════════════════════════════════════════════════ */
-DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
-{
-    printf("[Demag] Initializing Newell tensor (calt/ctt), nx=%d ny=%d thick=%.4f\n",
-           nx, ny, thick);
-
-    DemagData *d = (DemagData*)calloc(1, sizeof(DemagData));
-    if (!d) { fprintf(stderr,"[demag] calloc failed\n"); return NULL; }
-
-    d->nx      = nx;
-    d->ny      = ny;
-    d->ncell   = nx * ny;
-    d->nk      = nx * ny;       /* Z2Z: full complex spectrum, size = nx*ny */
-    d->scale   = 1.0 / (double)(nx * ny);
-    d->strength = demag_strength;
-
-    /* ── Step 1: compute real-space demag tensor on CPU (calt) ─────────── */
-    printf("[Demag] Computing calt tensor (9 components, 81-point averaging)...\n");
-
-    double *taa = (double*)calloc(d->ncell, sizeof(double));
-    double *tab = (double*)calloc(d->ncell, sizeof(double));
-    double *tac = (double*)calloc(d->ncell, sizeof(double));
-    double *tba = (double*)calloc(d->ncell, sizeof(double));
-    double *tbb = (double*)calloc(d->ncell, sizeof(double));
-    double *tbc = (double*)calloc(d->ncell, sizeof(double));
-    double *tca = (double*)calloc(d->ncell, sizeof(double));
-    double *tcb = (double*)calloc(d->ncell, sizeof(double));
-    double *tcc = (double*)calloc(d->ncell, sizeof(double));
-
-    if (!taa||!tab||!tac||!tba||!tbb||!tbc||!tca||!tcb||!tcc) {
-        fprintf(stderr,"[demag] tensor CPU alloc failed\n");
-        free(taa);free(tab);free(tac);free(tba);free(tbb);
-        free(tbc);free(tca);free(tcb);free(tcc);free(d);
-        return NULL;
-    }
-
-    calt(thick, nx, ny, taa,tab,tac, tba,tbb,tbc, tca,tcb,tcc);
-    printf("[Demag] calt done.\n");
-
-    /* ── Step 2: pack into complex host arrays (imag = 0, as in pseudocode) */
-    /*  Professor's code:
-     *    hfaa[idx].x = faa[idx];
-     *    hfaa[idx].y = 0.0;
-     *  We do the same for all 9 components.
-     */
-    cufftDoubleComplex *htensor[9];
-    double *tptrs[9] = {taa,tab,tac,tba,tbb,tbc,tca,tcb,tcc};
-    for (int c = 0; c < 9; c++) {
-        htensor[c] = (cufftDoubleComplex*)malloc(
-                         (size_t)d->ncell * sizeof(cufftDoubleComplex));
-        if (!htensor[c]) {
-            fprintf(stderr,"[demag] htensor[%d] alloc failed\n", c);
-            /* cleanup */
-            for (int cc=0; cc<c; cc++) free(htensor[cc]);
-            free(taa);free(tab);free(tac);free(tba);free(tbb);
-            free(tbc);free(tca);free(tcb);free(tcc);free(d);
-            return NULL;
-        }
-        for (int idx = 0; idx < d->ncell; idx++) {
-            htensor[c][idx].x = tptrs[c][idx];
-            htensor[c][idx].y = 0.0;
-        }
-    }
-    free(taa);free(tab);free(tac);free(tba);free(tbb);
-    free(tbc);free(tca);free(tcb);free(tcc);
-
-    /* ── Step 3: cuFFT plan  (Z2Z, matches professor's CUFFT_Z2Z plan) ─── */
-    /*
-     * Professor:  cufftPlan2d(&plan, nn, nn, CUFFT_Z2Z)
-     * We use:     cufftPlan2d(&plan, ny, nx, CUFFT_Z2Z)
-     * cuFFT 2D convention: first arg = slower (row) dim = ny.
-     */
-    {
-        cufftResult r = cufftPlan2d(&d->plan, ny, nx, CUFFT_Z2Z);
-        if (r != CUFFT_SUCCESS) {
-            fprintf(stderr,"[demag] cufftPlan2d failed: %d\n",(int)r);
-            for (int c=0;c<9;c++) free(htensor[c]);
-            free(d); return NULL;
-        }
-    }
-
-    /* ── Step 4: allocate device arrays ───────────────────────────────── */
-    size_t csz = (size_t)d->ncell * sizeof(cufftDoubleComplex);
-
-    for (int c = 0; c < 9; c++) {
-        if (cudaMalloc((void**)&d->d_Nhat[c], csz) != cudaSuccess) {
-            fprintf(stderr,"[demag] cudaMalloc d_Nhat[%d] failed\n",c);
-            for(int cc=0;cc<c;cc++) cudaFree(d->d_Nhat[cc]);
-            for(int cc=0;cc<9;cc++) free(htensor[cc]);
-            cufftDestroy(d->plan); free(d); return NULL;
-        }
-    }
-    for (int c = 0; c < 3; c++) {
-        cudaMalloc((void**)&d->d_Mhat[c], csz);
-        cudaMalloc((void**)&d->d_Hhat[c], csz);
-    }
-    cudaMalloc((void**)&d->d_buf, csz);
-
-    /* ── Step 5: H2D copy tensor, then FFT each component ─────────────── */
-    for (int c = 0; c < 9; c++) {
-        /* copy real-space tensor component to device */
-        cudaMemcpy(d->d_Nhat[c], htensor[c], csz, cudaMemcpyHostToDevice);
-        free(htensor[c]);
-
-        /* FFT in-place: d_Nhat[c] = FFT(d_Nhat[c])
-         * Professor:  cufftExecZ2Z(plan, d_in, d_out, CUFFT_FORWARD)
-         * We do in-place so d_Nhat[c] stays as the output buffer.
-         */
-        cufftResult r = cufftExecZ2Z(d->plan,
-                                     d->d_Nhat[c],
-                                     d->d_Nhat[c],
-                                     CUFFT_FORWARD);
-        if (r != CUFFT_SUCCESS)
-            fprintf(stderr,"[demag] tensor FFT[%d] failed: %d\n",c,(int)r);
-    }
-    cudaDeviceSynchronize();
-
-    /* ── Report ─────────────────────────────────────────────────────────── */
-    size_t mem_N   = 9  * csz;
-    size_t mem_MH  = 6  * csz;
-    size_t mem_buf = csz;
-    printf("[Demag] Device memory: N̂=%.1f MB  M̂Ĥ=%.1f MB  buf=%.1f MB\n",
-           mem_N/1e6, mem_MH/1e6, mem_buf/1e6);
-    printf("[Demag] Ready. strength=%.4f\n", demag_strength);
-
-    return d;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Demag_Apply
- *
- * Called every RHS evaluation.
- * Adds h_dmag = N * M (convolution via FFT) to h_out.
- * ═══════════════════════════════════════════════════════════════════════════ */
-void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
-{
-    if (!d) return;
-
-    const int ncell = d->ncell;
-    const int block = 256;
-    const int grid  = (ncell + block - 1) / block;
-
-    /* ── Step 1: FFT each magnetization component ───────────────────────
-     * gather m_α from SoA → complex buffer (imag=0) → forward FFT → M̂_α
-     * Matches professor's:
-     *   h_in[idx].x = mx[idx]; h_in[idx].y = 0;
-     *   cufftExecZ2Z(plan, h_in_dev, M_hat, CUFFT_FORWARD)
-     */
-    for (int comp = 0; comp < 3; comp++) {
-        gather_to_complex_kernel<<<grid, block>>>(
-            y_dev, d->d_Mhat[comp], comp, ncell);
-
-        cufftExecZ2Z(d->plan,
-                     d->d_Mhat[comp],
-                     d->d_Mhat[comp],
-                     CUFFT_FORWARD);
-    }
-
-    /* ── Step 2: pointwise tensor multiply in k-space ───────────────────
-     * Ĥ_α(k) = Σ_β  N̂_αβ(k) · M̂_β(k)
-     */
-    {
-        const int g = (d->nk + block - 1) / block;
-        pointwise_multiply_kernel<<<g, block>>>(
-            d->d_Mhat[0], d->d_Mhat[1], d->d_Mhat[2],
-            d->d_Nhat[0], d->d_Nhat[1], d->d_Nhat[2],   /* aa,ab,ac */
-            d->d_Nhat[3], d->d_Nhat[4], d->d_Nhat[5],   /* ba,bb,bc */
-            d->d_Nhat[6], d->d_Nhat[7], d->d_Nhat[8],   /* ca,cb,cc */
-            d->d_Hhat[0], d->d_Hhat[1], d->d_Hhat[2],
-            d->nk);
-    }
-
-    /* ── Step 3: IFFT each field component → scatter-add to h_out ───────
-     * Professor:
-     *   cufftExecZ2Z(plan, Hhat, h_buf, CUFFT_INVERSE)
-     *   result /= (nn*nn)     ← normalization
-     * We do it in-place on d_Hhat, then scatter the real part.
-     */
-    const double s = d->scale * d->strength;
-
-    for (int comp = 0; comp < 3; comp++) {
-        cufftExecZ2Z(d->plan,
-                     d->d_Hhat[comp],
-                     d->d_Hhat[comp],
-                     CUFFT_INVERSE);
-
-        scatter_add_real_kernel<<<grid, block>>>(
-            d->d_Hhat[comp], h_out, comp, ncell, s);
-    }
-    /* No explicit sync — CVODE's next CUDA call on stream 0 provides order */
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Demag_Destroy
- * ═══════════════════════════════════════════════════════════════════════════ */
-void Demag_Destroy(DemagData *d)
-{
-    if (!d) return;
-    cufftDestroy(d->plan);
-    for (int c = 0; c < 9; c++) if (d->d_Nhat[c]) cudaFree(d->d_Nhat[c]);
-    for (int c = 0; c < 3; c++) {
-        if (d->d_Mhat[c]) cudaFree(d->d_Mhat[c]);
-        if (d->d_Hhat[c]) cudaFree(d->d_Hhat[c]);
-    }
+    dm[9] =
+        std::atan(xn * yn / (zn * dnnn)) - std::atan(xp * yn / (zn * dpnn))
+        - std::atan(xn * yp / (zn * dnpn)) + std::atan(xp * yp / (zn * dppn))
+        - std::atan(xn * yn / (zp * dnnp)) + std::atan(xp * yn / (zp * dpnp))
+        + std::atan(xn * yp / (zp * dnpp)) - std::atan(xp * yp / (zp * dppp));
 }
