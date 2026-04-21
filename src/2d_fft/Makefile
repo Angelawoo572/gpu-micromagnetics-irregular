@@ -262,15 +262,62 @@ show-config:
 	@echo "CUDA_ARCH      = $(CUDA_ARCH)"
 	@echo "PROFILE_OUT    = $(PROFILE_OUT)"
 
+
+# ====== Direct (O(N²)) target — drop-in swap of demag module ======
+# Uses same 2d_fft.cu but links demag_direct.o instead of demag_fft.o
+# Everything else (CVODE, precond, jtv, fused_nvec) is identical.
+#
+# Build:
+#   make 2d_direct
+# Run:
+#   make run-direct
+# Compare timing:
+#   make bench
+
+DIRECT_TARGET  := 2d_direct
+DIRECT_DEMAG_SRC := demag_direct.cu
+DIRECT_DEMAG_OBJ := demag_direct.o
+DIRECT_OBJS    := $(FUSED_OBJ) $(PRECOND_OBJ) $(JTV_OBJ) $(DIRECT_DEMAG_OBJ)
+
+$(DIRECT_DEMAG_OBJ): $(DIRECT_DEMAG_SRC) demag_fft.h
+	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
+	    $(INCLUDE_FLAGS) -c $< -o $@
+
+# Note: SRC (2d_fft.cu) is reused — it includes demag_fft.h which both
+# demag_fft.cu and demag_direct.cu implement. Only the linked .o differs.
+$(DIRECT_TARGET): 2d_fft.cu $(DIRECT_OBJS) deferred_nvector.h precond.h jtv.h demag_fft.h
+	$(NVCC) $(NVCC_FLAGS) $(INCLUDE_FLAGS) -o $@ 2d_fft.cu $(DIRECT_OBJS) \
+	    $(LIBRARY_FLAGS) $(LDLIBS)
+
+run-direct: $(DIRECT_TARGET)
+	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(DIRECT_TARGET) $(ARGS)
+
+# ── Side-by-side timing benchmark ──────────────────────────────────────
+# Builds both targets and runs each once, printing GPU time.
+# Redirect stderr to /dev/null to suppress calt progress messages.
+bench: $(TARGET) $(DIRECT_TARGET)
+	@echo "========================================================"
+	@echo "FFT version    (O(N log N)):"
+	@echo "========================================================"
+	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
+	@echo ""
+	@echo "========================================================"
+	@echo "Direct version (O(N²)):"
+	@echo "========================================================"
+	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(DIRECT_TARGET) $(ARGS)
+
+.PHONY: run-direct bench
+
 # ====== Clean ======
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) $(DIRECT_TARGET)
+	rm -f $(OBJS) $(DIRECT_DEMAG_OBJ)
 
 reallyclean: clean
 	rm -f $(PROFILE_OUT).nsys-rep $(PROFILE_OUT).qdrep $(PROFILE_OUT).sqlite
-	rm -f ncu_$(TARGET).ncu-rep
+	rm -f ncu_$(TARGET).ncu-rep ncu_$(DIRECT_TARGET).ncu-rep
 	rm -rf csv_out
-	rm -f output.txt run_bx*.txt run_tol_*.txt run_circle_r_*.txt run_demag_*.txt
+	rm -f *.txt
 
 reports:
 	$(NSYS) stats --help-reports || true
