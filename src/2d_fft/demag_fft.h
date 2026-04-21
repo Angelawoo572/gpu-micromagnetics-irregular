@@ -2,7 +2,7 @@
 #define FFT_DEMAG_H
 
 /*
- * fft_demag.h  —  FFT demagnetization field using professor's Newell tensor
+ * demag_fft.h  —  FFT demagnetization field using Newell tensor
  *
  * Real-space demag tensor N_αβ(r) is computed with the closed-form
  * Newell/Donahue analytic integrals (calt + ctt), then FFT'd once at
@@ -12,7 +12,7 @@
  *   Ĥ_α(k)  = Σ_β  N̂_αβ(k) · M̂_β(k)
  *   h_α(r)  = IFFT[ Ĥ_α(k) ] / (nx*ny)
  *
- * thick : cell thickness in z, in units of cell spacing  (= thik in pseudocode)
+ * thick : cell thickness in z, in units of cell spacing
  */
 
 #ifdef __cplusplus

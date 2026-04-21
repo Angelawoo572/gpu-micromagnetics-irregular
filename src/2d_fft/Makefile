@@ -22,24 +22,26 @@ PRINT ?= 0
 # ====== Solver / kernel params ======
 BLOCK_X ?= 16
 BLOCK_Y ?= 8
+
 RTOL_VAL ?= 1.0e-4
 ATOL_VAL ?= 1.0e-4
 T_TOTAL  ?= 1000.0
 
-# ====== Texture params ======
+# ====== Periodic smooth-texture params ======
 CIRCLE_CENTER_X_FRAC ?= 0.50
 CIRCLE_CENTER_Y_FRAC ?= 0.50
 CIRCLE_RADIUS_FRAC_Y ?= 0.22
+
 TEXTURE_CORE_MZ    ?= -0.998
 TEXTURE_OUTER_MZ   ?= 0.998
 TEXTURE_WIDTH_FRAC ?= 0.35
 TEXTURE_EPS        ?= 1.0e-12
 
-# ====== FFT Demagnetization (professor's Newell calt/ctt method) ======
+# ====== FFT Demagnetization (professor's Newell calt/ctt) ======
 # DEMAG_STRENGTH = 0.0  → disabled (exchange-only, original behaviour)
 # DEMAG_STRENGTH = 1.0  → full dipolar demag via cuFFT Z2Z
 # DEMAG_THICK           → cell thickness in z (in cell-spacing units)
-DEMAG_STRENGTH ?= 1.0
+DEMAG_STRENGTH ?= 0.0
 DEMAG_THICK    ?= 1.0
 
 # ====== Output schedule ======
@@ -71,8 +73,8 @@ NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DDEMAG_THICK=$(DEMAG_THICK)
 
 # ====== Sources & objects ======
-TARGET      := 2d_fft
-SRC         := 2d_fft.cu
+TARGET      := 2d_p
+SRC         := 2d_p.cu
 FUSED_SRC   := deferred_nvector.cu
 PRECOND_SRC := precond.cu
 JTV_SRC     := jtv.cu
@@ -89,29 +91,43 @@ ARGS ?=
 # ====== Nsight tools ======
 NSYS ?= /opt/nvidia/nsight-systems/2025.1.3/bin/nsys
 NCU  ?= /opt/nvidia/nsight-compute/2025.3.1/ncu
+NSYS_UI ?= /usr/local/cuda/bin/nsight-sys
+
 PROFILE_OUT ?= profile_$(TARGET)
-NSYS_FLAGS_STD := profile --trace=cuda --cuda-memory-usage=true -o $(PROFILE_OUT)
+
+NSYS_FLAGS_LIGHT := profile --trace=cuda -o $(PROFILE_OUT)
+NSYS_FLAGS_STD   := profile --trace=cuda --cuda-memory-usage=true -o $(PROFILE_OUT)
+NSYS_FLAGS_EXT   := profile --trace=cuda --cuda-memory-usage=true \
+                    --cuda-um-cpu-page-faults=true -o $(PROFILE_OUT)
+
 NCU_FLAGS ?= --set roofline -o ncu_$(TARGET)
 
 .PHONY: all run run-debug build-debug build-release \
-        run-demag run-no-demag sweep-demag sweep-tol sweep-block \
-        profile compute show-config clean reallyclean
+        run-print run-noprint run-demag run-no-demag \
+        sweep-block sweep-tol sweep-circle sweep-demag \
+        profile profile-light profile-ext stats \
+        export-csv export-sqlite ui compute \
+        show-config clean reallyclean reports
 
 # ====== Build rules ======
 all: $(TARGET)
 
 $(FUSED_OBJ): $(FUSED_SRC) deferred_nvector.h
-	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math $(INCLUDE_FLAGS) -c $< -o $@
+	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
+	    $(INCLUDE_FLAGS) -c $< -o $@
 
 $(PRECOND_OBJ): $(PRECOND_SRC) precond.h
-	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math $(INCLUDE_FLAGS) -c $< -o $@
+	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
+	    $(INCLUDE_FLAGS) -c $< -o $@
 
 $(JTV_OBJ): $(JTV_SRC) jtv.h
-	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math $(INCLUDE_FLAGS) -c $< -o $@
+	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
+	    $(INCLUDE_FLAGS) -c $< -o $@
 
 # Professor's Newell tensor (calt/ctt) + cuFFT Z2Z convolution
 $(DEMAG_OBJ): $(DEMAG_SRC) demag_fft.h
-	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math $(INCLUDE_FLAGS) -c $< -o $@
+	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
+	    $(INCLUDE_FLAGS) -c $< -o $@
 
 $(TARGET): $(SRC) $(OBJS) deferred_nvector.h precond.h jtv.h demag_fft.h
 	$(NVCC) $(NVCC_FLAGS) $(INCLUDE_FLAGS) -o $@ $< $(OBJS) \
@@ -130,67 +146,131 @@ run: $(TARGET)
 run-debug: $(TARGET)
 	CUDA_LAUNCH_BLOCKING=1 LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
-# Full demag (professor's Newell tensor, thick=1.0)
+run-print:
+	$(MAKE) clean
+	$(MAKE) PRINT=1
+	$(MAKE) run PRINT=1
+
+run-noprint:
+	$(MAKE) clean
+	$(MAKE) PRINT=0
+	$(MAKE) run PRINT=0
+
+# Full demag (professor's Newell tensor)
 run-demag:
 	$(MAKE) clean
 	$(MAKE) DEMAG_STRENGTH=1.0 DEMAG_THICK=1.0
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
-# Exchange-only baseline (demag disabled)
+# Exchange-only baseline (demag disabled, recovers original behaviour)
 run-no-demag:
 	$(MAKE) clean
 	$(MAKE) DEMAG_STRENGTH=0.0
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
-# ====== Sweeps ======
-sweep-demag:
-	@for s in 0.0 0.01 0.1 0.5 1.0; do \
-	  echo "======== DEMAG_STRENGTH=$$s ========"; \
-	  $(MAKE) clean >/dev/null 2>&1; \
-	  $(MAKE) BUILD=release PRINT=0 DEMAG_STRENGTH=$$s DEMAG_THICK=1.0 >/dev/null && \
-	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_demag_$${s}.txt; \
+# ====== Parameter sweeps ======
+sweep-block:
+	@for bx in 32 16; do \
+	  for by in 4 8 16; do \
+	    threads=`expr $$bx \* $$by`; \
+	    if [ $$threads -le 1024 ]; then \
+	      echo "========================================"; \
+	      echo "Testing BLOCK_X=$$bx BLOCK_Y=$$by"; \
+	      $(MAKE) clean >/dev/null 2>&1; \
+	      $(MAKE) BUILD=release PRINT=0 BLOCK_X=$$bx BLOCK_Y=$$by >/dev/null && \
+	      LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_bx$${bx}_by$${by}.txt; \
+	    fi; \
+	  done; \
 	done
 
 sweep-tol:
 	@for tol in 1.0e-4 1.0e-5 1.0e-6; do \
-	  echo "======== TOL=$$tol ========"; \
+	  echo "========================================"; \
+	  echo "Testing RTOL_VAL=$$tol ATOL_VAL=$$tol"; \
 	  $(MAKE) clean >/dev/null 2>&1; \
 	  $(MAKE) BUILD=release PRINT=0 RTOL_VAL=$$tol ATOL_VAL=$$tol >/dev/null && \
 	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_tol_$${tol}.txt; \
 	done
 
-sweep-block:
-	@for bx in 32 16; do for by in 4 8 16; do \
-	  threads=`expr $$bx \* $$by`; \
-	  if [ $$threads -le 1024 ]; then \
-	    echo "======== BLOCK_X=$$bx BLOCK_Y=$$by ========"; \
-	    $(MAKE) clean >/dev/null 2>&1; \
-	    $(MAKE) BUILD=release PRINT=0 BLOCK_X=$$bx BLOCK_Y=$$by >/dev/null && \
-	    LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) | tee run_bx$${bx}_by$${by}.txt; \
-	  fi; done; done
+sweep-circle:
+	@for r in 0.12 0.18 0.22 0.28 0.34; do \
+	  echo "========================================"; \
+	  echo "Testing CIRCLE_RADIUS_FRAC_Y=$$r"; \
+	  $(MAKE) clean >/dev/null 2>&1; \
+	  $(MAKE) BUILD=release PRINT=0 \
+	    CIRCLE_RADIUS_FRAC_Y=$$r >/dev/null && \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_circle_r_$${r}.txt; \
+	done
 
-# ====== Profiling ======
+sweep-demag:
+	@for s in 0.0 0.01 0.1 0.5 1.0; do \
+	  echo "========================================"; \
+	  echo "Testing DEMAG_STRENGTH=$$s"; \
+	  $(MAKE) clean >/dev/null 2>&1; \
+	  $(MAKE) BUILD=release PRINT=0 DEMAG_STRENGTH=$$s DEMAG_THICK=1.0 >/dev/null && \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_demag_$${s}.txt; \
+	done
+
+# ====== Nsight Systems ======
 profile: $(TARGET)
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
 	$(NSYS) $(NSYS_FLAGS_STD) ./$(TARGET) $(ARGS)
+	@echo "Generated: $(PROFILE_OUT).nsys-rep"
+
+profile-light: $(TARGET)
+	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
+	$(NSYS) $(NSYS_FLAGS_LIGHT) ./$(TARGET) $(ARGS)
+	@echo "Generated: $(PROFILE_OUT).nsys-rep"
+
+profile-ext: $(TARGET)
+	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
+	$(NSYS) $(NSYS_FLAGS_EXT) ./$(TARGET) $(ARGS)
+	@echo "Generated: $(PROFILE_OUT).nsys-rep"
+
+stats:
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: run make profile first."; exit 1)
+	nsys stats --report cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum \
+	    $(PROFILE_OUT).nsys-rep > nsys_report.txt
+	@echo "Wrote: nsys_report.txt"
+
+export-csv:
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: run make profile first."; exit 1)
+	nsys export --type csv --output ./csv_out $(PROFILE_OUT).nsys-rep
+
+export-sqlite:
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: run make profile first."; exit 1)
+	nsys export --sqlite $(PROFILE_OUT).sqlite $(PROFILE_OUT).nsys-rep
+
+ui:
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: run make profile first."; exit 1)
+	$(NSYS_UI) $(PROFILE_OUT).nsys-rep
 
 compute: $(TARGET)
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
-	$(NCU) $(NCU_FLAGS) ./$(TARGET) $(ARGS)
+	$(NCU) $(NCU_FLAGS) ./$(TARGET) $(ARGS) || \
+	(echo "Nsight Compute failed (check GPU counter permissions)"; exit 1)
 
-# ====== Info ======
+# ====== Show config ======
 show-config:
 	@echo "TARGET         = $(TARGET)"
-	@echo "DEMAG_STRENGTH = $(DEMAG_STRENGTH)"
+	@echo "DEMAG_STRENGTH = $(DEMAG_STRENGTH)  (0=off, 1=full Newell tensor)"
 	@echo "DEMAG_THICK    = $(DEMAG_THICK)"
 	@echo "RTOL_VAL       = $(RTOL_VAL)"
+	@echo "ATOL_VAL       = $(ATOL_VAL)"
 	@echo "T_TOTAL        = $(T_TOTAL)"
+	@echo "BLOCK_X        = $(BLOCK_X)   BLOCK_Y = $(BLOCK_Y)"
 	@echo "CUDA_ARCH      = $(CUDA_ARCH)"
+	@echo "PROFILE_OUT    = $(PROFILE_OUT)"
 
 # ====== Clean ======
 clean:
 	rm -f $(TARGET) $(OBJS)
 
 reallyclean: clean
-	rm -f $(PROFILE_OUT).nsys-rep ncu_$(TARGET).ncu-rep output.txt
-	rm -f run_demag_*.txt run_tol_*.txt run_bx*.txt
+	rm -f $(PROFILE_OUT).nsys-rep $(PROFILE_OUT).qdrep $(PROFILE_OUT).sqlite
+	rm -f ncu_$(TARGET).ncu-rep
+	rm -rf csv_out
+	rm -f output.txt run_bx*.txt run_tol_*.txt run_circle_r_*.txt run_demag_*.txt
+
+reports:
+	$(NSYS) stats --help-reports || true

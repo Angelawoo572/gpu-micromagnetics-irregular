@@ -1,7 +1,7 @@
 /*
  * jtv.cu  —  Analytic Jacobian-times-vector for the 2D periodic LLG solver.
  *
- * JtvUserData must mirror UserData from 2d_fft.cu EXACTLY.
+ * JtvUserData must mirror UserData from 2d_p.cu EXACTLY.
  * Current UserData layout:
  *   PrecondData  *pd;        // +0  (8 bytes)
  *   DemagData    *demag;     // +8  (8 bytes)
@@ -21,7 +21,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-/* Physical constants — must match 2d_fft.cu */
+/* Physical constants — must match 2d_p.cu */
 __constant__ sunrealtype jc_msk[3]  = {0.0, 0.0, 1.0};
 __constant__ sunrealtype jc_nsk[3]  = {1.0, 0.0, 0.0};
 __constant__ sunrealtype jc_chk     = 1.0;
@@ -100,7 +100,7 @@ __global__ static void jtv_kernel(
 }
 
 /*
- * JtvUserData — mirrors UserData from 2d_fft.cu exactly.
+ * JtvUserData — mirrors UserData from 2d_p.cu exactly.
  * Three pointer fields before the ints.
  */
 typedef struct {

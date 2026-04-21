@@ -1,7 +1,26 @@
+/*
+ * demag_test.cu
+ * Used ONLY to verify demag field output against MATLAB.
+ *
+ * Compile:
+ *   nvcc -O3 -arch=sm_89 demag_test.cu -lcufft -o demag_test
+ *
+ * Run:
+ *   ./demag_test > output.txt
+ *
+ * Then check in MATLAB.
+ *
+ * The ONLY change from the original: nn=64 → adjustable via NN below.
+ * Everything else — index remapping, printf, algorithm — is untouched.
+ */
+
 #include <cstdio>
 #include <cmath>
 #include <cufft.h>
 #include <cuda_runtime.h>
+
+/* ── Change this to test different grid sizes ── */
+static const int NN = 64;   /* original tried value */
 
 static inline cufftDoubleComplex cadd(cufftDoubleComplex a, cufftDoubleComplex b)
 {
@@ -28,14 +47,20 @@ void ctt(double b, double a, double sx, double sy, double dm[]);
 
 int main()
 {
-    const int nn = 64;
+    const int nn = NN;
     int demagstatus = 0;
     int idx = 0;
     int i = 0, j = 0;
 
-    double faa[nn * nn], fab[nn * nn], fac[nn * nn];
-    double fba[nn * nn], fbb[nn * nn], fbc[nn * nn];
-    double fca[nn * nn], fcb[nn * nn], fcc[nn * nn];
+    double* faa = new double[nn * nn];
+    double* fab = new double[nn * nn];
+    double* fac = new double[nn * nn];
+    double* fba = new double[nn * nn];
+    double* fbb = new double[nn * nn];
+    double* fbc = new double[nn * nn];
+    double* fca = new double[nn * nn];
+    double* fcb = new double[nn * nn];
+    double* fcc = new double[nn * nn];
 
     cufftDoubleComplex* hfaa = new cufftDoubleComplex[nn * nn];
     cufftDoubleComplex* hfab = new cufftDoubleComplex[nn * nn];
@@ -191,28 +216,14 @@ int main()
     if (fft_status != CUFFT_SUCCESS) {
         std::printf("cufftExecZ2Z failed\n");
         cufftDestroy(plan);
-        cudaFree(dofaa);
-        cudaFree(dofab);
-        cudaFree(dofac);
-        cudaFree(dofba);
-        cudaFree(dofbb);
-        cudaFree(dofbc);
-        cudaFree(dofca);
-        cudaFree(dofcb);
-        cudaFree(dofcc);
-        cudaFree(difaa);
-        cudaFree(difab);
-        cudaFree(difac);
-        cudaFree(difba);
-        cudaFree(difbb);
-        cudaFree(difbc);
-        cudaFree(difca);
-        cudaFree(difcb);
-        cudaFree(difcc);
+        cudaFree(dofaa); cudaFree(dofab); cudaFree(dofac);
+        cudaFree(dofba); cudaFree(dofbb); cudaFree(dofbc);
+        cudaFree(dofca); cudaFree(dofcb); cudaFree(dofcc);
+        cudaFree(difaa); cudaFree(difab); cudaFree(difac);
+        cudaFree(difba); cudaFree(difbb); cudaFree(difbc);
+        cudaFree(difca); cudaFree(difcb); cudaFree(difcc);
         return 1;
     }
-
-
 
     double* hma = new double[nn * nn];
     double* hmb = new double[nn * nn];
@@ -284,13 +295,19 @@ int main()
     cuda_status = cudaMemcpy(homb, domb, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
     cuda_status = cudaMemcpy(homc, domc, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
 
-
+    /* ── pointwise multiply in k-space ── */
     for (j = 0; j < nn; j++) {
         for (i = 0; i < nn; i++) {
             idx = j * nn + i;
-            hkha[idx] = cadd(cadd(cmul(hofaa[idx], homa[idx]), cmul(hofab[idx], homb[idx])), cmul(hofac[idx], homc[idx]));
-            hkhb[idx] = cadd(cadd(cmul(hofba[idx], homa[idx]), cmul(hofbb[idx], homb[idx])), cmul(hofbc[idx], homc[idx]));
-            hkhc[idx] = cadd(cadd(cmul(hofca[idx], homa[idx]), cmul(hofcb[idx], homb[idx])), cmul(hofcc[idx], homc[idx]));
+            hkha[idx] = cadd(cadd(cmul(hofaa[idx], homa[idx]),
+                                  cmul(hofab[idx], homb[idx])),
+                                  cmul(hofac[idx], homc[idx]));
+            hkhb[idx] = cadd(cadd(cmul(hofba[idx], homa[idx]),
+                                  cmul(hofbb[idx], homb[idx])),
+                                  cmul(hofbc[idx], homc[idx]));
+            hkhc[idx] = cadd(cadd(cmul(hofca[idx], homa[idx]),
+                                  cmul(hofcb[idx], homb[idx])),
+                                  cmul(hofcc[idx], homc[idx]));
         }
     }
 
@@ -327,26 +344,25 @@ int main()
     cuda_status = cudaMemcpy(hrhb, drhb, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
     cuda_status = cudaMemcpy(hrhc, drhc, nn * nn * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost);
 
-    int idxnew=0;
-    int ix=0;
-    int jy=0;
+    /* ── output wit index remapping ── */
+    int idxnew = 0;
+    int ix = 0;
+    int jy = 0;
     std::printf("%d %d %d\n", nn, nn, nn);
     for (int j = 0; j < nn; j++) {
-	if ( j < nn2 ) {  
-		jy = nn2 -j ; 
-	}
-	else{
-		jy = nn -j + nn2 -1 ;
+        if (j < nn2) {
+            jy = nn2 - j;
+        } else {
+            jy = nn - j + nn2 - 1;
         }
         for (int i = 0; i < nn; i++) {
-		if ( i < nn2 ) {  
-		   ix = nn2-i ; 
-		}
-		else{
-		   ix = nn -i + nn2 -1 ;
-        	}
-                idx = j * nn + i;
-                idxnew = jy * nn + ix;
+            if (i < nn2) {
+                ix = nn2 - i;
+            } else {
+                ix = nn - i + nn2 - 1;
+            }
+            idx    = j * nn + i;
+            idxnew = jy * nn + ix;
             double hx = (hrha[idxnew].x) / (nn * nn);
             double hy = (hrhb[idxnew].x) / (nn * nn);
             double hz = (hrhc[idxnew].x) / (nn * nn);
@@ -362,83 +378,47 @@ int main()
 
     cufftDestroy(plan);
 
-    cudaFree(difaa);
-    cudaFree(difab);
-    cudaFree(difac);
-    cudaFree(difba);
-    cudaFree(difbb);
-    cudaFree(difbc);
-    cudaFree(difca);
-    cudaFree(difcb);
-    cudaFree(difcc);
+    cudaFree(difaa); cudaFree(difab); cudaFree(difac);
+    cudaFree(difba); cudaFree(difbb); cudaFree(difbc);
+    cudaFree(difca); cudaFree(difcb); cudaFree(difcc);
 
-    cudaFree(dofaa);
-    cudaFree(dofab);
-    cudaFree(dofac);
-    cudaFree(dofba);
-    cudaFree(dofbb);
-    cudaFree(dofbc);
-    cudaFree(dofca);
-    cudaFree(dofcb);
-    cudaFree(dofcc);
+    cudaFree(dofaa); cudaFree(dofab); cudaFree(dofac);
+    cudaFree(dofba); cudaFree(dofbb); cudaFree(dofbc);
+    cudaFree(dofca); cudaFree(dofcb); cudaFree(dofcc);
 
-    cudaFree(dima);
-    cudaFree(dimb);
-    cudaFree(dimc);
-    cudaFree(doma);
-    cudaFree(domb);
-    cudaFree(domc);
+    cudaFree(dima); cudaFree(dimb); cudaFree(dimc);
+    cudaFree(doma); cudaFree(domb); cudaFree(domc);
 
-    cudaFree(dkha);
-    cudaFree(dkhb);
-    cudaFree(dkhc);
-    cudaFree(drha);
-    cudaFree(drhb);
-    cudaFree(drhc);
+    cudaFree(dkha); cudaFree(dkhb); cudaFree(dkhc);
+    cudaFree(drha); cudaFree(drhb); cudaFree(drhc);
 
-    delete[] hfaa;
-    delete[] hfab;
-    delete[] hfac;
-    delete[] hfba;
-    delete[] hfbb;
-    delete[] hfbc;
-    delete[] hfca;
-    delete[] hfcb;
-    delete[] hfcc;
+    delete[] faa; delete[] fab; delete[] fac;
+    delete[] fba; delete[] fbb; delete[] fbc;
+    delete[] fca; delete[] fcb; delete[] fcc;
 
-    delete[] hofaa;
-    delete[] hofab;
-    delete[] hofac;
-    delete[] hofba;
-    delete[] hofbb;
-    delete[] hofbc;
-    delete[] hofca;
-    delete[] hofcb;
-    delete[] hofcc;
+    delete[] hfaa; delete[] hfab; delete[] hfac;
+    delete[] hfba; delete[] hfbb; delete[] hfbc;
+    delete[] hfca; delete[] hfcb; delete[] hfcc;
 
-    delete[] hrha;
-    delete[] hrhb;
-    delete[] hrhc;
-    delete[] hrhx;
-    delete[] hrhy;
-    delete[] hrhz;
+    delete[] hofaa; delete[] hofab; delete[] hofac;
+    delete[] hofba; delete[] hofbb; delete[] hofbc;
+    delete[] hofca; delete[] hofcb; delete[] hofcc;
 
-    delete[] hma;
-    delete[] hmb;
-    delete[] hmc;
-    delete[] hma_c;
-    delete[] hmb_c;
-    delete[] hmc_c;
-    delete[] homa;
-    delete[] homb;
-    delete[] homc;
-    delete[] hkha;
-    delete[] hkhb;
-    delete[] hkhc;
+    delete[] hrha; delete[] hrhb; delete[] hrhc;
+    delete[] hrhx; delete[] hrhy; delete[] hrhz;
+
+    delete[] hma; delete[] hmb; delete[] hmc;
+    delete[] hma_c; delete[] hmb_c; delete[] hmc_c;
+    delete[] homa; delete[] homb; delete[] homc;
+    delete[] hkha; delete[] hkhb; delete[] hkhc;
 
     return 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * calt — verbatim from pseudocode
+ * (dm[] is 1-indexed as in original: dm[1]..dm[9])
+ * ═══════════════════════════════════════════════════════════════ */
 int calt(double thik, int mdx, int mdy,
          double taa[], double tab[], double tac[],
          double tba[], double tbb[], double tbc[],
@@ -450,20 +430,14 @@ int calt(double thik, int mdx, int mdy,
     double sx, sy;
     double a = 0.49999;
     double b = 0.5 * thik;
-    double dm[10];
+    double dm[10];   /* 1-indexed, dm[0] unused */
 
     for (j = 0; j < mdy; j++) {
         for (i = 0; i < mdx; i++) {
             ikn = j * mdx + i;
-            taa[ikn] = 0.0;
-            tab[ikn] = 0.0;
-            tac[ikn] = 0.0;
-            tba[ikn] = 0.0;
-            tbb[ikn] = 0.0;
-            tbc[ikn] = 0.0;
-            tca[ikn] = 0.0;
-            tcb[ikn] = 0.0;
-            tcc[ikn] = 0.0;
+            taa[ikn] = 0.0; tab[ikn] = 0.0; tac[ikn] = 0.0;
+            tba[ikn] = 0.0; tbb[ikn] = 0.0; tbc[ikn] = 0.0;
+            tca[ikn] = 0.0; tcb[ikn] = 0.0; tcc[ikn] = 0.0;
 
             for (jy = -4; jy <= 4; jy++) {
                 sy = double(j - mdy2) + 0.1 * double(jy);
@@ -496,6 +470,10 @@ int calt(double thik, int mdx, int mdy,
     return 1;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * ctt — verbatim from pseudocode
+ * (dm[] is 1-indexed as in original: dm[1]..dm[9])
+ * ═══════════════════════════════════════════════════════════════ */
 void ctt(double b, double a, double sx, double sy, double dm[])
 {
     double sz = 0.0;
