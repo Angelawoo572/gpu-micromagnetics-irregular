@@ -41,7 +41,7 @@ TEXTURE_EPS        ?= 1.0e-12
 # DEMAG_STRENGTH = 0.0  → disabled (exchange-only, original behaviour)
 # DEMAG_STRENGTH = 1.0  → full dipolar demag via cuFFT Z2Z
 # DEMAG_THICK           → cell thickness in z (in cell-spacing units)
-DEMAG_STRENGTH ?= 0.0
+DEMAG_STRENGTH ?= 1.0
 DEMAG_THICK    ?= 1.0
 
 # ====== Output schedule ======
@@ -73,8 +73,8 @@ NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DDEMAG_THICK=$(DEMAG_THICK)
 
 # ====== Sources & objects ======
-TARGET      := 2d_p
-SRC         := 2d_p.cu
+TARGET      := 2d_fft
+SRC         := 2d_fft.cu
 FUSED_SRC   := deferred_nvector.cu
 PRECOND_SRC := precond.cu
 JTV_SRC     := jtv.cu
