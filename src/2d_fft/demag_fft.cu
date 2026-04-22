@@ -1,20 +1,30 @@
 /*
  * demag_fft.cu
+ * wrapping into Demag_Init/Apply/Destroy
+ * for integration with CVODE f() — the data flow is identical.
  *
- * Key fix over v1:
- *   f̂ (FFT of demag tensor) is computed ONCE at Init and stays on device.
- *   Demag_Apply does everything on GPU — no D2H/H2D round-trips for
- *   the multiply step.
+ *  flow:
+ *   1. calt/ctt  → real-space tensor taa..tcc  (CPU)
+ *   2. pack into complex host arrays hfaa..hfcc  (imag=0)  (CPU)
+ *   3. H2D copy → difaa..difcc
+ *   4. cufftExecZ2Z FORWARD → dofaa..dofcc (GPU)
+ *   5. D2H copy → hofaa..hofcc (CPU, keep on host)
  *
- * v1 (inefficient) flow in Apply:
- *   D2H y → pack CPU → H2D → FFT GPU → D2H M̂ → multiply CPU → H2D Ĥ
- *   → IFFT GPU → D2H h → scatter CPU → H2D h_out
+ *   Per-timestep (Demag_Apply):
+ *   6. pack M into complex hma_c..hmc_c (CPU, gather from SoA)
+ *   7. H2D copy → dima..dimc
+ *   8. cufftExecZ2Z FORWARD → doma..domc  (GPU)
+ *   9. D2H copy → homa..homc (CPU)
+ *  10. host multiply loop: hkha = cmul(hofaa,homa)+... (CPU — exactly as pseudocode)
+ *  11. H2D copy hkha..hkhc → dkha..dkhc
+ *  12. cufftExecZ2Z INVERSE → drha..drhc  (GPU)
+ *  13. D2H copy → hrha..hrhc  (CPU)
+ *  14. scatter hrha[idxnew].x/(nn*nn) back into SoA h_out  (CPU)
  *
- * v2 (efficient) flow in Apply — all GPU:
- *   pack_kernel(y_dev→d_mhat) → FFT(d_mhat) → multiply_kernel(d_fhat·d_mhat→d_hhat)
- *   → IFFT(d_hhat) → scatter_kernel(d_hhat→h_out)
- *
- * f̂ = d_fhat[9] never leaves device after Init.
+ * Note: the index remapping in step 14 uses the  idxnew formula:
+ *   if j < nn2:  jy = nn2 - j
+ *   else:        jy = nn - j + nn2 - 1
+ * (same for i/ix), then idxnew = jy*nn + ix
  */
 
 #include "demag_fft.h"
@@ -26,271 +36,446 @@
 #include <cstdlib>
 #include <cstring>
 
-/* ── ctt: exact copy from professor's pseudocode (1-indexed dm[]) ── */
+static inline cufftDoubleComplex h_cadd(cufftDoubleComplex a, cufftDoubleComplex b)
+{
+    cufftDoubleComplex r;
+    r.x = a.x + b.x;
+    r.y = a.y + b.y;
+    return r;
+}
+
+static inline cufftDoubleComplex h_cmul(cufftDoubleComplex a, cufftDoubleComplex b)
+{
+    cufftDoubleComplex r;
+    r.x = a.x * b.x - a.y * b.y;
+    r.y = a.x * b.y + a.y * b.x;
+    return r;
+}
+
+/* dm[] is 1-indexed: dm[1]..dm[9].  Size declared as dm[10] in calt.    */
 static void ctt(double b, double a, double sx, double sy, double dm[])
 {
-    double sz=0.0;
-    double xn=sx-a,xp=sx+a,yn=sy-a,yp=sy+a,zn=sz-b,zp=sz+b;
-    double xn2=xn*xn,xp2=xp*xp,yn2=yn*yn,yp2=yp*yp,zn2=zn*zn,zp2=zp*zp;
-    double dnnn=std::sqrt(xn2+yn2+zn2),dpnn=std::sqrt(xp2+yn2+zn2);
-    double dnpn=std::sqrt(xn2+yp2+zn2),dnnp=std::sqrt(xn2+yn2+zp2);
-    double dppn=std::sqrt(xp2+yp2+zn2),dnpp=std::sqrt(xn2+yp2+zp2);
-    double dpnp=std::sqrt(xp2+yn2+zp2),dppp=std::sqrt(xp2+yp2+zp2);
-    dm[1]=std::atan(zn*yn/(xn*dnnn))-std::atan(zp*yn/(xn*dnnp))
-         -std::atan(zn*yp/(xn*dnpn))+std::atan(zp*yp/(xn*dnpp))
-         -std::atan(zn*yn/(xp*dpnn))+std::atan(zp*yn/(xp*dpnp))
-         +std::atan(zn*yp/(xp*dppn))-std::atan(zp*yp/(xp*dppp));
-    dm[2]=std::log((dnnn-zn)/(dnnp-zp))-std::log((dpnn-zn)/(dpnp-zp))
-         -std::log((dnpn-zn)/(dnpp-zp))+std::log((dppn-zn)/(dppp-zp));
-    dm[3]=std::log((dnnn-yn)/(dnpn-yp))-std::log((dpnn-yn)/(dppn-yp))
-         -std::log((dnnp-yn)/(dnpp-yp))+std::log((dpnp-yn)/(dppp-yp));
-    dm[4]=std::log((dnnn-zn)/(dnnp-zp))-std::log((dnpn-zn)/(dnpp-zp))
-         -std::log((dpnn-zn)/(dpnp-zp))+std::log((dppn-zn)/(dppp-zp));
-    dm[5]=std::atan(zn*xn/(yn*dnnn))-std::atan(zp*xn/(yn*dnnp))
-         -std::atan(zn*xp/(yn*dpnn))+std::atan(zp*xp/(yn*dpnp))
-         -std::atan(zn*xn/(yp*dnpn))+std::atan(zp*xn/(yp*dnpp))
-         +std::atan(zn*xp/(yp*dppn))-std::atan(zp*xp/(yp*dppp));
-    dm[6]=std::log((dnnn-xn)/(dpnn-xp))-std::log((dnpn-xn)/(dppn-xp))
-         -std::log((dnnp-xn)/(dpnp-xp))+std::log((dnpp-xn)/(dppp-xp));
-    dm[7]=std::log((dnnn-yn)/(dnpn-yp))-std::log((dnnp-yn)/(dnpp-yp))
-         -std::log((dpnn-yn)/(dppn-yp))+std::log((dpnp-yn)/(dppp-yp));
-    dm[8]=std::log((dnnn-xn)/(dpnn-xp))-std::log((dnnp-xn)/(dpnp-xp))
-         -std::log((dnpn-xn)/(dppn-xp))+std::log((dnpp-xn)/(dppp-xp));
-    dm[9]=std::atan(xn*yn/(zn*dnnn))-std::atan(xp*yn/(zn*dpnn))
-         -std::atan(xn*yp/(zn*dnpn))+std::atan(xp*yp/(zn*dppn))
-         -std::atan(xn*yn/(zp*dnnp))+std::atan(xp*yn/(zp*dpnp))
-         +std::atan(xn*yp/(zp*dnpp))-std::atan(xp*yp/(zp*dppp));
+    double sz = 0.0;
+
+    double xn = sx - a;
+    double xp = sx + a;
+    double yn = sy - a;
+    double yp = sy + a;
+    double zn = sz - b;
+    double zp = sz + b;
+
+    double xn2 = xn * xn;
+    double xp2 = xp * xp;
+    double yn2 = yn * yn;
+    double yp2 = yp * yp;
+    double zn2 = zn * zn;
+    double zp2 = zp * zp;
+
+    double dnnn = std::sqrt(xn2 + yn2 + zn2);
+    double dpnn = std::sqrt(xp2 + yn2 + zn2);
+    double dnpn = std::sqrt(xn2 + yp2 + zn2);
+    double dnnp = std::sqrt(xn2 + yn2 + zp2);
+    double dppn = std::sqrt(xp2 + yp2 + zn2);
+    double dnpp = std::sqrt(xn2 + yp2 + zp2);
+    double dpnp = std::sqrt(xp2 + yn2 + zp2);
+    double dppp = std::sqrt(xp2 + yp2 + zp2);
+
+    dm[1] =
+        std::atan(zn * yn / (xn * dnnn)) - std::atan(zp * yn / (xn * dnnp))
+        - std::atan(zn * yp / (xn * dnpn)) + std::atan(zp * yp / (xn * dnpp))
+        - std::atan(zn * yn / (xp * dpnn)) + std::atan(zp * yn / (xp * dpnp))
+        + std::atan(zn * yp / (xp * dppn)) - std::atan(zp * yp / (xp * dppp));
+
+    dm[2] =
+        std::log((dnnn - zn) / (dnnp - zp)) - std::log((dpnn - zn) / (dpnp - zp))
+        - std::log((dnpn - zn) / (dnpp - zp)) + std::log((dppn - zn) / (dppp - zp));
+
+    dm[3] =
+        std::log((dnnn - yn) / (dnpn - yp)) - std::log((dpnn - yn) / (dppn - yp))
+        - std::log((dnnp - yn) / (dnpp - yp)) + std::log((dpnp - yn) / (dppp - yp));
+
+    dm[4] =
+        std::log((dnnn - zn) / (dnnp - zp)) - std::log((dnpn - zn) / (dnpp - zp))
+        - std::log((dpnn - zn) / (dpnp - zp)) + std::log((dppn - zn) / (dppp - zp));
+
+    dm[5] =
+        std::atan(zn * xn / (yn * dnnn)) - std::atan(zp * xn / (yn * dnnp))
+        - std::atan(zn * xp / (yn * dpnn)) + std::atan(zp * xp / (yn * dpnp))
+        - std::atan(zn * xn / (yp * dnpn)) + std::atan(zp * xn / (yp * dnpp))
+        + std::atan(zn * xp / (yp * dppn)) - std::atan(zp * xp / (yp * dppp));
+
+    dm[6] =
+        std::log((dnnn - xn) / (dpnn - xp)) - std::log((dnpn - xn) / (dppn - xp))
+        - std::log((dnnp - xn) / (dpnp - xp)) + std::log((dnpp - xn) / (dppp - xp));
+
+    dm[7] =
+        std::log((dnnn - yn) / (dnpn - yp)) - std::log((dnnp - yn) / (dnpp - yp))
+        - std::log((dpnn - yn) / (dppn - yp)) + std::log((dpnp - yn) / (dppp - yp));
+
+    dm[8] =
+        std::log((dnnn - xn) / (dpnn - xp)) - std::log((dnnp - xn) / (dpnp - xp))
+        - std::log((dnpn - xn) / (dppn - xp)) + std::log((dnpp - xn) / (dppp - xp));
+
+    dm[9] =
+        std::atan(xn * yn / (zn * dnnn)) - std::atan(xp * yn / (zn * dpnn))
+        - std::atan(xn * yp / (zn * dnpn)) + std::atan(xp * yp / (zn * dppn))
+        - std::atan(xn * yn / (zp * dnnp)) + std::atan(xp * yn / (zp * dpnp))
+        + std::atan(xn * yp / (zp * dnpp)) - std::atan(xp * yp / (zp * dppp));
 }
 
-/* ── calt: exact copy (1-indexed dm[]) ── */
-static int calt(double thik,int mdx,int mdy,
-                double taa[],double tab[],double tac[],
-                double tba[],double tbb[],double tbc[],
-                double tca[],double tcb[],double tcc[])
+static int calt(double thik, int mdx, int mdy,
+                double taa[], double tab[], double tac[],
+                double tba[], double tbb[], double tbc[],
+                double tca[], double tcb[], double tcc[])
 {
-    int mdx2=mdx/2,mdy2=mdy/2;
-    double a=0.49999,b=0.5*thik,dm[10];
-    for(int j=0;j<mdy;j++) for(int i=0;i<mdx;i++){
-        int ikn=j*mdx+i;
-        taa[ikn]=tab[ikn]=tac[ikn]=tba[ikn]=tbb[ikn]=tbc[ikn]=
-        tca[ikn]=tcb[ikn]=tcc[ikn]=0.0;
-        for(int jy=-4;jy<=4;jy++){
-            double sy=double(j-mdy2)+0.1*double(jy);
-            for(int ix=-4;ix<=4;ix++){
-                double sx=double(i-mdx2)+0.1*double(ix);
-                ctt(b,a,sx,sy,dm);
-                taa[ikn]+=dm[1];tab[ikn]+=dm[2];tac[ikn]+=dm[3];
-                tba[ikn]+=dm[4];tbb[ikn]+=dm[5];tbc[ikn]+=dm[6];
-                tca[ikn]+=dm[7];tcb[ikn]+=dm[8];tcc[ikn]+=dm[9];
+    int i, j, ix, jy, ikn;
+    int mdx2 = mdx / 2;
+    int mdy2 = mdy / 2;
+    double sx, sy;
+    double a = 0.49999;
+    double b = 0.5 * thik;
+    double dm[10];   /* 1-indexed: dm[1]..dm[9] */
+
+    for (j = 0; j < mdy; j++) {
+        for (i = 0; i < mdx; i++) {
+            ikn = j * mdx + i;
+            taa[ikn] = 0.0;
+            tab[ikn] = 0.0;
+            tac[ikn] = 0.0;
+            tba[ikn] = 0.0;
+            tbb[ikn] = 0.0;
+            tbc[ikn] = 0.0;
+            tca[ikn] = 0.0;
+            tcb[ikn] = 0.0;
+            tcc[ikn] = 0.0;
+
+            for (jy = -4; jy <= 4; jy++) {
+                sy = double(j - mdy2) + 0.1 * double(jy);
+                for (ix = -4; ix <= 4; ix++) {
+                    sx = double(i - mdx2) + 0.1 * double(ix);
+                    ctt(b, a, sx, sy, dm);
+                    taa[ikn] = taa[ikn] + dm[1];
+                    tab[ikn] = tab[ikn] + dm[2];
+                    tac[ikn] = tac[ikn] + dm[3];
+                    tba[ikn] = tba[ikn] + dm[4];
+                    tbb[ikn] = tbb[ikn] + dm[5];
+                    tbc[ikn] = tbc[ikn] + dm[6];
+                    tca[ikn] = tca[ikn] + dm[7];
+                    tcb[ikn] = tcb[ikn] + dm[8];
+                    tcc[ikn] = tcc[ikn] + dm[9];
+                }
             }
+
+            taa[ikn] = taa[ikn] / 81.0;
+            tab[ikn] = tab[ikn] / 81.0;
+            tac[ikn] = tac[ikn] / 81.0;
+            tba[ikn] = tba[ikn] / 81.0;
+            tbb[ikn] = tbb[ikn] / 81.0;
+            tbc[ikn] = tbc[ikn] / 81.0;
+            tca[ikn] = tca[ikn] / 81.0;
+            tcb[ikn] = tcb[ikn] / 81.0;
+            tcc[ikn] = tcc[ikn] / 81.0;
         }
-        taa[ikn]/=81.;tab[ikn]/=81.;tac[ikn]/=81.;
-        tba[ikn]/=81.;tbb[ikn]/=81.;tbc[ikn]/=81.;
-        tca[ikn]/=81.;tcb[ikn]/=81.;tcc[ikn]/=81.;
     }
     return 1;
-}
-
-/* 
- * GPU kernels
- *  */
-
-/* Pack one SoA real component → complex device buffer (imag=0) */
-__global__ static void pack_real_to_complex_kernel(
-    const double* __restrict__ y_dev,
-    cufftDoubleComplex* __restrict__ out,
-    int comp, int ncell)
-{
-    int cell = blockIdx.x*blockDim.x+threadIdx.x;
-    if(cell>=ncell) return;
-    out[cell].x = y_dev[comp*ncell+cell];
-    out[cell].y = 0.0;
-}
-
-/* Pointwise multiply: Ĥ_α = Σ_β f̂_αβ · M̂_β  (all on device) */
-__global__ static void multiply_kernel(
-    const cufftDoubleComplex* __restrict__ Mx,
-    const cufftDoubleComplex* __restrict__ My,
-    const cufftDoubleComplex* __restrict__ Mz,
-    const cufftDoubleComplex* __restrict__ faa,
-    const cufftDoubleComplex* __restrict__ fab,
-    const cufftDoubleComplex* __restrict__ fac,
-    const cufftDoubleComplex* __restrict__ fba,
-    const cufftDoubleComplex* __restrict__ fbb,
-    const cufftDoubleComplex* __restrict__ fbc,
-    const cufftDoubleComplex* __restrict__ fca,
-    const cufftDoubleComplex* __restrict__ fcb,
-    const cufftDoubleComplex* __restrict__ fcc,
-    cufftDoubleComplex* __restrict__ Hx,
-    cufftDoubleComplex* __restrict__ Hy,
-    cufftDoubleComplex* __restrict__ Hz,
-    int nk)
-{
-    int k=blockIdx.x*blockDim.x+threadIdx.x;
-    if(k>=nk) return;
-#define CR(A,B) ((A)[k].x*(B)[k].x-(A)[k].y*(B)[k].y)
-#define CI(A,B) ((A)[k].x*(B)[k].y+(A)[k].y*(B)[k].x)
-    Hx[k].x=CR(faa,Mx)+CR(fab,My)+CR(fac,Mz);
-    Hx[k].y=CI(faa,Mx)+CI(fab,My)+CI(fac,Mz);
-    Hy[k].x=CR(fba,Mx)+CR(fbb,My)+CR(fbc,Mz);
-    Hy[k].y=CI(fba,Mx)+CI(fbb,My)+CI(fbc,Mz);
-    Hz[k].x=CR(fca,Mx)+CR(fcb,My)+CR(fcc,Mz);
-    Hz[k].y=CI(fca,Mx)+CI(fcb,My)+CI(fcc,Mz);
-#undef CR
-#undef CI
-}
-
-/* Scatter IFFT result into h_out SoA with professor's index remapping */
-__global__ static void scatter_add_kernel(
-    const cufftDoubleComplex* __restrict__ hhat,
-    double* __restrict__ h_out,
-    int comp, int ncell, int nx, int ny, double scale)
-{
-    int cell=blockIdx.x*blockDim.x+threadIdx.x;
-    if(cell>=ncell) return;
-    int j=cell/nx, i=cell%nx;
-    int nx2=nx/2, ny2=ny/2;
-    int jy=(j<ny2)?(ny2-j):(ny-j+ny2-1);
-    int ix=(i<nx2)?(nx2-i):(nx-i+nx2-1);
-    int idxnew=jy*nx+ix;
-    if(idxnew<0||idxnew>=ncell) return;
-    h_out[comp*ncell+cell] += scale * hhat[idxnew].x;
 }
 
 /* 
  * DemagData
  *  */
 struct DemagData {
-    int nx, ny, ncell, nk;
+    int nx, ny, ncell;
+    int nn2;
     double strength;
+
     cufftHandle plan;
-    cufftDoubleComplex *d_fhat[9];  /* constant, on device forever */
-    cufftDoubleComplex *d_mhat[3];  /* M̂, updated each timestep */
-    cufftDoubleComplex *d_hhat[3];  /* Ĥ, updated each timestep */
+
+    /* Host: FFT of tensor (kept on host for multiply loop) */
+    cufftDoubleComplex *hofaa, *hofab, *hofac;
+    cufftDoubleComplex *hofba, *hofbb, *hofbc;
+    cufftDoubleComplex *hofca, *hofcb, *hofcc;
+
+    /* Device: M FFT buffers */
+    cufftDoubleComplex *dima, *dimb, *dimc;
+    cufftDoubleComplex *doma, *domb, *domc;
+
+    /* Host: M FFT output, multiply output, IFFT output */
+    cufftDoubleComplex *homa, *homb, *homc;
+    cufftDoubleComplex *hkha, *hkhb, *hkhc;
+    cufftDoubleComplex *hrha, *hrhb, *hrhc;
+
+    /* Device: H IFFT buffers */
+    cufftDoubleComplex *dkha, *dkhb, *dkhc;
+    cufftDoubleComplex *drha, *drhb, *drhc;
 };
 
 /* 
- * Demag_Init
+ * Demag_Init  (steps 1-5)
  *  */
 DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
 {
-    printf("[Demag v2] Init: nx=%d ny=%d thick=%.4f strength=%.4f\n",
-           nx,ny,thick,demag_strength);
+    printf("[Demag] Init: nx=%d ny=%d thick=%.4f strength=%.4f\n",
+           nx, ny, thick, demag_strength);
 
-    DemagData *d=(DemagData*)calloc(1,sizeof(DemagData));
-    if(!d){fprintf(stderr,"[demag v2] calloc failed\n");return NULL;}
-    d->nx=nx; d->ny=ny; d->ncell=nx*ny; d->nk=nx*ny;
-    d->strength=demag_strength;
+    DemagData *d = (DemagData*)calloc(1, sizeof(DemagData));
+    if (!d) { fprintf(stderr,"[demag] calloc failed\n"); return NULL; }
 
-    const size_t csz=(size_t)(nx*ny)*sizeof(cufftDoubleComplex);
+    d->nx       = nx;
+    d->ny       = ny;
+    d->ncell    = nx * ny;
+    d->nn2      = ny / 2;
+    d->strength = demag_strength;
 
-    /* step 1: calt on CPU */
-    printf("[Demag v2] Computing calt...\n");
-    double *t[9];
-    for(int c=0;c<9;c++){
-        t[c]=(double*)calloc(nx*ny,sizeof(double));
-        if(!t[c]){
-            fprintf(stderr,"[demag v2] tensor alloc failed\n");
-            for(int cc=0;cc<c;cc++) free(t[cc]);
-            free(d); return NULL;
-        }
+    const size_t csz = (size_t)(nx * ny) * sizeof(cufftDoubleComplex);
+
+    /* step 1: calt */
+    printf("[Demag] Computing calt (81-pt averaging)...\n");
+
+    double *taa = (double*)calloc(nx*ny, sizeof(double));
+    double *tab = (double*)calloc(nx*ny, sizeof(double));
+    double *tac = (double*)calloc(nx*ny, sizeof(double));
+    double *tba = (double*)calloc(nx*ny, sizeof(double));
+    double *tbb = (double*)calloc(nx*ny, sizeof(double));
+    double *tbc = (double*)calloc(nx*ny, sizeof(double));
+    double *tca = (double*)calloc(nx*ny, sizeof(double));
+    double *tcb = (double*)calloc(nx*ny, sizeof(double));
+    double *tcc = (double*)calloc(nx*ny, sizeof(double));
+
+    if (!taa||!tab||!tac||!tba||!tbb||!tbc||!tca||!tcb||!tcc) {
+        fprintf(stderr,"[demag] tensor alloc failed\n");
+        free(taa);free(tab);free(tac);free(tba);free(tbb);
+        free(tbc);free(tca);free(tcb);free(tcc);free(d);
+        return NULL;
     }
-    calt(thick,nx,ny,t[0],t[1],t[2],t[3],t[4],t[5],t[6],t[7],t[8]);
-    printf("[Demag v2] calt done.\n");
+    calt(thick, nx, ny, taa,tab,tac, tba,tbb,tbc, tca,tcb,tcc);
+    printf("[Demag] calt done.\n");
 
-    /* step 2: pack into complex on CPU */
-    cufftDoubleComplex *htmp[9];
-    for(int c=0;c<9;c++){
-        htmp[c]=(cufftDoubleComplex*)malloc(csz);
-        if(!htmp[c]){
-            fprintf(stderr,"[demag v2] htmp alloc failed\n");
-            for(int cc=0;cc<c;cc++) free(htmp[cc]);
-            for(int cc=0;cc<9;cc++) free(t[cc]);
-            free(d); return NULL;
-        }
-        for(int idx=0;idx<nx*ny;idx++){
-            htmp[c][idx].x=t[c][idx];
-            htmp[c][idx].y=0.0;
-        }
-        free(t[c]);
+    /* step 2: pack into complex (imag=0) */
+    cufftDoubleComplex *hfaa = (cufftDoubleComplex*)malloc(csz);
+    cufftDoubleComplex *hfab = (cufftDoubleComplex*)malloc(csz);
+    cufftDoubleComplex *hfac = (cufftDoubleComplex*)malloc(csz);
+    cufftDoubleComplex *hfba = (cufftDoubleComplex*)malloc(csz);
+    cufftDoubleComplex *hfbb = (cufftDoubleComplex*)malloc(csz);
+    cufftDoubleComplex *hfbc = (cufftDoubleComplex*)malloc(csz);
+    cufftDoubleComplex *hfca = (cufftDoubleComplex*)malloc(csz);
+    cufftDoubleComplex *hfcb = (cufftDoubleComplex*)malloc(csz);
+    cufftDoubleComplex *hfcc = (cufftDoubleComplex*)malloc(csz);
+
+    for (int idx = 0; idx < nx*ny; idx++) {
+        hfaa[idx].x = taa[idx]; hfaa[idx].y = 0.0;
+        hfab[idx].x = tab[idx]; hfab[idx].y = 0.0;
+        hfac[idx].x = tac[idx]; hfac[idx].y = 0.0;
+        hfba[idx].x = tba[idx]; hfba[idx].y = 0.0;
+        hfbb[idx].x = tbb[idx]; hfbb[idx].y = 0.0;
+        hfbc[idx].x = tbc[idx]; hfbc[idx].y = 0.0;
+        hfca[idx].x = tca[idx]; hfca[idx].y = 0.0;
+        hfcb[idx].x = tcb[idx]; hfcb[idx].y = 0.0;
+        hfcc[idx].x = tcc[idx]; hfcc[idx].y = 0.0;
     }
+    free(taa);free(tab);free(tac);free(tba);free(tbb);
+    free(tbc);free(tca);free(tcb);free(tcc);
 
     /* step 3: cuFFT Z2Z plan */
     {
-        cufftResult r=cufftPlan2d(&d->plan,ny,nx,CUFFT_Z2Z);
-        if(r!=CUFFT_SUCCESS){
-            fprintf(stderr,"[demag v2] cufftPlan2d failed: %d\n",(int)r);
-            for(int c=0;c<9;c++) free(htmp[c]);
-            free(d); return NULL;
+        cufftResult r = cufftPlan2d(&d->plan, ny, nx, CUFFT_Z2Z);
+        if (r != CUFFT_SUCCESS) {
+            fprintf(stderr,"[demag] cufftPlan2d failed: %d\n",(int)r);
+            free(hfaa);free(hfab);free(hfac);free(hfba);free(hfbb);
+            free(hfbc);free(hfca);free(hfcb);free(hfcc);free(d);
+            return NULL;
         }
     }
 
-    /* steps 4-5: H2D + FFT → d_fhat — stays on device permanently */
-    for(int c=0;c<9;c++){
-        if(cudaMalloc((void**)&d->d_fhat[c],csz)!=cudaSuccess){
-            fprintf(stderr,"[demag v2] cudaMalloc d_fhat[%d] failed\n",c);
-            for(int cc=0;cc<c;cc++) cudaFree(d->d_fhat[cc]);
-            for(int cc=0;cc<9;cc++) free(htmp[cc]);
-            cufftDestroy(d->plan); free(d); return NULL;
-        }
-        cudaMemcpy(d->d_fhat[c],htmp[c],csz,cudaMemcpyHostToDevice);
-        free(htmp[c]);
-        cufftExecZ2Z(d->plan,d->d_fhat[c],d->d_fhat[c],CUFFT_FORWARD);
-    }
-    cudaDeviceSynchronize();
+    /* step 4: H2D + FFT tensor */
+    cufftDoubleComplex *difaa=NULL,*difab=NULL,*difac=NULL;
+    cufftDoubleComplex *difba=NULL,*difbb=NULL,*difbc=NULL;
+    cufftDoubleComplex *difca=NULL,*difcb=NULL,*difcc=NULL;
+    cufftDoubleComplex *dofaa=NULL,*dofab=NULL,*dofac=NULL;
+    cufftDoubleComplex *dofba=NULL,*dofbb=NULL,*dofbc=NULL;
+    cufftDoubleComplex *dofca=NULL,*dofcb=NULL,*dofcc=NULL;
 
-    /* allocate M̂ and Ĥ (reused every timestep) */
-    for(int c=0;c<3;c++){
-        cudaMalloc((void**)&d->d_mhat[c],csz);
-        cudaMalloc((void**)&d->d_hhat[c],csz);
-    }
+    cudaMalloc((void**)&difaa,csz); cudaMalloc((void**)&dofaa,csz);
+    cudaMalloc((void**)&difab,csz); cudaMalloc((void**)&dofab,csz);
+    cudaMalloc((void**)&difac,csz); cudaMalloc((void**)&dofac,csz);
+    cudaMalloc((void**)&difba,csz); cudaMalloc((void**)&dofba,csz);
+    cudaMalloc((void**)&difbb,csz); cudaMalloc((void**)&dofbb,csz);
+    cudaMalloc((void**)&difbc,csz); cudaMalloc((void**)&dofbc,csz);
+    cudaMalloc((void**)&difca,csz); cudaMalloc((void**)&dofca,csz);
+    cudaMalloc((void**)&difcb,csz); cudaMalloc((void**)&dofcb,csz);
+    cudaMalloc((void**)&difcc,csz); cudaMalloc((void**)&dofcc,csz);
 
-    printf("[Demag v2] Device: f̂=%.1f MB  M̂Ĥ=%.1f MB\n",
-           9.*csz/1e6, 6.*csz/1e6);
-    printf("[Demag v2] Ready — no D2H/H2D in hot path.\n");
+    cudaMemcpy(difaa,hfaa,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difab,hfab,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difac,hfac,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difba,hfba,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difbb,hfbb,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difbc,hfbc,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difca,hfca,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difcb,hfcb,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difcc,hfcc,csz,cudaMemcpyHostToDevice);
+
+    free(hfaa);free(hfab);free(hfac);free(hfba);free(hfbb);
+    free(hfbc);free(hfca);free(hfcb);free(hfcc);
+
+    cufftExecZ2Z(d->plan,difaa,dofaa,CUFFT_FORWARD);
+    cufftExecZ2Z(d->plan,difab,dofab,CUFFT_FORWARD);
+    cufftExecZ2Z(d->plan,difac,dofac,CUFFT_FORWARD);
+    cufftExecZ2Z(d->plan,difba,dofba,CUFFT_FORWARD);
+    cufftExecZ2Z(d->plan,difbb,dofbb,CUFFT_FORWARD);
+    cufftExecZ2Z(d->plan,difbc,dofbc,CUFFT_FORWARD);
+    cufftExecZ2Z(d->plan,difca,dofca,CUFFT_FORWARD);
+    cufftExecZ2Z(d->plan,difcb,dofcb,CUFFT_FORWARD);
+    cufftExecZ2Z(d->plan,difcc,dofcc,CUFFT_FORWARD);
+
+    /* step 5: D2H → hofaa..hofcc (keep on host for multiply loop) */
+    d->hofaa=(cufftDoubleComplex*)malloc(csz); d->hofab=(cufftDoubleComplex*)malloc(csz);
+    d->hofac=(cufftDoubleComplex*)malloc(csz); d->hofba=(cufftDoubleComplex*)malloc(csz);
+    d->hofbb=(cufftDoubleComplex*)malloc(csz); d->hofbc=(cufftDoubleComplex*)malloc(csz);
+    d->hofca=(cufftDoubleComplex*)malloc(csz); d->hofcb=(cufftDoubleComplex*)malloc(csz);
+    d->hofcc=(cufftDoubleComplex*)malloc(csz);
+
+    cudaMemcpy(d->hofaa,dofaa,csz,cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->hofab,dofab,csz,cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->hofac,dofac,csz,cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->hofba,dofba,csz,cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->hofbb,dofbb,csz,cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->hofbc,dofbc,csz,cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->hofca,dofca,csz,cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->hofcb,dofcb,csz,cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->hofcc,dofcc,csz,cudaMemcpyDeviceToHost);
+
+    cudaFree(difaa);cudaFree(difab);cudaFree(difac);
+    cudaFree(difba);cudaFree(difbb);cudaFree(difbc);
+    cudaFree(difca);cudaFree(difcb);cudaFree(difcc);
+    cudaFree(dofaa);cudaFree(dofab);cudaFree(dofac);
+    cudaFree(dofba);cudaFree(dofbb);cudaFree(dofbc);
+    cudaFree(dofca);cudaFree(dofcb);cudaFree(dofcc);
+
+    /* allocate persistent per-timestep buffers */
+    cudaMalloc((void**)&d->dima,csz); cudaMalloc((void**)&d->doma,csz);
+    cudaMalloc((void**)&d->dimb,csz); cudaMalloc((void**)&d->domb,csz);
+    cudaMalloc((void**)&d->dimc,csz); cudaMalloc((void**)&d->domc,csz);
+    cudaMalloc((void**)&d->dkha,csz); cudaMalloc((void**)&d->drha,csz);
+    cudaMalloc((void**)&d->dkhb,csz); cudaMalloc((void**)&d->drhb,csz);
+    cudaMalloc((void**)&d->dkhc,csz); cudaMalloc((void**)&d->drhc,csz);
+
+    d->homa=(cufftDoubleComplex*)malloc(csz); d->homb=(cufftDoubleComplex*)malloc(csz);
+    d->homc=(cufftDoubleComplex*)malloc(csz); d->hkha=(cufftDoubleComplex*)malloc(csz);
+    d->hkhb=(cufftDoubleComplex*)malloc(csz); d->hkhc=(cufftDoubleComplex*)malloc(csz);
+    d->hrha=(cufftDoubleComplex*)malloc(csz); d->hrhb=(cufftDoubleComplex*)malloc(csz);
+    d->hrhc=(cufftDoubleComplex*)malloc(csz);
+
+    printf("[Demag] Ready. Host ~%.1f MB  Device ~%.1f MB\n",
+           18.0*csz/1e6, 12.0*csz/1e6);
     return d;
 }
 
 /* 
- * Demag_Apply  (all GPU, no D2H/H2D in hot path)
+ * Demag_Apply  (steps 6-14, per-timestep)
  *  */
 void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
 {
-    if(!d) return;
-    const int ncell=d->ncell, nk=d->nk, nx=d->nx, ny=d->ny;
-    const double scale=d->strength/(double)(nx*ny);
-    const int blk=256;
-    const int g_cell=(ncell+blk-1)/blk;
-    const int g_k   =(nk   +blk-1)/blk;
+    if (!d) return;
 
-    /* step 6: pack M → d_mhat (GPU kernel, no D2H) */
-    for(int comp=0;comp<3;comp++)
-        pack_real_to_complex_kernel<<<g_cell,blk>>>(
-            y_dev, d->d_mhat[comp], comp, ncell);
+    const int nx    = d->nx;
+    const int ny    = d->ny;
+    const int ncell = d->ncell;
+    const int nn2   = d->nn2;
+    const double scale = d->strength / (double)(nx * ny);
+    const size_t csz = (size_t)ncell * sizeof(cufftDoubleComplex);
 
-    /* step 7: FFT M̂ (in-place, GPU) */
-    for(int comp=0;comp<3;comp++)
-        cufftExecZ2Z(d->plan, d->d_mhat[comp],
-                     d->d_mhat[comp], CUFFT_FORWARD);
+    /* step 6: D2H y, pack into complex hma_c..hmc_c */
+    double *h_y = (double*)malloc((size_t)3 * ncell * sizeof(double));
+    if (!h_y) { fprintf(stderr,"[demag] h_y alloc failed\n"); return; }
+    cudaMemcpy(h_y, y_dev, (size_t)3*ncell*sizeof(double), cudaMemcpyDeviceToHost);
 
-    /* step 8: Ĥ = f̂ · M̂  (GPU kernel, f̂ is constant on device) */
-    multiply_kernel<<<g_k,blk>>>(
-        d->d_mhat[0], d->d_mhat[1], d->d_mhat[2],
-        d->d_fhat[0], d->d_fhat[1], d->d_fhat[2],
-        d->d_fhat[3], d->d_fhat[4], d->d_fhat[5],
-        d->d_fhat[6], d->d_fhat[7], d->d_fhat[8],
-        d->d_hhat[0], d->d_hhat[1], d->d_hhat[2],
-        nk);
+    cufftDoubleComplex *hma_c=(cufftDoubleComplex*)malloc(csz);
+    cufftDoubleComplex *hmb_c=(cufftDoubleComplex*)malloc(csz);
+    cufftDoubleComplex *hmc_c=(cufftDoubleComplex*)malloc(csz);
 
-    /* step 9: IFFT Ĥ (in-place, GPU) */
-    for(int comp=0;comp<3;comp++)
-        cufftExecZ2Z(d->plan, d->d_hhat[comp],
-                     d->d_hhat[comp], CUFFT_INVERSE);
+    for (int idx = 0; idx < ncell; idx++) {
+        hma_c[idx].x = h_y[idx];           hma_c[idx].y = 0.0;
+        hmb_c[idx].x = h_y[ncell + idx];   hmb_c[idx].y = 0.0;
+        hmc_c[idx].x = h_y[2*ncell + idx]; hmc_c[idx].y = 0.0;
+    }
+    free(h_y);
 
-    /* step 10: scatter into h_out SoA (GPU kernel, professor's index remap) */
-    for(int comp=0;comp<3;comp++)
-        scatter_add_kernel<<<g_cell,blk>>>(
-            d->d_hhat[comp], h_out, comp, ncell, nx, ny, scale);
+    /* step 7: H2D */
+    cudaMemcpy(d->dima, hma_c, csz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d->dimb, hmb_c, csz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d->dimc, hmc_c, csz, cudaMemcpyHostToDevice);
+    free(hma_c); free(hmb_c); free(hmc_c);
+
+    /* step 8: FFT FORWARD */
+    cufftExecZ2Z(d->plan, d->dima, d->doma, CUFFT_FORWARD);
+    cufftExecZ2Z(d->plan, d->dimb, d->domb, CUFFT_FORWARD);
+    cufftExecZ2Z(d->plan, d->dimc, d->domc, CUFFT_FORWARD);
+
+    /* step 9: D2H */
+    cudaMemcpy(d->homa, d->doma, csz, cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->homb, d->domb, csz, cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->homc, d->domc, csz, cudaMemcpyDeviceToHost);
+
+    /* step 10: host multiply — EXACT copy of  cadd/cmul loop */
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            int idx = j * nx + i;
+            d->hkha[idx] = h_cadd(h_cadd(h_cmul(d->hofaa[idx], d->homa[idx]),
+                                          h_cmul(d->hofab[idx], d->homb[idx])),
+                                          h_cmul(d->hofac[idx], d->homc[idx]));
+            d->hkhb[idx] = h_cadd(h_cadd(h_cmul(d->hofba[idx], d->homa[idx]),
+                                          h_cmul(d->hofbb[idx], d->homb[idx])),
+                                          h_cmul(d->hofbc[idx], d->homc[idx]));
+            d->hkhc[idx] = h_cadd(h_cadd(h_cmul(d->hofca[idx], d->homa[idx]),
+                                          h_cmul(d->hofcb[idx], d->homb[idx])),
+                                          h_cmul(d->hofcc[idx], d->homc[idx]));
+        }
+    }
+
+    /* step 11: H2D */
+    cudaMemcpy(d->dkha, d->hkha, csz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d->dkhb, d->hkhb, csz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d->dkhc, d->hkhc, csz, cudaMemcpyHostToDevice);
+
+    /* step 12: FFT INVERSE */
+    cufftExecZ2Z(d->plan, d->dkha, d->drha, CUFFT_INVERSE);
+    cufftExecZ2Z(d->plan, d->dkhb, d->drhb, CUFFT_INVERSE);
+    cufftExecZ2Z(d->plan, d->dkhc, d->drhc, CUFFT_INVERSE);
+
+    /* step 13: D2H */
+    cudaMemcpy(d->hrha, d->drha, csz, cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->hrhb, d->drhb, csz, cudaMemcpyDeviceToHost);
+    cudaMemcpy(d->hrhc, d->drhc, csz, cudaMemcpyDeviceToHost);
+
+    /* step 14: scatter into SoA h_out with  index remapping
+     *
+     *  output loop (from main()):
+     *   for j: jy = (j < nn2) ? (nn2-j) : (nn-j+nn2-1)
+     *   for i: ix = (i < nn2) ? (nn2-i) : (nn-i+nn2-1)
+     *   idxnew = jy*nn + ix
+     *   hx = hrha[idxnew].x / (nn*nn)
+     *
+     * h_out is device memory — read existing values, add, write back.
+     */
+    double *h_hout = (double*)malloc((size_t)3*ncell*sizeof(double));
+    if (!h_hout) { fprintf(stderr,"[demag] h_hout alloc failed\n"); return; }
+    cudaMemcpy(h_hout, h_out, (size_t)3*ncell*sizeof(double), cudaMemcpyDeviceToHost);
+
+    for (int j = 0; j < ny; j++) {
+        int jy = (j < nn2) ? (nn2 - j) : (ny - j + nn2 - 1);
+        for (int i = 0; i < nx; i++) {
+            int ix = (i < nn2) ? (nn2 - i) : (nx - i + nn2 - 1);
+            int idx    = j  * nx + i;
+            int idxnew = jy * nx + ix;
+            if (idxnew < 0 || idxnew >= ncell) continue;
+
+            h_hout[idx]          += d->hrha[idxnew].x * scale;
+            h_hout[ncell + idx]  += d->hrhb[idxnew].x * scale;
+            h_hout[2*ncell + idx]+= d->hrhc[idxnew].x * scale;
+        }
+    }
+    cudaMemcpy(h_out, h_hout, (size_t)3*ncell*sizeof(double), cudaMemcpyHostToDevice);
+    free(h_hout);
 }
 
 /* 
@@ -298,12 +483,19 @@ void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
  *  */
 void Demag_Destroy(DemagData *d)
 {
-    if(!d) return;
+    if (!d) return;
     cufftDestroy(d->plan);
-    for(int c=0;c<9;c++) if(d->d_fhat[c]) cudaFree(d->d_fhat[c]);
-    for(int c=0;c<3;c++){
-        if(d->d_mhat[c]) cudaFree(d->d_mhat[c]);
-        if(d->d_hhat[c]) cudaFree(d->d_hhat[c]);
-    }
+    free(d->hofaa); free(d->hofab); free(d->hofac);
+    free(d->hofba); free(d->hofbb); free(d->hofbc);
+    free(d->hofca); free(d->hofcb); free(d->hofcc);
+    cudaFree(d->dima); cudaFree(d->doma);
+    cudaFree(d->dimb); cudaFree(d->domb);
+    cudaFree(d->dimc); cudaFree(d->domc);
+    cudaFree(d->dkha); cudaFree(d->drha);
+    cudaFree(d->dkhb); cudaFree(d->drhb);
+    cudaFree(d->dkhc); cudaFree(d->drhc);
+    free(d->homa); free(d->homb); free(d->homc);
+    free(d->hkha); free(d->hkhb); free(d->hkhc);
+    free(d->hrha); free(d->hrhb); free(d->hrhc);
     free(d);
 }
