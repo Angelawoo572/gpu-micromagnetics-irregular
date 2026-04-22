@@ -1,4 +1,5 @@
 /*
+<<<<<<< Updated upstream
  * demag_fft.cu
  *
  * Key fix over v1:
@@ -15,18 +16,52 @@
  *   → IFFT(d_hhat) → scatter_kernel(d_hhat→h_out)
  *
  * f̂ = d_fhat[9] never leaves device after Init.
+=======
+ * demag_fft_v2_test.cu
+ *
+ * Standalone test: verify that the optimized version (f̂ stays on device,
+ * multiply on GPU) gives IDENTICAL results to demag_test.cu.
+ *
+ * Key optimization:
+ *   OLD: hofaa..hofcc live on HOST, multiply loop on CPU, then H2D back
+ *   NEW: dofaa..dofcc live on DEVICE permanently, multiply kernel on GPU
+ *        → eliminates 9 D2H + 9 H2D transfers per f() call
+ *        → f̂ computed once at Init, never touched again
+ *
+ * Compile:
+ *   nvcc -O3 -arch=sm_89 demag_fft_v2_test.cu -lcufft -o demag_fft_v2_test
+ *
+ * Run and compare with demag_test.cu:
+ *   ./demag_test         > out_v1.txt
+ *   ./demag_fft_v2_test  > out_v2.txt
+ *   diff out_v1.txt out_v2.txt        # should be empty
+ *
+ * In MATLAB:
+ *   A = load('out_v1.txt');  B = load('out_v2.txt');
+ *   max(max(abs(A(2:end,:) - B(2:end,:))))   % should be ~0 or machine epsilon
+>>>>>>> Stashed changes
  */
 
-#include "demag_fft.h"
-
+#include <cstdio>
+#include <cmath>
 #include <cufft.h>
 #include <cuda_runtime.h>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 
+<<<<<<< Updated upstream
 /* ── ctt: exact copy from  pseudocode (1-indexed dm[]) ── */
+=======
+static const int NN    = 64;
+static const double THICK = 100.0;
+
+/* ── cadd / cmul (same as demag_test.cu) ── */
+static inline cufftDoubleComplex cadd(cufftDoubleComplex a, cufftDoubleComplex b)
+{ cufftDoubleComplex r; r.x=a.x+b.x; r.y=a.y+b.y; return r; }
+
+static inline cufftDoubleComplex cmul(cufftDoubleComplex a, cufftDoubleComplex b)
+{ cufftDoubleComplex r; r.x=a.x*b.x-a.y*b.y; r.y=a.x*b.y+a.y*b.x; return r; }
+
+/* ── ctt / calt: verbatim from professor's pseudocode (1-indexed dm[]) ── */
+>>>>>>> Stashed changes
 static void ctt(double b, double a, double sx, double sy, double dm[])
 {
     double sz=0.0;
@@ -36,6 +71,10 @@ static void ctt(double b, double a, double sx, double sy, double dm[])
     double dnpn=std::sqrt(xn2+yp2+zn2),dnnp=std::sqrt(xn2+yn2+zp2);
     double dppn=std::sqrt(xp2+yp2+zn2),dnpp=std::sqrt(xn2+yp2+zp2);
     double dpnp=std::sqrt(xp2+yn2+zp2),dppp=std::sqrt(xp2+yp2+zp2);
+<<<<<<< Updated upstream
+=======
+
+>>>>>>> Stashed changes
     dm[1]=std::atan(zn*yn/(xn*dnnn))-std::atan(zp*yn/(xn*dnnp))
          -std::atan(zn*yp/(xn*dnpn))+std::atan(zp*yp/(xn*dnpp))
          -std::atan(zn*yn/(xp*dpnn))+std::atan(zp*yn/(xp*dpnp))
@@ -62,6 +101,7 @@ static void ctt(double b, double a, double sx, double sy, double dm[])
          +std::atan(xn*yp/(zp*dnpp))-std::atan(xp*yp/(zp*dppp));
 }
 
+<<<<<<< Updated upstream
 /* ── calt: exact copy (1-indexed dm[]) ── */
 static int calt(double thik,int mdx,int mdy,
                 double taa[],double tab[],double tac[],
@@ -73,12 +113,27 @@ static int calt(double thik,int mdx,int mdy,
     for(int j=0;j<mdy;j++) for(int i=0;i<mdx;i++){
         int ikn=j*mdx+i;
         taa[ikn]=tab[ikn]=tac[ikn]=tba[ikn]=tbb[ikn]=tbc[ikn]=
+=======
+static void calt(double thik, int mdx, int mdy,
+                 double taa[],double tab[],double tac[],
+                 double tba[],double tbb[],double tbc[],
+                 double tca[],double tcb[],double tcc[])
+{
+    int mdx2=mdx/2, mdy2=mdy/2;
+    double a=0.49999, b=0.5*thik;
+    double dm[10];
+    for(int j=0;j<mdy;j++) for(int i=0;i<mdx;i++){
+        int ikn=j*mdx+i;
+        taa[ikn]=tab[ikn]=tac[ikn]=0.0;
+        tba[ikn]=tbb[ikn]=tbc[ikn]=0.0;
+>>>>>>> Stashed changes
         tca[ikn]=tcb[ikn]=tcc[ikn]=0.0;
         for(int jy=-4;jy<=4;jy++){
             double sy=double(j-mdy2)+0.1*double(jy);
             for(int ix=-4;ix<=4;ix++){
                 double sx=double(i-mdx2)+0.1*double(ix);
                 ctt(b,a,sx,sy,dm);
+<<<<<<< Updated upstream
                 taa[ikn]+=dm[1];tab[ikn]+=dm[2];tac[ikn]+=dm[3];
                 tba[ikn]+=dm[4];tbb[ikn]+=dm[5];tbc[ikn]+=dm[6];
                 tca[ikn]+=dm[7];tcb[ikn]+=dm[8];tcc[ikn]+=dm[9];
@@ -87,11 +142,21 @@ static int calt(double thik,int mdx,int mdy,
         taa[ikn]/=81.;tab[ikn]/=81.;tac[ikn]/=81.;
         tba[ikn]/=81.;tbb[ikn]/=81.;tbc[ikn]/=81.;
         tca[ikn]/=81.;tcb[ikn]/=81.;tcc[ikn]/=81.;
+=======
+                taa[ikn]+=dm[1]; tab[ikn]+=dm[2]; tac[ikn]+=dm[3];
+                tba[ikn]+=dm[4]; tbb[ikn]+=dm[5]; tbc[ikn]+=dm[6];
+                tca[ikn]+=dm[7]; tcb[ikn]+=dm[8]; tcc[ikn]+=dm[9];
+            }
+        }
+        taa[ikn]/=81.; tab[ikn]/=81.; tac[ikn]/=81.;
+        tba[ikn]/=81.; tbb[ikn]/=81.; tbc[ikn]/=81.;
+        tca[ikn]/=81.; tcb[ikn]/=81.; tcc[ikn]/=81.;
+>>>>>>> Stashed changes
     }
-    return 1;
 }
 
 /* 
+<<<<<<< Updated upstream
  * GPU kernels
  *  */
 
@@ -218,8 +283,60 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
             for(int c=0;c<9;c++) free(htmp[c]);
             free(d); return NULL;
         }
-    }
+=======
+ * GPU kernel: pointwise multiply  ĥ = f̂ · m̂  (all on device)
+ *
+ * f̂ (tensor spectra) is PERMANENT on device — computed once at init.
+ * m̂ (magnetization spectrum) is computed fresh each call.
+ *
+ * hkha[k] = hofaa[k]*homa[k] + hofab[k]*homb[k] + hofac[k]*homc[k]
+ * (same formula as professor's CPU loop, but on GPU)
+ *  */
+__global__ static void multiply_kernel(
+    /* f̂: tensor spectra (permanent device arrays) */
+    const cufftDoubleComplex* __restrict__ dofaa,
+    const cufftDoubleComplex* __restrict__ dofab,
+    const cufftDoubleComplex* __restrict__ dofac,
+    const cufftDoubleComplex* __restrict__ dofba,
+    const cufftDoubleComplex* __restrict__ dofbb,
+    const cufftDoubleComplex* __restrict__ dofbc,
+    const cufftDoubleComplex* __restrict__ dofca,
+    const cufftDoubleComplex* __restrict__ dofcb,
+    const cufftDoubleComplex* __restrict__ dofcc,
+    /* m̂: magnetization spectra (computed this call) */
+    const cufftDoubleComplex* __restrict__ doma,
+    const cufftDoubleComplex* __restrict__ domb,
+    const cufftDoubleComplex* __restrict__ domc,
+    /* ĥ: output field spectra */
+    cufftDoubleComplex* __restrict__ dkha,
+    cufftDoubleComplex* __restrict__ dkhb,
+    cufftDoubleComplex* __restrict__ dkhc,
+    int N)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= N) return;
 
+    /* Ĥa = f̂aa·M̂a + f̂ab·M̂b + f̂ac·M̂c */
+    cufftDoubleComplex ha = {0.0, 0.0};
+    {
+        cufftDoubleComplex t;
+        /* f̂aa * M̂a */
+        t.x = dofaa[k].x*doma[k].x - dofaa[k].y*doma[k].y;
+        t.y = dofaa[k].x*doma[k].y + dofaa[k].y*doma[k].x;
+        ha.x += t.x; ha.y += t.y;
+        /* f̂ab * M̂b */
+        t.x = dofab[k].x*domb[k].x - dofab[k].y*domb[k].y;
+        t.y = dofab[k].x*domb[k].y + dofab[k].y*domb[k].x;
+        ha.x += t.x; ha.y += t.y;
+        /* f̂ac * M̂c */
+        t.x = dofac[k].x*domc[k].x - dofac[k].y*domc[k].y;
+        t.y = dofac[k].x*domc[k].y + dofac[k].y*domc[k].x;
+        ha.x += t.x; ha.y += t.y;
+>>>>>>> Stashed changes
+    }
+    dkha[k] = ha;
+
+<<<<<<< Updated upstream
     /* steps 4-5: H2D + FFT → d_fhat — stays on device permanently */
     for(int c=0;c<9;c++){
         if(cudaMalloc((void**)&d->d_fhat[c],csz)!=cudaSuccess){
@@ -233,6 +350,85 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
         cufftExecZ2Z(d->plan,d->d_fhat[c],d->d_fhat[c],CUFFT_FORWARD);
     }
     cudaDeviceSynchronize();
+=======
+    /* Ĥb = f̂ba·M̂a + f̂bb·M̂b + f̂bc·M̂c */
+    cufftDoubleComplex hb = {0.0, 0.0};
+    {
+        cufftDoubleComplex t;
+        t.x = dofba[k].x*doma[k].x - dofba[k].y*doma[k].y;
+        t.y = dofba[k].x*doma[k].y + dofba[k].y*doma[k].x;
+        hb.x += t.x; hb.y += t.y;
+        t.x = dofbb[k].x*domb[k].x - dofbb[k].y*domb[k].y;
+        t.y = dofbb[k].x*domb[k].y + dofbb[k].y*domb[k].x;
+        hb.x += t.x; hb.y += t.y;
+        t.x = dofbc[k].x*domc[k].x - dofbc[k].y*domc[k].y;
+        t.y = dofbc[k].x*domc[k].y + dofbc[k].y*domc[k].x;
+        hb.x += t.x; hb.y += t.y;
+    }
+    dkhb[k] = hb;
+
+    /* Ĥc = f̂ca·M̂a + f̂cb·M̂b + f̂cc·M̂c */
+    cufftDoubleComplex hc = {0.0, 0.0};
+    {
+        cufftDoubleComplex t;
+        t.x = dofca[k].x*doma[k].x - dofca[k].y*doma[k].y;
+        t.y = dofca[k].x*doma[k].y + dofca[k].y*doma[k].x;
+        hc.x += t.x; hc.y += t.y;
+        t.x = dofcb[k].x*domb[k].x - dofcb[k].y*domb[k].y;
+        t.y = dofcb[k].x*domb[k].y + dofcb[k].y*domb[k].x;
+        hc.x += t.x; hc.y += t.y;
+        t.x = dofcc[k].x*domc[k].x - dofcc[k].y*domc[k].y;
+        t.y = dofcc[k].x*domc[k].y + dofcc[k].y*domc[k].x;
+        hc.x += t.x; hc.y += t.y;
+    }
+    dkhc[k] = hc;
+}
+
+int main()
+{
+    const int nn  = NN;
+    const int nn2 = nn / 2;
+    const int N   = nn * nn;
+    const size_t csz = (size_t)N * sizeof(cufftDoubleComplex);
+
+    /* ── Step 1: calt on CPU (same as demag_test.cu) ── */
+    double *faa=new double[N],*fab=new double[N],*fac=new double[N];
+    double *fba=new double[N],*fbb=new double[N],*fbc=new double[N];
+    double *fca=new double[N],*fcb=new double[N],*fcc=new double[N];
+
+    calt(THICK,nn,nn, faa,fab,fac, fba,fbb,fbc, fca,fcb,fcc);
+
+    /* ── Step 2: pack tensor into complex host arrays (imag=0) ── */
+    cufftDoubleComplex *hfaa=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hfab=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hfac=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hfba=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hfbb=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hfbc=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hfca=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hfcb=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hfcc=new cufftDoubleComplex[N];
+
+    for(int idx=0;idx<N;idx++){
+        hfaa[idx].x=faa[idx]; hfaa[idx].y=0.0;
+        hfab[idx].x=fab[idx]; hfab[idx].y=0.0;
+        hfac[idx].x=fac[idx]; hfac[idx].y=0.0;
+        hfba[idx].x=fba[idx]; hfba[idx].y=0.0;
+        hfbb[idx].x=fbb[idx]; hfbb[idx].y=0.0;
+        hfbc[idx].x=fbc[idx]; hfbc[idx].y=0.0;
+        hfca[idx].x=fca[idx]; hfca[idx].y=0.0;
+        hfcb[idx].x=fcb[idx]; hfcb[idx].y=0.0;
+        hfcc[idx].x=fcc[idx]; hfcc[idx].y=0.0;
+    }
+    delete[]faa;delete[]fab;delete[]fac;
+    delete[]fba;delete[]fbb;delete[]fbc;
+    delete[]fca;delete[]fcb;delete[]fcc;
+
+    /* ── Step 3: H2D tensor, FFT it, KEEP f̂ on device permanently ── */
+    /* dofaa..dofcc are the PERMANENT device arrays for f̂ */
+    cufftDoubleComplex *difaa,*difab,*difac,*difba,*difbb,*difbc,*difca,*difcb,*difcc;
+    cufftDoubleComplex *dofaa,*dofab,*dofac,*dofba,*dofbb,*dofbc,*dofca,*dofcb,*dofcc;
+>>>>>>> Stashed changes
 
     /* allocate M̂ and Ĥ (reused every timestep) */
     for(int c=0;c<3;c++){
@@ -240,6 +436,7 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
         cudaMalloc((void**)&d->d_hhat[c],csz);
     }
 
+<<<<<<< Updated upstream
     return d;
 }
 
@@ -298,4 +495,132 @@ void Demag_Destroy(DemagData *d)
         if(d->d_hhat[c]) cudaFree(d->d_hhat[c]);
     }
     free(d);
+=======
+    cudaMemcpy(difaa,hfaa,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difab,hfab,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difac,hfac,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difba,hfba,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difbb,hfbb,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difbc,hfbc,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difca,hfca,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difcb,hfcb,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(difcc,hfcc,csz,cudaMemcpyHostToDevice);
+
+    delete[]hfaa;delete[]hfab;delete[]hfac;
+    delete[]hfba;delete[]hfbb;delete[]hfbc;
+    delete[]hfca;delete[]hfcb;delete[]hfcc;
+
+    cufftHandle plan;
+    cufftPlan2d(&plan, nn, nn, CUFFT_Z2Z);
+
+    /* FFT the tensor — dofaa..dofcc now hold f̂, permanently on device */
+    cufftExecZ2Z(plan,difaa,dofaa,CUFFT_FORWARD);
+    cufftExecZ2Z(plan,difab,dofab,CUFFT_FORWARD);
+    cufftExecZ2Z(plan,difac,dofac,CUFFT_FORWARD);
+    cufftExecZ2Z(plan,difba,dofba,CUFFT_FORWARD);
+    cufftExecZ2Z(plan,difbb,dofbb,CUFFT_FORWARD);
+    cufftExecZ2Z(plan,difbc,dofbc,CUFFT_FORWARD);
+    cufftExecZ2Z(plan,difca,dofca,CUFFT_FORWARD);
+    cufftExecZ2Z(plan,difcb,dofcb,CUFFT_FORWARD);
+    cufftExecZ2Z(plan,difcc,dofcc,CUFFT_FORWARD);
+    cudaDeviceSynchronize();
+
+    /* free the input-side tensor buffers (no longer needed) */
+    cudaFree(difaa);cudaFree(difab);cudaFree(difac);
+    cudaFree(difba);cudaFree(difbb);cudaFree(difbc);
+    cudaFree(difca);cudaFree(difcb);cudaFree(difcc);
+
+    /* ── Step 4: same magnetization pattern as demag_test.cu ── */
+    cufftDoubleComplex *hma_c=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hmb_c=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hmc_c=new cufftDoubleComplex[N];
+
+    int i1=nn/3, i2=2*nn/3, j1=nn/3, j2=2*nn/3;
+    for(int j=0;j<nn;j++) for(int i=0;i<nn;i++){
+        int idx=j*nn+i;
+        double ma=1.0;
+        if(i>i1&&i<i2&&j>j1&&j<j2) ma=0.0;
+        hma_c[idx].x=ma;  hma_c[idx].y=0.0;
+        hmb_c[idx].x=0.0; hmb_c[idx].y=0.0;
+        hmc_c[idx].x=0.0; hmc_c[idx].y=0.0;
+    }
+
+    /* ── Step 5: H2D magnetization, FFT → m̂ stays on device ── */
+    cufftDoubleComplex *dima,*dimb,*dimc;
+    cufftDoubleComplex *doma,*domb,*domc;
+    cudaMalloc((void**)&dima,csz); cudaMalloc((void**)&doma,csz);
+    cudaMalloc((void**)&dimb,csz); cudaMalloc((void**)&domb,csz);
+    cudaMalloc((void**)&dimc,csz); cudaMalloc((void**)&domc,csz);
+
+    cudaMemcpy(dima,hma_c,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(dimb,hmb_c,csz,cudaMemcpyHostToDevice);
+    cudaMemcpy(dimc,hmc_c,csz,cudaMemcpyHostToDevice);
+    delete[]hma_c; delete[]hmb_c; delete[]hmc_c;
+
+    cufftExecZ2Z(plan,dima,doma,CUFFT_FORWARD);
+    cufftExecZ2Z(plan,dimb,domb,CUFFT_FORWARD);
+    cufftExecZ2Z(plan,dimc,domc,CUFFT_FORWARD);
+    /* doma/domb/domc now hold m̂, all on device — no D2H needed */
+
+    /* ── Step 6: GPU multiply  ĥ = f̂ · m̂  (everything on device) ── */
+    /* This replaces the CPU cadd/cmul loop from demag_test.cu        */
+    cufftDoubleComplex *dkha,*dkhb,*dkhc;
+    cufftDoubleComplex *drha,*drhb,*drhc;
+    cudaMalloc((void**)&dkha,csz); cudaMalloc((void**)&drha,csz);
+    cudaMalloc((void**)&dkhb,csz); cudaMalloc((void**)&drhb,csz);
+    cudaMalloc((void**)&dkhc,csz); cudaMalloc((void**)&drhc,csz);
+
+    {
+        int block=256, grid=(N+block-1)/block;
+        multiply_kernel<<<grid,block>>>(
+            dofaa,dofab,dofac,
+            dofba,dofbb,dofbc,
+            dofca,dofcb,dofcc,
+            doma,domb,domc,
+            dkha,dkhb,dkhc,
+            N);
+        cudaDeviceSynchronize();
+    }
+
+    /* ── Step 7: IFFT ĥ → h (on device) ── */
+    cufftExecZ2Z(plan,dkha,drha,CUFFT_INVERSE);
+    cufftExecZ2Z(plan,dkhb,drhb,CUFFT_INVERSE);
+    cufftExecZ2Z(plan,dkhc,drhc,CUFFT_INVERSE);
+    cudaDeviceSynchronize();
+
+    /* ── Step 8: D2H result ── */
+    cufftDoubleComplex *hrha=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hrhb=new cufftDoubleComplex[N];
+    cufftDoubleComplex *hrhc=new cufftDoubleComplex[N];
+    cudaMemcpy(hrha,drha,csz,cudaMemcpyDeviceToHost);
+    cudaMemcpy(hrhb,drhb,csz,cudaMemcpyDeviceToHost);
+    cudaMemcpy(hrhc,drhc,csz,cudaMemcpyDeviceToHost);
+
+    /* ── Step 9: print with EXACT same index remapping as demag_test.cu ── */
+    std::printf("%d %d %d\n", nn, nn, nn);
+    for(int j=0;j<nn;j++){
+        int jy = (j<nn2) ? (nn2-j) : (nn-j+nn2-1);
+        for(int i=0;i<nn;i++){
+            int ix = (i<nn2) ? (nn2-i) : (nn-i+nn2-1);
+            int idxnew = jy*nn + ix;
+            double hx = hrha[idxnew].x / (double)(nn*nn);
+            double hy = hrhb[idxnew].x / (double)(nn*nn);
+            double hz = hrhc[idxnew].x / (double)(nn*nn);
+            std::printf("%f %f %f\n", hx, hy, hz);
+        }
+    }
+
+    /* cleanup */
+    cufftDestroy(plan);
+    cudaFree(dofaa);cudaFree(dofab);cudaFree(dofac);
+    cudaFree(dofba);cudaFree(dofbb);cudaFree(dofbc);
+    cudaFree(dofca);cudaFree(dofcb);cudaFree(dofcc);
+    cudaFree(dima);cudaFree(dimb);cudaFree(dimc);
+    cudaFree(doma);cudaFree(domb);cudaFree(domc);
+    cudaFree(dkha);cudaFree(dkhb);cudaFree(dkhc);
+    cudaFree(drha);cudaFree(drhb);cudaFree(drhc);
+    delete[]hrha;delete[]hrhb;delete[]hrhc;
+
+    return 0;
+>>>>>>> Stashed changes
 }
