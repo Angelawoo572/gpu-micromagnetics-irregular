@@ -2,7 +2,7 @@
  * 2D periodic smooth-texture LLG solver
  * CVODE + CUDA, SoA layout
  *
- * Demag field (professor's Newell tensor, calt/ctt, Z2Z cuFFT):
+ * Demag field ( Newell tensor, calt/ctt, Z2Z cuFFT):
  *   h_dmag(i,j) = Σ_{m,n} N(i-m, j-n) · M(m,n)   [convolution]
  *               = IFFT[ N̂(k) · M̂(k) ]             [via cuFFT Z2Z]
  *
@@ -25,7 +25,7 @@
 #include "deferred_nvector.h"
 #include "precond.h"
 #include "jtv.h"
-#include "demag_fft.h"   /* professor's Newell tensor demag */
+#include "demag_fft.h"   /*  Newell tensor demag */
 
 /* Problem constants */
 #define GROUPSIZE 3
@@ -300,7 +300,7 @@ __global__ static void demag_correction_kernel(
  * RHS wrapper for CVODE
  *
  * Step 1: exchange stencil (original kernel, unchanged)
- * Step 2: demag field via FFT convolution (professor's Newell tensor)
+ * Step 2: demag field via FFT convolution ( Newell tensor)
  *         h_dmag = IFFT[ N̂(k) · M̂(k) ]
  *         ydot  += LLG(m, h_dmag)
  */
@@ -331,7 +331,7 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
     cudaMemsetAsync(udata->d_hdmag, 0,
                     (size_t)3 * udata->ncell * sizeof(sunrealtype), 0);
 
-    /* h_dmag = IFFT[ N̂ · M̂ ]  — professor's algorithm */
+    /* h_dmag = IFFT[ N̂ · M̂ ]  —  algorithm */
     Demag_Apply(udata->demag,
                 (const double*)ydata,
                 (double*)udata->d_hdmag);
@@ -475,7 +475,7 @@ int main(int argc, char* argv[]) {
   udata.pd = Precond_Create(ng, ny, ncell);
   if (!udata.pd) { fprintf(stderr, "Precond_Create failed\n"); return 1; }
 
-  /* FFT demag (professor's Newell tensor) */
+  /* FFT demag ( Newell tensor) */
   const double dstr = (double)DEMAG_STRENGTH;
   const double dthk = (double)DEMAG_THICK;
   if (dstr > 0.0) {

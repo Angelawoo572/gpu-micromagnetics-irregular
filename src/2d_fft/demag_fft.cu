@@ -26,7 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 
-/* ── ctt: exact copy from professor's pseudocode (1-indexed dm[]) ── */
+/* ── ctt: exact copy from  pseudocode (1-indexed dm[]) ── */
 static void ctt(double b, double a, double sx, double sy, double dm[])
 {
     double sz=0.0;
@@ -140,7 +140,7 @@ __global__ static void multiply_kernel(
 #undef CI
 }
 
-/* Scatter IFFT result into h_out SoA with professor's index remapping */
+/* Scatter IFFT result into h_out SoA with  index remapping */
 __global__ static void scatter_add_kernel(
     const cufftDoubleComplex* __restrict__ hhat,
     double* __restrict__ h_out,
@@ -279,7 +279,7 @@ void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
         cufftExecZ2Z(d->plan, d->d_hhat[comp],
                      d->d_hhat[comp], CUFFT_INVERSE);
 
-    /* step 10: scatter into h_out SoA (GPU kernel, professor's index remap) */
+    /* step 10: scatter into h_out SoA (GPU kernel,  index remap) */
     for(int comp=0;comp<3;comp++)
         scatter_add_kernel<<<g_cell,blk>>>(
             d->d_hhat[comp], h_out, comp, ncell, nx, ny, scale);
