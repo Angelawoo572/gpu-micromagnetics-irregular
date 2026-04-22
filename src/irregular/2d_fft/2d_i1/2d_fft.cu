@@ -51,7 +51,7 @@
 
 /* Demag controls */
 #ifndef DEMAG_STRENGTH
-#define DEMAG_STRENGTH 1.0
+#define DEMAG_STRENGTH 0.0
 #endif
 
 #ifndef DEMAG_THICK
