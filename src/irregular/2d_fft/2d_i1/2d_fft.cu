@@ -510,13 +510,16 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
 
-  /* Initialize y — smooth Néel-like texture */
+  /* Initialize y — mx domain wall structure
+   * Three regions along x (using ng columns):
+   *   [0,        ng/4)   : mx = -1
+   *   [ng/4,   3*ng/4)   : mx = +1
+   *   [3*ng/4,    ng)    : mx = -1
+   * my = mz = 0 everywhere
+   */
   {
-    const double core_mz  = (double)TEXTURE_CORE_MZ;
-    const double outer_mz = (double)TEXTURE_OUTER_MZ;
-
-    double width = (double)TEXTURE_WIDTH_FRAC * radius;
-    if (width < 1.0) width = 1.0;
+    const int x1 = ng / 4;
+    const int x2 = 3 * ng / 4;
 
     for (int j = 0; j < ny; j++) {
       for (int i = 0; i < ng; i++) {
@@ -526,31 +529,11 @@ int main(int argc, char* argv[]) {
         const int my = idx_my(cell, ncell);
         const int mz = idx_mz(cell, ncell);
 
-        const double ddx = (double)i - cx;
-        const double ddy = (double)j - cy;
-        const double rho = sqrt(ddx * ddx + ddy * ddy);
-
-        const double u = (rho - radius) / width;
-        const double s = 0.5 * (1.0 - tanh(u));
-
-        double mz0 = outer_mz + (core_mz - outer_mz) * s;
-        if (mz0 >  1.0) mz0 =  1.0;
-        if (mz0 < -1.0) mz0 = -1.0;
-
-        double mperp = sqrt(fmax(0.0, 1.0 - mz0 * mz0));
-        double mx0, my0;
-
-        if (rho > (double)TEXTURE_EPS) {
-          mx0 = mperp * (ddx / rho);
-          my0 = mperp * (ddy / rho);
-        } else {
-          mx0 = 0.0;
-          my0 = 0.0;
-        }
+        double mx0 = (i >= x1 && i < x2) ? 1.0 : -1.0;
 
         ydata[mx] = SUN_RCONST(mx0);
-        ydata[my] = SUN_RCONST(my0);
-        ydata[mz] = SUN_RCONST(mz0);
+        ydata[my] = SUN_RCONST(0.0);
+        ydata[mz] = SUN_RCONST(0.0);
 
         abstol_data[mx] = ATOL1;
         abstol_data[my] = ATOL2;
@@ -605,7 +588,8 @@ int main(int argc, char* argv[]) {
   printf("\n2D periodic smooth-texture LLG + FFT Demag [Newell calt/ctt, Z2Z]\n\n");
   printf("nx=%d  ny=%d  ng=%d  ncell=%d  neq=%d\n", nx, ny, ng, ncell, neq);
   printf("periodic BC: x and y\n");
-  printf("circle center=(%.2f,%.2f), radius=%.2f cells\n", cx, cy, radius);
+  // printf("circle center=(%.2f,%.2f), radius=%.2f cells\n", cx, cy, radius);
+  printf("mx domain walls at ng/4=%d and 3*ng/4=%d\n", ng/4, 3*ng/4);
   printf("DEMAG_STRENGTH=%.4f  DEMAG_THICK=%.4f  (%s)\n",
          dstr, dthk,
          dstr > 0.0 ? "h_dmag=IFFT[N̂·M̂] via cuFFT Z2Z" : "disabled");
