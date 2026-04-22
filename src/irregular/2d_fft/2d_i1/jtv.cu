@@ -22,7 +22,7 @@
 #include <stdio.h>
 
 /* Physical constants — must match 2d_p.cu */
-__constant__ sunrealtype jc_msk[3]  = {0.0, 0.0, 1.0};
+__constant__ sunrealtype jc_msk[3]  = {1.0, 0.0, 0.0};
 __constant__ sunrealtype jc_nsk[3]  = {1.0, 0.0, 0.0};
 __constant__ sunrealtype jc_chk     = 1.0;
 __constant__ sunrealtype jc_che     = 4.0;
@@ -76,21 +76,22 @@ __global__ static void jtv_kernel(
 
     const sunrealtype h1 =
         che_chb*(y[jidx_mx(lc,ncell)]+y[jidx_mx(rc,ncell)]) +
-        jc_che *(y[jidx_mx(uc,ncell)]+y[jidx_mx(dc,ncell)]);
+        jc_che *(y[jidx_mx(uc,ncell)]+y[jidx_mx(dc,ncell)]) +
+        m1;          // ← c_msk[0]*c_chk*m1 = 1*1*m1
 
     const sunrealtype h2 =
         jc_che*(y[jidx_my(lc,ncell)]+y[jidx_my(rc,ncell)]+
-                y[jidx_my(uc,ncell)]+y[jidx_my(dc,ncell)]);
+                y[jidx_my(uc,ncell)]+y[jidx_my(dc,ncell)]); // c_msk[1]=0 no self
 
     const sunrealtype h3 =
         jc_che*(y[jidx_mz(lc,ncell)]+y[jidx_mz(rc,ncell)]+
-                y[jidx_mz(uc,ncell)]+y[jidx_mz(dc,ncell)]) + m3;
+                y[jidx_mz(uc,ncell)]+y[jidx_mz(dc,ncell)]); // c_msk[2]=0 no self
 
     const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
 
-    const sunrealtype dh1 = che_chb*(v1L+v1R) + jc_che*(v1U+v1D);
+    const sunrealtype dh1 = che_chb*(v1L+v1R) + jc_che*(v1U+v1D) + v1;  // +v1
     const sunrealtype dh2 = jc_che*(v2L+v2R+v2U+v2D);
-    const sunrealtype dh3 = jc_che*(v3L+v3R+v3U+v3D) + v3;
+    const sunrealtype dh3 = jc_che*(v3L+v3R+v3U+v3D);
 
     const sunrealtype dmh = (v1*h1+v2*h2+v3*h3) + (m1*dh1+m2*dh2+m3*dh3);
 

@@ -47,7 +47,7 @@
 #include <stdlib.h>
 
 /* Physical constants — must match 2d_p.cu */
-__constant__ sunrealtype pc_msk[3]  = {0.0, 0.0, 1.0};
+__constant__ sunrealtype pc_msk[3]  = {1.0, 0.0, 0.0};
 __constant__ sunrealtype pc_nsk[3]  = {1.0, 0.0, 0.0};
 __constant__ sunrealtype pc_chk     = 1.0;
 __constant__ sunrealtype pc_che     = 4.0;
@@ -102,8 +102,8 @@ __global__ static void build_J_kernel(
     /* h_eff (identical to RHS kernel) */
     const sunrealtype h1 =
         pc_che * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)] +
-                  y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)]) +
-        pc_msk[0] * (pc_chk*m3 + pc_cha) +
+                y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)]) +
+        pc_msk[0] * (pc_chk*m1 + pc_cha) +          // m3 → m1
         pc_chb * pc_nsk[0] * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)]);
 
     const sunrealtype h2 =
@@ -121,9 +121,9 @@ __global__ static void build_J_kernel(
     const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
 
     /* ∂mh/∂mi */
-    const sunrealtype d1 = h1;
+    const sunrealtype d1 = h1 + pc_chk*m1;;
     const sunrealtype d2 = h2;
-    const sunrealtype d3 = h3 + pc_chk*m3;
+    const sunrealtype d3 = h3;
 
     /* Store J row-major in d_J[9*cell .. 9*cell+8] */
     const int b = cell * 9;
