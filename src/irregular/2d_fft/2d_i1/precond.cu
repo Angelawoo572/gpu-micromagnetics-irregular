@@ -129,15 +129,15 @@ __global__ static void build_J_kernel(
     const int b = cell * 9;
     d_J[b+0] = pc_alpha * (-d1*m1 - mh);
     d_J[b+1] = -pc_chg*h3 - pc_alpha*d2*m1;
-    d_J[b+2] =  pc_chg*(h2 - m2) - pc_alpha*d3*m1;
+    d_J[b+2] =  pc_chg*h2 - pc_alpha*d3*m1;
 
     d_J[b+3] =  pc_chg*h3 - pc_alpha*d1*m2;
     d_J[b+4] = pc_alpha * (-d2*m2 - mh);
-    d_J[b+5] =  pc_chg*(m1 - h1) - pc_alpha*d3*m2;
+    d_J[b+5] = -pc_chg*h1 - pc_alpha*d3*m2; 
 
     d_J[b+6] = -pc_chg*h2 - pc_alpha*d1*m3;
     d_J[b+7] =  pc_chg*h1 - pc_alpha*d2*m3;
-    d_J[b+8] = pc_alpha * (pc_msk[2]*pc_chk - d3*m3 - mh);
+    d_J[b+8] = pc_alpha * (-d3*m3 - mh);
 }
 
 /* Kernel 2: build_Pinv_kernel
