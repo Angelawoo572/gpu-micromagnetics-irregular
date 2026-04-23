@@ -41,7 +41,7 @@ TEXTURE_EPS        ?= 1.0e-12
 # DEMAG_STRENGTH = 0.0  → disabled (exchange-only, original behaviour)
 # DEMAG_STRENGTH = 1.0  → full dipolar demag via cuFFT Z2Z
 # DEMAG_THICK           → cell thickness in z (in cell-spacing units)
-DEMAG_STRENGTH ?= 3.0
+DEMAG_STRENGTH ?= 1.0
 DEMAG_THICK    ?= 1.0
 
 # ====== Output schedule ======
@@ -159,7 +159,7 @@ run-noprint:
 # Full demag (professor's Newell tensor)
 run-demag:
 	$(MAKE) clean
-	$(MAKE) DEMAG_STRENGTH=3.0 DEMAG_THICK=1.0
+	$(MAKE) DEMAG_STRENGTH=1.0 DEMAG_THICK=1.0
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
 # Exchange-only baseline (demag disabled, recovers original behaviour)
