@@ -134,7 +134,7 @@ __constant__ sunrealtype c_msk[3] = {
 __constant__ sunrealtype c_nsk[3] = {
     SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
 
-__constant__ sunrealtype c_chk   = SUN_RCONST(1.0);
+__constant__ sunrealtype c_chk   = SUN_RCONST(4.0);
 __constant__ sunrealtype c_che   = SUN_RCONST(4.0);
 __constant__ sunrealtype c_alpha = SUN_RCONST(0.2);
 __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
@@ -427,8 +427,8 @@ int main(int argc, char* argv[]) {
   float elapsedTime = 0.0f;
 
   /* problem size */
-  const int nx = 384;
-  const int ny = 128;
+  const int nx = 768;
+  const int ny = 256;
 
   if (nx % GROUPSIZE != 0) {
     fprintf(stderr, "nx must be a multiple of GROUPSIZE=%d\n", GROUPSIZE);

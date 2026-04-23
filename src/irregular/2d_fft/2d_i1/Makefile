@@ -41,12 +41,15 @@ TEXTURE_EPS        ?= 1.0e-12
 # DEMAG_STRENGTH = 0.0  → disabled (exchange-only, original behaviour)
 # DEMAG_STRENGTH = 1.0  → full dipolar demag via cuFFT Z2Z
 # DEMAG_THICK           → cell thickness in z (in cell-spacing units)
-DEMAG_STRENGTH ?= 3.0
+DEMAG_STRENGTH ?= 2.0
 DEMAG_THICK    ?= 1.0
 
 # ====== Output schedule ======
-EARLY_SAVE_UNTIL ?= 80.0
-EARLY_SAVE_EVERY ?= 5
+# EARLY_SAVE_UNTIL ?= 80.0
+# EARLY_SAVE_EVERY ?= 5
+# LATE_SAVE_EVERY  ?= 100
+EARLY_SAVE_UNTIL ?= 0.0
+EARLY_SAVE_EVERY ?= 100
 LATE_SAVE_EVERY  ?= 100
 
 ifeq ($(BUILD),debug)
