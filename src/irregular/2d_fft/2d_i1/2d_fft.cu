@@ -27,6 +27,14 @@
  *   This is physically correct — mz grows transiently and decays
  *   back to 0 as the system reaches equilibrium.
  *   The mz≠0 seen in results is transient behavior, not a bug.
+ *
+ * ── Key fix for DEMAG_STRENGTH > 0 ────────────────────────────────────
+ * UserData carries TWO demag buffers now:
+ *   d_hdmag    : h_demag(y)  — computed during f()   — used by f() + jtv
+ *   d_hdmag_v  : h_demag(v)  — computed during jtv() — used only by jtv
+ * This lets the analytic Jv include the demag Jacobian contribution,
+ * which is required for Newton-Krylov to solve the correct linearized
+ * system.  Without it, mz grows uncontrollably (3D bumpy artifact).
  */
 
 #include <cvode/cvode.h>
@@ -152,15 +160,21 @@ __constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
     fprintf(stderr,"SUNDIALS error %s:%d: flag=%d\n",__FILE__,__LINE__,_f); \
     exit(EXIT_FAILURE); } } while(0)
 
+/*
+ * UserData — MUST match JtvUserData in jtv.cu byte-by-byte.
+ * Both structs are cast from the same void* (set via CVodeSetUserData).
+ * On 64-bit: pointer = 8 B, int = 4 B.
+ */
 typedef struct {
-  PrecondData  *pd;       /* offset 0  — must be first */
-  DemagData    *demag;    /* offset 8  */
-  sunrealtype  *d_hdmag;  /* offset 16 */
-  int nx;                 /* offset 24 */
-  int ny;                 /* offset 28 */
-  int ng;                 /* offset 32 */
-  int ncell;              /* offset 36 */
-  int neq;                /* offset 40 */
+  PrecondData  *pd;         /* offset 0  — must be first (read by precond) */
+  DemagData    *demag;      /* offset 8  */
+  sunrealtype  *d_hdmag;    /* offset 16 — h_demag(y), set by f()           */
+  sunrealtype  *d_hdmag_v;  /* offset 24 — h_demag(v), set by jtv() — NEW   */
+  int nx;                   /* offset 32 */
+  int ny;                   /* offset 36 */
+  int ng;                   /* offset 40 */
+  int ncell;                /* offset 44 */
+  int neq;                  /* offset 48 */
 } UserData;
 
 __host__ __device__ static inline int idx_mx(int cell, int ncell) { return cell; }
@@ -357,7 +371,11 @@ int main(int argc, char* argv[]) {
   if(dstr>0.0){
     udata.demag=Demag_Init(ng,ny,dthk,dstr);
     if(!udata.demag){fprintf(stderr,"Demag_Init failed\n");Precond_Destroy(udata.pd);return 1;}
-    CHECK_CUDA(cudaMalloc((void**)&udata.d_hdmag,(size_t)3*ncell*sizeof(sunrealtype)));
+    /* h_demag(y) — computed in f() */
+    CHECK_CUDA(cudaMalloc((void**)&udata.d_hdmag,  (size_t)3*ncell*sizeof(sunrealtype)));
+    /* h_demag(v) — computed in jtv(). NEW. */
+    CHECK_CUDA(cudaMalloc((void**)&udata.d_hdmag_v,(size_t)3*ncell*sizeof(sunrealtype)));
+    printf("[main] allocated d_hdmag and d_hdmag_v for demag-aware jtv\n");
   }
 
   y=N_VNew_Cuda(neq,sunctx);
@@ -498,7 +516,8 @@ cleanup:
   if(sunctx)    SUNContext_Free(&sunctx);
   Precond_Destroy(udata.pd);
   Demag_Destroy(udata.demag);
-  if(udata.d_hdmag) cudaFree(udata.d_hdmag);
+  if(udata.d_hdmag)   cudaFree(udata.d_hdmag);
+  if(udata.d_hdmag_v) cudaFree(udata.d_hdmag_v);  /* NEW */
   FusedNVec_FreePool();
 #if ENABLE_OUTPUT
   if(fp) fclose(fp);
