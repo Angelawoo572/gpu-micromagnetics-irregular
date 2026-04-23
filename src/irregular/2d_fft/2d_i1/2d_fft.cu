@@ -2,21 +2,31 @@
  * 2D periodic head-on transition LLG solver
  * CVODE + CUDA, SoA layout
  *
- * Demag field ( Newell tensor, calt/ctt, Z2Z cuFFT):
- *   h_dmag(i,j) = Σ_{m,n} N(i-m, j-n) · M(m,n)   [convolution]
- *               = IFFT[ N̂(k) · M̂(k) ]             [via cuFFT Z2Z]
+ * Anisotropy: x-axis  (c_msk={1,0,0}, c_nsk={1,0,0})
  *
- * Initialization: head-on transition along x
- *   mx = -1  for i < ng/4
- *   mx = +1  for ng/4 <= i < 3*ng/4
- *   mx = -1  for i >= 3*ng/4
- *   (smooth tanh transitions at the two domain walls)
- *   my = mz = 0 everywhere
+ * Initial condition — professor's suggestion:
+ *   mz = 0  (exactly, always)
+ *   my = sin(phi(x))
+ *   mx = sqrt(1 - my^2) = cos(phi(x))     [both signs handled via phi]
  *
- * Anisotropy axis: x  (c_msk = {1,0,0}, c_nsk = {1,0,0})
+ * phi(x) = pi * (1 - 0.5*(tanh((x-x1)/w) - tanh((x-x2)/w)))
  *
- * Enable:  make DEMAG_STRENGTH=1.0 DEMAG_THICK=1.0
- * Disable: make DEMAG_STRENGTH=0.0  (zero overhead in f())
+ *   x << x1:       phi → pi      →  mx=cos(pi)=-1,  my=sin(pi)=0   ✓
+ *   x1 < x < x2:   phi → 0       →  mx=cos(0)=+1,   my=sin(0)=0    ✓
+ *   x >> x2:       phi → pi      →  mx=-1,           my=0           ✓
+ *   at x = x1:     phi = pi/2    →  mx=0,            my=+1  (Neel wall peak)
+ *   at x = x2:     phi = pi/2    →  mx=0,            my=+1
+ *
+ * This is an in-plane Neel wall: the magnetization rotates continuously
+ * through the +y direction at each domain wall.  |m|=1 is exact.
+ *
+ * Physical note on mz during dynamics:
+ *   Even with mz(t=0)=0, the precession term
+ *     dm3/dt = chg*(m2*h1 - m1*h2) + alpha*(h3 - mh*m3)
+ *   is nonzero during transient (spins precess out of plane).
+ *   This is physically correct — mz grows transiently and decays
+ *   back to 0 as the system reaches equilibrium.
+ *   The mz≠0 seen in results is transient behavior, not a bug.
  */
 
 #include <cvode/cvode.h>
@@ -34,14 +44,10 @@
 #include "deferred_nvector.h"
 #include "precond.h"
 #include "jtv.h"
-#include "demag_fft.h"   /*  Newell tensor demag */
+#include "demag_fft.h"
 
-/* Problem constants */
 #define GROUPSIZE 3
 
-/* -------------------------------------------------------
- * Solver tuning knobs
- * ------------------------------------------------------- */
 #ifndef KRYLOV_DIM
 #define KRYLOV_DIM 0
 #endif
@@ -58,7 +64,6 @@
 #define ATOL_VAL 1.0e-5
 #endif
 
-/* Demag controls */
 #ifndef DEMAG_STRENGTH
 #define DEMAG_STRENGTH 0.0
 #endif
@@ -72,9 +77,9 @@
 #define ATOL2 SUN_RCONST(ATOL_VAL)
 #define ATOL3 SUN_RCONST(ATOL_VAL)
 
-#define T0    SUN_RCONST(0.0)
-#define T1    SUN_RCONST(0.1)
-#define ZERO  SUN_RCONST(0.0)
+#define T0   SUN_RCONST(0.0)
+#define T1   SUN_RCONST(0.1)
+#define ZERO SUN_RCONST(0.0)
 
 #ifndef T_TOTAL
 #define T_TOTAL 1000.0
@@ -92,13 +97,9 @@
 #define BLOCK_Y 8
 #endif
 
-/*
- * Domain wall transition width, as a fraction of ng.
- * E.g. 0.02 means the 10%-90% transition spans ~2% of the grid width.
- * Larger values give a wider, smoother wall.
- */
+/* Domain wall transition width as fraction of ng */
 #ifndef WALL_WIDTH_FRAC
-#define WALL_WIDTH_FRAC 0.02
+#define WALL_WIDTH_FRAC 0.05
 #endif
 
 #ifndef EARLY_SAVE_UNTIL
@@ -116,13 +117,18 @@
 /*
  * Physical constants — x-axis easy axis
  *
- * c_msk = {1,0,0} : anisotropy along x  → H_ani = chk * m1 * x̂
- * c_nsk = {1,0,0} : DMI / chb term along x
+ * c_msk = {1,0,0}:  H_ani_i = c_msk[i] * (c_chk * m1 + c_cha)
+ *   → only h1 gets the anisotropy term: h1 += c_chk*m1 + c_cha
+ *   → h2, h3 have no anisotropy
  *
- * RHS field components:
- *   h1 = c_che*(sum neighbors mx) + c_chk*m1 + c_cha + c_chb*(ml_x + mr_x)
- *   h2 = c_che*(sum neighbors my)
- *   h3 = c_che*(sum neighbors mz)
+ * c_nsk = {1,0,0}:  chb term only on h1, from x-neighbors of mx
+ *   → h1 += c_chb * (mx_left + mx_right)  [anisotropic exchange]
+ *   → h2, h3 unaffected by chb
+ *
+ * Resulting effective field (full expansion):
+ *   h1 = (c_che+c_chb)*(mx_L+mx_R) + c_che*(mx_U+mx_D) + c_chk*m1 + c_cha
+ *   h2 = c_che*(my_L+my_R+my_U+my_D)
+ *   h3 = c_che*(mz_L+mz_R+mz_U+mz_D)
  */
 __constant__ sunrealtype c_msk[3] = {
     SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
@@ -136,434 +142,283 @@ __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
 __constant__ sunrealtype c_cha   = SUN_RCONST(0.0);
 __constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
 
-/* error checking */
-#define CHECK_CUDA(call)                                                     \
-  do {                                                                       \
-    cudaError_t _err = (call);                                               \
-    if (_err != cudaSuccess) {                                               \
-      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,       \
-              cudaGetErrorString(_err));                                     \
-      exit(EXIT_FAILURE);                                                    \
-    }                                                                        \
-  } while (0)
+#define CHECK_CUDA(call) \
+  do { cudaError_t _e=(call); if(_e!=cudaSuccess){ \
+    fprintf(stderr,"CUDA error %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(_e)); \
+    exit(EXIT_FAILURE); } } while(0)
 
-#define CHECK_SUNDIALS(call)                                                 \
-  do {                                                                       \
-    int _flag = (call);                                                      \
-    if (_flag < 0) {                                                         \
-      fprintf(stderr, "SUNDIALS error at %s:%d: flag = %d\n",                \
-              __FILE__, __LINE__, _flag);                                    \
-      exit(EXIT_FAILURE);                                                    \
-    }                                                                        \
-  } while (0)
+#define CHECK_SUNDIALS(call) \
+  do { int _f=(call); if(_f<0){ \
+    fprintf(stderr,"SUNDIALS error %s:%d: flag=%d\n",__FILE__,__LINE__,_f); \
+    exit(EXIT_FAILURE); } } while(0)
 
-/*
- * UserData
- *
- * IMPORTANT: field ORDER IS CRITICAL.
- *   - PrecondData *pd  MUST be at offset 0  (PrecondSetup/Solve cast rule)
- *   - DemagData   *demag  at offset 8
- *   - sunrealtype *d_hdmag at offset 16
- *   - ints follow at offset 24+
- * JtvUserData in jtv.cu mirrors this layout exactly.
- */
 typedef struct {
-  PrecondData  *pd;        /* offset 0  — must be first */
-  DemagData    *demag;     /* offset 8  */
-  sunrealtype  *d_hdmag;   /* offset 16 — device buffer, 3*ncell */
-  int nx;                  /* offset 24 */
-  int ny;                  /* offset 28 */
-  int ng;                  /* offset 32 */
-  int ncell;               /* offset 36 */
-  int neq;                 /* offset 40 */
+  PrecondData  *pd;       /* offset 0  — must be first */
+  DemagData    *demag;    /* offset 8  */
+  sunrealtype  *d_hdmag;  /* offset 16 */
+  int nx;                 /* offset 24 */
+  int ny;                 /* offset 28 */
+  int ng;                 /* offset 32 */
+  int ncell;              /* offset 36 */
+  int neq;                /* offset 40 */
 } UserData;
 
-/* SoA indexing helpers */
-__host__ __device__ static inline int idx_mx(int cell, int ncell) {
-  return cell;
-}
-
-__host__ __device__ static inline int idx_my(int cell, int ncell) {
-  return ncell + cell;
-}
-
-__host__ __device__ static inline int idx_mz(int cell, int ncell) {
-  return 2 * ncell + cell;
-}
+__host__ __device__ static inline int idx_mx(int cell, int ncell) { return cell; }
+__host__ __device__ static inline int idx_my(int cell, int ncell) { return ncell+cell; }
+__host__ __device__ static inline int idx_mz(int cell, int ncell) { return 2*ncell+cell; }
 
 __host__ __device__ static inline int wrap_x(int x, int ng) {
-  return (x < 0) ? (x + ng) : ((x >= ng) ? (x - ng) : x);
+  return (x<0)?(x+ng):((x>=ng)?(x-ng):x);
 }
-
 __host__ __device__ static inline int wrap_y(int y, int ny) {
-  return (y < 0) ? (y + ny) : ((y >= ny) ? (y - ny) : y);
+  return (y<0)?(y+ny):((y>=ny)?(y-ny):y);
 }
 
 /*
- * Exchange + anisotropy RHS kernel — x-axis anisotropy version
+ * RHS kernel — x-axis anisotropy
  *
- * Effective field components:
- *   h1 = c_che*(ml_x+mr_x+mu_x+md_x) + c_msk[0]*(c_chk*m1+c_cha)
- *                                      + c_chb*c_nsk[0]*(ml_x+mr_x)
- *   h2 = c_che*(ml_y+mr_y+mu_y+md_y) + c_msk[1]*(c_chk*m1+c_cha)
- *                                      + c_chb*c_nsk[1]*(ml_y+mr_y)
- *   h3 = c_che*(ml_z+mr_z+mu_z+md_z) + c_msk[2]*(c_chk*m1+c_cha)
- *                                      + c_chb*c_nsk[2]*(ml_z+mr_z)
+ * h1 gets: exchange (anisotropic: chb boosts x-neighbor coupling) + c_chk*m1
+ * h2 gets: isotropic exchange only
+ * h3 gets: isotropic exchange only
  *
- * With c_msk={1,0,0} and c_nsk={1,0,0}:
- *   h1 = c_che*(neighbors mx) + c_chk*m1 + c_cha + c_chb*(ml_x+mr_x)
- *   h2 = c_che*(neighbors my)
- *   h3 = c_che*(neighbors mz)
- *
- * LLG:
- *   ṁ = c_chg*(m × h) + c_alpha*(h - (m·h)*m)
+ * LLG: dm/dt = chg*(m×h) + alpha*(h - (m·h)*m)
  */
 __global__ static void f_kernel_group_soa_periodic(
     const sunrealtype* __restrict__ y,
     sunrealtype* __restrict__ yd,
-    int ng, int ny, int ncell) {
+    int ng, int ny, int ncell)
+{
+  const int gx = blockIdx.x*blockDim.x + threadIdx.x;
+  const int gy = blockIdx.y*blockDim.y + threadIdx.y;
+  if (gx>=ng || gy>=ny) return;
 
-  const int gx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int gy = blockIdx.y * blockDim.y + threadIdx.y;
+  const int cell = gy*ng+gx;
+  const int mx = idx_mx(cell,ncell);
+  const int my = idx_my(cell,ncell);
+  const int mz = idx_mz(cell,ncell);
 
-  if (gx >= ng || gy >= ny) return;
+  const int xl   = wrap_x(gx-1,ng), xr   = wrap_x(gx+1,ng);
+  const int yu   = wrap_y(gy-1,ny), ydwn = wrap_y(gy+1,ny);
 
-  const int cell = gy * ng + gx;
+  const int lc = gy*ng+xl, rc = gy*ng+xr;
+  const int uc = yu*ng+gx, dc = ydwn*ng+gx;
 
-  const int mx = idx_mx(cell, ncell);
-  const int my = idx_my(cell, ncell);
-  const int mz = idx_mz(cell, ncell);
+  const sunrealtype m1 = y[mx], m2 = y[my], m3 = y[mz];
 
-  const int xl   = wrap_x(gx - 1, ng);
-  const int xr   = wrap_x(gx + 1, ng);
-  const int yu   = wrap_y(gy - 1, ny);
-  const int ydwn = wrap_y(gy + 1, ny);
+  const int lx=idx_mx(lc,ncell), rx=idx_mx(rc,ncell);
+  const int ux=idx_mx(uc,ncell), dx=idx_mx(dc,ncell);
+  const int ly=idx_my(lc,ncell), ry=idx_my(rc,ncell);
+  const int uy=idx_my(uc,ncell), dy=idx_my(dc,ncell);
+  const int lz=idx_mz(lc,ncell), rz=idx_mz(rc,ncell);
+  const int uz=idx_mz(uc,ncell), dz=idx_mz(dc,ncell);
 
-  const int left_cell  = gy * ng + xl;
-  const int right_cell = gy * ng + xr;
-  const int up_cell    = yu * ng + gx;
-  const int down_cell  = ydwn * ng + gx;
-
-  const sunrealtype m1 = y[mx];
-  const sunrealtype m2 = y[my];
-  const sunrealtype m3 = y[mz];
-
-  const int lx = idx_mx(left_cell,  ncell);
-  const int rx = idx_mx(right_cell, ncell);
-  const int ux = idx_mx(up_cell,    ncell);
-  const int dx = idx_mx(down_cell,  ncell);
-
-  const int ly = idx_my(left_cell,  ncell);
-  const int ry = idx_my(right_cell, ncell);
-  const int uy = idx_my(up_cell,    ncell);
-  const int dy = idx_my(down_cell,  ncell);
-
-  const int lz = idx_mz(left_cell,  ncell);
-  const int rz = idx_mz(right_cell, ncell);
-  const int uz = idx_mz(up_cell,    ncell);
-  const int dz = idx_mz(down_cell,  ncell);
-
-  /*
-   * h1: exchange + x-axis anisotropy (self: c_chk*m1) + DMI/chb on x neighbors
-   * h2: exchange only
-   * h3: exchange only
-   * Note: c_msk[0]=1, c_msk[1]=c_msk[2]=0
-   *       c_nsk[0]=1, c_nsk[1]=c_nsk[2]=0
-   */
+  /* h1: exchange + anisotropic chb (x-neighbors only) + x-anisotropy self */
   const sunrealtype h1 =
-      c_che * (y[lx] + y[rx] + y[ux] + y[dx]) +
-      c_msk[0] * (c_chk * m1 + c_cha) +
-      c_chb * c_nsk[0] * (y[lx] + y[rx]);
+      c_che*(y[lx]+y[rx]+y[ux]+y[dx]) +
+      c_msk[0]*(c_chk*m1+c_cha) +
+      c_chb*c_nsk[0]*(y[lx]+y[rx]);
 
+  /* h2: isotropic exchange only (c_msk[1]=0, c_nsk[1]=0) */
   const sunrealtype h2 =
-      c_che * (y[ly] + y[ry] + y[uy] + y[dy]) +
-      c_msk[1] * (c_chk * m1 + c_cha) +
-      c_chb * c_nsk[1] * (y[ly] + y[ry]);
+      c_che*(y[ly]+y[ry]+y[uy]+y[dy]) +
+      c_msk[1]*(c_chk*m1+c_cha) +
+      c_chb*c_nsk[1]*(y[ly]+y[ry]);
 
+  /* h3: isotropic exchange only (c_msk[2]=0, c_nsk[2]=0) */
   const sunrealtype h3 =
-      c_che * (y[lz] + y[rz] + y[uz] + y[dz]) +
-      c_msk[2] * (c_chk * m1 + c_cha) +
-      c_chb * c_nsk[2] * (y[lz] + y[rz]);
+      c_che*(y[lz]+y[rz]+y[uz]+y[dz]) +
+      c_msk[2]*(c_chk*m1+c_cha) +
+      c_chb*c_nsk[2]*(y[lz]+y[rz]);
 
-  const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
+  const sunrealtype mh = m1*h1+m2*h2+m3*h3;
 
-  yd[mx] = c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1);
-  yd[my] = c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2);
-  yd[mz] = c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3);
+  yd[mx] = c_chg*(m3*h2-m2*h3) + c_alpha*(h1-mh*m1);
+  yd[my] = c_chg*(m1*h3-m3*h1) + c_alpha*(h2-mh*m2);
+  yd[mz] = c_chg*(m2*h1-m1*h2) + c_alpha*(h3-mh*m3);
 }
 
-/*
- * demag_correction_kernel
- *
- * Adds the LLG contribution of h_dmag to ydot:
- *   ydot += γ(m × h_dmag) + α(h_dmag - (m·h_dmag)·m)
- */
 __global__ static void demag_correction_kernel(
     const sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ hd,
     sunrealtype*       __restrict__ ydot,
     int ncell)
 {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= ncell) return;
-
-    const sunrealtype m1 = y[c],        m2 = y[ncell+c],    m3 = y[2*ncell+c];
-    const sunrealtype h1 = hd[c],       h2 = hd[ncell+c],   h3 = hd[2*ncell+c];
-    const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
-
-    ydot[c]          += c_chg*(m3*h2 - m2*h3) + c_alpha*(h1 - mh*m1);
-    ydot[ncell+c]    += c_chg*(m1*h3 - m3*h1) + c_alpha*(h2 - mh*m2);
-    ydot[2*ncell+c]  += c_chg*(m2*h1 - m1*h2) + c_alpha*(h3 - mh*m3);
+  const int c = blockIdx.x*blockDim.x+threadIdx.x;
+  if (c>=ncell) return;
+  const sunrealtype m1=y[c],m2=y[ncell+c],m3=y[2*ncell+c];
+  const sunrealtype h1=hd[c],h2=hd[ncell+c],h3=hd[2*ncell+c];
+  const sunrealtype mh=m1*h1+m2*h2+m3*h3;
+  ydot[c]         += c_chg*(m3*h2-m2*h3)+c_alpha*(h1-mh*m1);
+  ydot[ncell+c]   += c_chg*(m1*h3-m3*h1)+c_alpha*(h2-mh*m2);
+  ydot[2*ncell+c] += c_chg*(m2*h1-m1*h2)+c_alpha*(h3-mh*m3);
 }
 
-/*
- * RHS wrapper for CVODE
- *
- * Step 1: exchange + anisotropy kernel
- * Step 2: demag field via FFT convolution
- *         h_dmag = IFFT[ N̂(k) · M̂(k) ]
- *         ydot  += LLG(m, h_dmag)
- */
 static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   (void)t;
+  UserData* ud = (UserData*)user_data;
+  sunrealtype* yd  = N_VGetDeviceArrayPointer_Cuda(y);
+  sunrealtype* ydt = N_VGetDeviceArrayPointer_Cuda(ydot);
 
-  UserData* udata = (UserData*)user_data;
-  sunrealtype* ydata    = N_VGetDeviceArrayPointer_Cuda(y);
-  sunrealtype* ydotdata = N_VGetDeviceArrayPointer_Cuda(ydot);
+  dim3 block(BLOCK_X,BLOCK_Y);
+  dim3 grid((ud->ng+block.x-1)/block.x,(ud->ny+block.y-1)/block.y);
+  f_kernel_group_soa_periodic<<<grid,block>>>(yd,ydt,ud->ng,ud->ny,ud->ncell);
 
-  if (BLOCK_X * BLOCK_Y > 1024) {
-    fprintf(stderr, "Invalid block size: BLOCK_X * BLOCK_Y = %d > 1024\n",
-            BLOCK_X * BLOCK_Y);
+  if (ud->demag && DEMAG_STRENGTH>0.0) {
+    cudaMemsetAsync(ud->d_hdmag,0,(size_t)3*ud->ncell*sizeof(sunrealtype),0);
+    Demag_Apply(ud->demag,(const double*)yd,(double*)ud->d_hdmag);
+    const int b=256,g=(ud->ncell+b-1)/b;
+    demag_correction_kernel<<<g,b>>>(yd,ud->d_hdmag,ydt,ud->ncell);
+  }
+  if (cudaPeekAtLastError()!=cudaSuccess) {
+    fprintf(stderr,"kernel launch error: %s\n",cudaGetErrorString(cudaPeekAtLastError()));
     return -1;
   }
-
-  /* Step 1: exchange + anisotropy */
-  dim3 block(BLOCK_X, BLOCK_Y);
-  dim3 grid((udata->ng + block.x - 1) / block.x,
-            (udata->ny + block.y - 1) / block.y);
-
-  f_kernel_group_soa_periodic<<<grid, block>>>(
-      ydata, ydotdata, udata->ng, udata->ny, udata->ncell);
-
-  /* Step 2: demag (only when enabled) */
-  if (udata->demag && DEMAG_STRENGTH > 0.0) {
-    cudaMemsetAsync(udata->d_hdmag, 0,
-                    (size_t)3 * udata->ncell * sizeof(sunrealtype), 0);
-
-    Demag_Apply(udata->demag,
-                (const double*)ydata,
-                (double*)udata->d_hdmag);
-
-    const int b = 256, g = (udata->ncell + b - 1) / b;
-    demag_correction_kernel<<<g, b>>>(ydata, udata->d_hdmag,
-                                      ydotdata, udata->ncell);
-  }
-
-  cudaError_t cuerr = cudaPeekAtLastError();
-  if (cuerr != cudaSuccess) {
-    fprintf(stderr, ">>> ERROR in f: kernel launch failed: %s\n",
-            cudaGetErrorString(cuerr));
-    return -1;
-  }
-
   return 0;
 }
 
-/* final stats */
 static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
   (void)LS;
-
-  long int nst, nfe, nsetups, nni, ncfn, netf, nge, nli, nlcf, njvevals;
-
-  CVodeGetNumSteps(cvode_mem, &nst);
-  CVodeGetNumRhsEvals(cvode_mem, &nfe);
-  CVodeGetNumLinSolvSetups(cvode_mem, &nsetups);
-  CVodeGetNumErrTestFails(cvode_mem, &netf);
-  CVodeGetNumNonlinSolvIters(cvode_mem, &nni);
-  CVodeGetNumNonlinSolvConvFails(cvode_mem, &ncfn);
-  CVodeGetNumGEvals(cvode_mem, &nge);
-  CVodeGetNumLinIters(cvode_mem, &nli);
-  CVodeGetNumLinConvFails(cvode_mem, &nlcf);
-  CVodeGetNumJtimesEvals(cvode_mem, &njvevals);
-
+  long int nst,nfe,nsetups,nni,ncfn,netf,nge,nli,nlcf,njv;
+  CVodeGetNumSteps(cvode_mem,&nst);
+  CVodeGetNumRhsEvals(cvode_mem,&nfe);
+  CVodeGetNumLinSolvSetups(cvode_mem,&nsetups);
+  CVodeGetNumErrTestFails(cvode_mem,&netf);
+  CVodeGetNumNonlinSolvIters(cvode_mem,&nni);
+  CVodeGetNumNonlinSolvConvFails(cvode_mem,&ncfn);
+  CVodeGetNumGEvals(cvode_mem,&nge);
+  CVodeGetNumLinIters(cvode_mem,&nli);
+  CVodeGetNumLinConvFails(cvode_mem,&nlcf);
+  CVodeGetNumJtimesEvals(cvode_mem,&njv);
   printf("\nFinal Statistics:\n");
-  printf("nst = %-6ld nfe  = %-6ld nsetups = %-6ld ", nst, nfe, nsetups);
-  printf("nni = %-6ld ncfn = %-6ld netf = %-6ld nge = %ld\n",
-         nni, ncfn, netf, nge);
-  printf("nli = %-6ld nlcf = %-6ld njvevals = %ld\n", nli, nlcf, njvevals);
+  printf("nst=%-6ld nfe=%-6ld nsetups=%-6ld nni=%-6ld ncfn=%-6ld netf=%-6ld nge=%ld\n",
+         nst,nfe,nsetups,nni,ncfn,netf,nge);
+  printf("nli=%-6ld nlcf=%-6ld njv=%ld\n",nli,nlcf,njv);
 }
 
 #if ENABLE_OUTPUT
-static void WriteFrame(FILE* fp,
-                       sunrealtype t,
-                       int nx, int ny, int ng, int ncell,
-                       N_Vector y) {
+static void WriteFrame(FILE* fp, sunrealtype t,
+                       int nx, int ny, int ng, int ncell, N_Vector y) {
   N_VCopyFromDevice_Cuda(y);
-  sunrealtype* ydata = N_VGetHostArrayPointer_Cuda(y);
-
-  fprintf(fp, "%f %d %d\n", (double)t, nx, ny);
-  for (int jp = 0; jp < ny; jp++) {
-    for (int ip = 0; ip < ng; ip++) {
-      int cell_out = jp * ng + ip;
-      fprintf(fp, "%f %f %f\n",
-              (double)ydata[idx_mx(cell_out, ncell)],
-              (double)ydata[idx_my(cell_out, ncell)],
-              (double)ydata[idx_mz(cell_out, ncell)]);
+  sunrealtype* d = N_VGetHostArrayPointer_Cuda(y);
+  fprintf(fp,"%f %d %d\n",(double)t,nx,ny);
+  for (int jp=0;jp<ny;jp++)
+    for (int ip=0;ip<ng;ip++) {
+      int c=jp*ng+ip;
+      fprintf(fp,"%f %f %f\n",
+        (double)d[idx_mx(c,ncell)],
+        (double)d[idx_my(c,ncell)],
+        (double)d[idx_mz(c,ncell)]);
     }
-  }
-  fprintf(fp, "\n");
+  fprintf(fp,"\n");
 }
-
 static int ShouldWriteFrame(long int iout, sunrealtype t) {
-  if (t <= SUN_RCONST(EARLY_SAVE_UNTIL)) {
-    return (iout % EARLY_SAVE_EVERY) == 0;
-  } else {
-    return (iout % LATE_SAVE_EVERY) == 0;
-  }
+  if (t<=SUN_RCONST(EARLY_SAVE_UNTIL)) return (iout%EARLY_SAVE_EVERY)==0;
+  return (iout%LATE_SAVE_EVERY)==0;
 }
 #endif
 
 int main(int argc, char* argv[]) {
-  (void)argc;
-  (void)argv;
+  (void)argc;(void)argv;
 
-  SUNContext sunctx = NULL;
-  sunrealtype *ydata = NULL, *abstol_data = NULL;
-  sunrealtype t = T0, tout = T1;
-  sunrealtype ttotal = SUN_RCONST(T_TOTAL);
-
-  N_Vector y = NULL, abstol = NULL;
-  SUNLinearSolver LS = NULL;
-  SUNNonlinearSolver NLS = NULL;
-  void* cvode_mem = NULL;
-
+  SUNContext sunctx=NULL;
+  sunrealtype *ydata=NULL,*abstol_data=NULL;
+  sunrealtype t=T0,tout=T1,ttotal=SUN_RCONST(T_TOTAL);
+  N_Vector y=NULL,abstol=NULL;
+  SUNLinearSolver LS=NULL;
+  SUNNonlinearSolver NLS=NULL;
+  void* cvode_mem=NULL;
   int retval;
-  long int iout, NOUT;
+  long int iout,NOUT;
   UserData udata;
-  memset(&udata, 0, sizeof(udata));
-
+  memset(&udata,0,sizeof(udata));
   int cell;
+  cudaEvent_t start,stop;
+  float elapsed=0.0f;
 
-  cudaEvent_t start, stop;
-  float elapsedTime = 0.0f;
-
-  /* problem size */
-  const int nx = 600;
-  const int ny = 128;
-
-  if (nx % GROUPSIZE != 0) {
-    fprintf(stderr, "nx must be a multiple of GROUPSIZE=%d\n", GROUPSIZE);
-    return 1;
-  }
-
-  const int ng    = nx / GROUPSIZE;
-  const int ncell = ng * ny;
-  const int neq   = 3 * ncell;
+  const int nx=600,ny=128;
+  if (nx%GROUPSIZE!=0){fprintf(stderr,"nx not multiple of GROUPSIZE\n");return 1;}
+  const int ng=nx/GROUPSIZE, ncell=ng*ny, neq=3*ncell;
 
 #if ENABLE_OUTPUT
-  FILE* fp = fopen("output.txt", "w");
-  if (fp == NULL) {
-    fprintf(stderr, "Error opening output file.\n");
-    return 1;
-  }
-  setvbuf(fp, NULL, _IOFBF, 1 << 20);
+  FILE* fp=fopen("output.txt","w");
+  if(!fp){fprintf(stderr,"Error opening output file\n");return 1;}
+  setvbuf(fp,NULL,_IOFBF,1<<20);
 #else
-  FILE* fp = NULL; (void)fp;
+  FILE* fp=NULL;(void)fp;
 #endif
 
-  /* fill user data */
-  udata.nx    = nx;
-  udata.ny    = ny;
-  udata.ng    = ng;
-  udata.ncell = ncell;
-  udata.neq   = neq;
-  udata.pd    = NULL;
-  udata.demag = NULL;
-  udata.d_hdmag = NULL;
+  udata.nx=nx;udata.ny=ny;udata.ng=ng;udata.ncell=ncell;udata.neq=neq;
 
-  CHECK_SUNDIALS(SUNContext_Create(SUN_COMM_NULL, &sunctx));
+  CHECK_SUNDIALS(SUNContext_Create(SUN_COMM_NULL,&sunctx));
+  udata.pd=Precond_Create(ng,ny,ncell);
+  if(!udata.pd){fprintf(stderr,"Precond_Create failed\n");return 1;}
 
-  /* 3x3 block Jacobi preconditioner */
-  udata.pd = Precond_Create(ng, ny, ncell);
-  if (!udata.pd) { fprintf(stderr, "Precond_Create failed\n"); return 1; }
-
-  /* FFT demag ( Newell tensor) */
-  const double dstr = (double)DEMAG_STRENGTH;
-  const double dthk = (double)DEMAG_THICK;
-  if (dstr > 0.0) {
-    udata.demag = Demag_Init(ng, ny, dthk, dstr);
-    if (!udata.demag) {
-      fprintf(stderr, "Demag_Init failed\n");
-      Precond_Destroy(udata.pd);
-      return 1;
-    }
-    CHECK_CUDA(cudaMalloc((void**)&udata.d_hdmag,
-                          (size_t)3 * ncell * sizeof(sunrealtype)));
+  const double dstr=(double)DEMAG_STRENGTH,dthk=(double)DEMAG_THICK;
+  if(dstr>0.0){
+    udata.demag=Demag_Init(ng,ny,dthk,dstr);
+    if(!udata.demag){fprintf(stderr,"Demag_Init failed\n");Precond_Destroy(udata.pd);return 1;}
+    CHECK_CUDA(cudaMalloc((void**)&udata.d_hdmag,(size_t)3*ncell*sizeof(sunrealtype)));
   }
 
-  y      = N_VNew_Cuda(neq, sunctx);
-  abstol = N_VNew_Cuda(neq, sunctx);
-  if (y == NULL || abstol == NULL) {
-    fprintf(stderr, "Failed to allocate N_Vector_Cuda objects.\n");
-    goto cleanup;
-  }
-
+  y=N_VNew_Cuda(neq,sunctx);
+  abstol=N_VNew_Cuda(neq,sunctx);
+  if(!y||!abstol){fprintf(stderr,"N_VNew_Cuda failed\n");goto cleanup;}
   FusedNVec_Init(y);
 
-  ydata       = N_VGetHostArrayPointer_Cuda(y);
-  abstol_data = N_VGetHostArrayPointer_Cuda(abstol);
-  if (ydata == NULL || abstol_data == NULL) {
-    fprintf(stderr, "Failed to get host array pointers from N_Vector_Cuda.\n");
-    goto cleanup;
-  }
+  ydata=N_VGetHostArrayPointer_Cuda(y);
+  abstol_data=N_VGetHostArrayPointer_Cuda(abstol);
+  if(!ydata||!abstol_data){fprintf(stderr,"host pointer failed\n");goto cleanup;}
 
   /*
-   * Initialize y — head-on transition along x:
+   * Initial condition — in-plane Neel-wall head-on transition
    *
-   *   mx = -1  for i < ng/4
-   *   mx = +1  for ng/4 <= i < 3*ng/4
-   *   mx = -1  for i >= 3*ng/4
-   *   my = mz = 0 everywhere
+   * phi(x) = pi * (1 - 0.5*(tanh((x-x1)/w) - tanh((x-x2)/w)))
    *
-   * Profile: mx(x) = tanh((x - x1)/w) * (-tanh((x - x2)/w))
+   * where x1=ng/4, x2=3*ng/4, w=WALL_WIDTH_FRAC*ng
    *
-   *   x < x1:        tanh → -1, -tanh → +1  →  mx = -1  ✓
-   *   x1 < x < x2:   tanh → +1, -tanh → +1  →  mx = +1  ✓
-   *   x > x2:        tanh → +1, -tanh → -1  →  mx = -1  ✓
+   * mx = cos(phi),  my = sin(phi),  mz = 0
    *
-   * where x1 = ng/4, x2 = 3*ng/4, w = WALL_WIDTH_FRAC * ng.
+   * Verification:
+   *   far left  (x<<x1):  tanh1→-1, tanh2→-1  → phi=pi*(1-0)=pi   → mx=-1, my=0  ✓
+   *   far right (x>>x2):  tanh1→+1, tanh2→+1  → phi=pi*(1-0)=pi   → mx=-1, my=0  ✓
+   *   middle   (x1<x<x2): tanh1→+1, tanh2→-1  → phi=pi*(1-1)=0    → mx=+1, my=0  ✓
+   *   at x=x1:            tanh1→0,  tanh2→-1  → phi=pi*(1-0.5)=pi/2 → mx=0, my=1  (wall)
+   *   at x=x2:            tanh1→+1, tanh2→0   → phi=pi*(1-0.5)=pi/2 → mx=0, my=1  (wall)
+   *
+   * The wall rotates through +y (Neel wall).
+   * Professor's formula: my=sin(theta), mx=sqrt(1-my^2) = |cos(phi)|.
+   * Here we use the signed cos(phi) to properly handle the sign of mx.
    */
   {
-    const double x1 = 0.25 * (double)ng;
-    const double x2 = 0.75 * (double)ng;
-    const double w  = fmax(1.0, (double)WALL_WIDTH_FRAC * (double)ng);
+    const double x1 = 0.25*(double)ng;
+    const double x2 = 0.75*(double)ng;
+    const double w  = fmax(1.0, (double)WALL_WIDTH_FRAC*(double)ng);
 
-    for (int j = 0; j < ny; j++) {
-      for (int i = 0; i < ng; i++) {
-        cell = j * ng + i;
-
-        const int imx = idx_mx(cell, ncell);
-        const int imy = idx_my(cell, ncell);
-        const int imz = idx_mz(cell, ncell);
+    for (int j=0;j<ny;j++) {
+      for (int i=0;i<ng;i++) {
+        cell = j*ng+i;
+        const int imx=idx_mx(cell,ncell);
+        const int imy=idx_my(cell,ncell);
+        const int imz=idx_mz(cell,ncell);
 
         const double xi = (double)i;
-        const double t1 = tanh((xi - x1) / w);
-        const double t2 = tanh((xi - x2) / w);
+        const double t1 = tanh((xi-x1)/w);
+        const double t2 = tanh((xi-x2)/w);
 
-        /* mx: -1 | +1 | -1 with smooth tanh walls */
-        double mx0 = t1 * (-t2);
+        /* phi: pi on outside, 0 in middle */
+        const double phi = M_PI*(1.0 - 0.5*(t1-t2));
 
-        /* clamp to [-1, 1] for safety */
-        if (mx0 >  1.0) mx0 =  1.0;
-        if (mx0 < -1.0) mx0 = -1.0;
+        const double mx0 = cos(phi);   /* -1 outside, +1 middle */
+        const double my0 = sin(phi);   /* 0 outside, peaks ±1 at walls */
+        /* mz = 0 exactly */
 
         ydata[imx] = SUN_RCONST(mx0);
-        ydata[imy] = SUN_RCONST(0.0);
+        ydata[imy] = SUN_RCONST(my0);
         ydata[imz] = SUN_RCONST(0.0);
 
-        abstol_data[imx] = ATOL1;
-        abstol_data[imy] = ATOL2;
-        abstol_data[imz] = ATOL3;
+        abstol_data[imx]=ATOL1;
+        abstol_data[imy]=ATOL2;
+        abstol_data[imz]=ATOL3;
       }
     }
   }
@@ -572,109 +427,81 @@ int main(int argc, char* argv[]) {
   N_VCopyToDevice_Cuda(abstol);
 
 #if ENABLE_OUTPUT
-  WriteFrame(fp, T0, nx, ny, ng, ncell, y);
+  WriteFrame(fp,T0,nx,ny,ng,ncell,y);
 #endif
 
-  cvode_mem = CVodeCreate(CV_BDF, sunctx);
-  if (cvode_mem == NULL) {
-    fprintf(stderr, "CVodeCreate failed.\n");
-    goto cleanup;
-  }
+  cvode_mem=CVodeCreate(CV_BDF,sunctx);
+  if(!cvode_mem){fprintf(stderr,"CVodeCreate failed\n");goto cleanup;}
 
-  CHECK_SUNDIALS(CVodeInit(cvode_mem, f, T0, y));
-  CHECK_SUNDIALS(CVodeSetUserData(cvode_mem, &udata));
-  CHECK_SUNDIALS(CVodeSVtolerances(cvode_mem, RTOL, abstol));
+  CHECK_SUNDIALS(CVodeInit(cvode_mem,f,T0,y));
+  CHECK_SUNDIALS(CVodeSetUserData(cvode_mem,&udata));
+  CHECK_SUNDIALS(CVodeSVtolerances(cvode_mem,RTOL,abstol));
 
-  NLS = SUNNonlinSol_Newton(y, sunctx);
-  if (NLS == NULL) {
-    fprintf(stderr, "SUNNonlinSol_Newton failed.\n");
-    goto cleanup;
-  }
-  CHECK_SUNDIALS(CVodeSetNonlinearSolver(cvode_mem, NLS));
+  NLS=SUNNonlinSol_Newton(y,sunctx);
+  if(!NLS){fprintf(stderr,"SUNNonlinSol_Newton failed\n");goto cleanup;}
+  CHECK_SUNDIALS(CVodeSetNonlinearSolver(cvode_mem,NLS));
 
-  LS = SUNLinSol_SPGMR(y, SUN_PREC_LEFT, KRYLOV_DIM, sunctx);
-  if (LS == NULL) {
-    fprintf(stderr, "SUNLinSol_SPGMR failed.\n");
-    goto cleanup;
-  }
-  CHECK_SUNDIALS(CVodeSetLinearSolver(cvode_mem, LS, NULL));
-  CHECK_SUNDIALS(CVodeSetJacTimes(cvode_mem, NULL, JtvProduct));
-  CHECK_SUNDIALS(CVodeSetPreconditioner(cvode_mem, PrecondSetup, PrecondSolve));
+  LS=SUNLinSol_SPGMR(y,SUN_PREC_LEFT,KRYLOV_DIM,sunctx);
+  if(!LS){fprintf(stderr,"SUNLinSol_SPGMR failed\n");goto cleanup;}
+  CHECK_SUNDIALS(CVodeSetLinearSolver(cvode_mem,LS,NULL));
+  CHECK_SUNDIALS(CVodeSetJacTimes(cvode_mem,NULL,JtvProduct));
+  CHECK_SUNDIALS(CVodeSetPreconditioner(cvode_mem,PrecondSetup,PrecondSolve));
 
-  if (neq < 500000) {
-      CHECK_SUNDIALS(SUNLinSol_SPGMRSetGSType(LS, SUN_CLASSICAL_GS));
-      printf("GS type: Classical (overhead-limited, neq=%d)\n", neq);
+  if (neq<500000) {
+    CHECK_SUNDIALS(SUNLinSol_SPGMRSetGSType(LS,SUN_CLASSICAL_GS));
+    printf("GS type: Classical (neq=%d)\n",neq);
   } else {
-      printf("GS type: Modified  (bandwidth-limited, neq=%d)\n", neq);
+    printf("GS type: Modified  (neq=%d)\n",neq);
   }
+  CHECK_SUNDIALS(CVodeSetMaxOrd(cvode_mem,MAX_BDF_ORDER));
 
-  CHECK_SUNDIALS(CVodeSetMaxOrd(cvode_mem, MAX_BDF_ORDER));
-  printf("Max BDF order: %d   Krylov dim: %d\n", MAX_BDF_ORDER, KRYLOV_DIM);
-
-  printf("\n2D periodic head-on transition LLG + FFT Demag [Newell calt/ctt, Z2Z]\n\n");
-  printf("nx=%d  ny=%d  ng=%d  ncell=%d  neq=%d\n", nx, ny, ng, ncell, neq);
-  printf("periodic BC: x and y\n");
-  printf("anisotropy axis: x  (c_msk={1,0,0})\n");
-  printf("init: mx=-1|+1|-1  walls at ng/4=%.1f, 3*ng/4=%.1f  width=%.2f cells\n",
+  printf("\n2D LLG head-on transition (Neel wall, x-axis anisotropy)\n");
+  printf("nx=%d ny=%d ng=%d ncell=%d neq=%d\n",nx,ny,ng,ncell,neq);
+  printf("init: phi=pi*(1-0.5*(tanh1-tanh2)), mx=cos(phi), my=sin(phi), mz=0\n");
+  printf("      walls at x1=%.1f, x2=%.1f, width=%.2f cells\n",
          0.25*(double)ng, 0.75*(double)ng,
-         fmax(1.0, (double)WALL_WIDTH_FRAC * (double)ng));
-  printf("DEMAG_STRENGTH=%.4f  DEMAG_THICK=%.4f  (%s)\n",
-         dstr, dthk,
-         dstr > 0.0 ? "h_dmag=IFFT[N̂·M̂] via cuFFT Z2Z" : "disabled");
-  printf("T_TOTAL=%.2f  RTOL/ATOL=%.1e\n",
-         (double)T_TOTAL, (double)RTOL_VAL);
-#if ENABLE_OUTPUT
-  printf("EARLY_SAVE_UNTIL = %.2f\n", (double)EARLY_SAVE_UNTIL);
-  printf("EARLY_SAVE_EVERY = %d\n", EARLY_SAVE_EVERY);
-  printf("LATE_SAVE_EVERY  = %d\n", LATE_SAVE_EVERY);
-#endif
+         fmax(1.0,(double)WALL_WIDTH_FRAC*(double)ng));
+  printf("DEMAG_STRENGTH=%.4f DEMAG_THICK=%.4f\n",dstr,dthk);
+  printf("T_TOTAL=%.2f RTOL/ATOL=%.1e\n",(double)T_TOTAL,(double)RTOL_VAL);
 
-  NOUT = (long int)(ttotal / T1 + SUN_RCONST(0.5));
-  iout = 0;
-
+  NOUT=(long int)(ttotal/T1+SUN_RCONST(0.5));
+  iout=0;
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
-  CHECK_CUDA(cudaEventRecord(start, 0));
+  CHECK_CUDA(cudaEventRecord(start,0));
 
-  while (iout < NOUT) {
-    retval = CVode(cvode_mem, tout, y, &t, CV_NORMAL);
-    if (retval != CV_SUCCESS) {
-      fprintf(stderr, "CVode error at output %ld: retval = %d\n", iout, retval);
+  while (iout<NOUT) {
+    retval=CVode(cvode_mem,tout,y,&t,CV_NORMAL);
+    if(retval!=CV_SUCCESS){
+      fprintf(stderr,"CVode error at output %ld: retval=%d\n",iout,retval);
       break;
     }
-
 #if ENABLE_OUTPUT
-    if (ShouldWriteFrame(iout + 1, t)) {
-      WriteFrame(fp, t, nx, ny, ng, ncell, y);
-    }
+    if(ShouldWriteFrame(iout+1,t))
+      WriteFrame(fp,t,nx,ny,ng,ncell,y);
 #endif
-
-    iout++;
-    tout += T1;
+    iout++;tout+=T1;
   }
 
-  CHECK_CUDA(cudaEventRecord(stop, 0));
+  CHECK_CUDA(cudaEventRecord(stop,0));
   CHECK_CUDA(cudaEventSynchronize(stop));
-  CHECK_CUDA(cudaEventElapsedTime(&elapsedTime, start, stop));
-  printf("GPU simulation took %.3f ms\n", elapsedTime);
-
-  PrintFinalStats(cvode_mem, LS);
+  CHECK_CUDA(cudaEventElapsedTime(&elapsed,start,stop));
+  printf("GPU simulation took %.3f ms\n",elapsed);
+  PrintFinalStats(cvode_mem,LS);
 
 cleanup:
-  if (LS) SUNLinSolFree(LS);
-  if (NLS) SUNNonlinSolFree(NLS);
-  if (cvode_mem) CVodeFree(&cvode_mem);
-  if (y) N_VDestroy(y);
-  if (abstol) N_VDestroy(abstol);
-  if (sunctx) SUNContext_Free(&sunctx);
+  if(LS)        SUNLinSolFree(LS);
+  if(NLS)       SUNNonlinSolFree(NLS);
+  if(cvode_mem) CVodeFree(&cvode_mem);
+  if(y)         N_VDestroy(y);
+  if(abstol)    N_VDestroy(abstol);
+  if(sunctx)    SUNContext_Free(&sunctx);
   Precond_Destroy(udata.pd);
   Demag_Destroy(udata.demag);
-  if (udata.d_hdmag) cudaFree(udata.d_hdmag);
+  if(udata.d_hdmag) cudaFree(udata.d_hdmag);
   FusedNVec_FreePool();
-
 #if ENABLE_OUTPUT
-  if (fp) fclose(fp);
+  if(fp) fclose(fp);
 #endif
-
   return 0;
 }
