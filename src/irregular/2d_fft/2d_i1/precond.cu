@@ -1,5 +1,4 @@
 /*
-<<<<<<< HEAD
  * precond.cu — 3x3 Block-Diagonal Jacobi Preconditioner, x-axis anisotropy
  *
  * Constants must match 2d_fft.cu and jtv.cu:
@@ -23,17 +22,6 @@
  *   J[0][0] += alpha*c_chk             (from dH1/dm1 in damping)
  *   J[1][0] += -chg*c_chk*m3           (from d(m3*H1)/dm1 in gyro)
  *   J[2][0] += +chg*c_chk*m2           (from d(m2*H1)/dm1 in gyro)
-=======
- * precond.cu — 3×3 Block-Diagonal Jacobi, x-axis anisotropy
- *
- * ALL constants MUST match 2d_fft.cu and jtv.cu, including c_chb=0.3.
- *
- * H1 = (c_che+c_chb)*(m1_L+m1_R) + c_che*(m1_U+m1_D) + c_chk*m1
- * H2 = c_che*(all m2 neighbors)
- * H3 = c_che*(all m3 neighbors)
- *
- * d1 = H1 + c_chk*m1,  d2 = H2,  d3 = H3
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
  */
 
 #include "precond.h"
@@ -49,11 +37,7 @@ __constant__ sunrealtype pc_che   = 4.0;
 __constant__ sunrealtype pc_alpha = 0.2;
 __constant__ sunrealtype pc_chg   = 1.0;
 __constant__ sunrealtype pc_cha   = 0.0;
-<<<<<<< HEAD
 __constant__ sunrealtype pc_chb   = 0.3;
-=======
-__constant__ sunrealtype pc_chb   = 0.3;   /* MUST match 2d_fft.cu */
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
 
 __device__ static inline int pidx_mx(int c,int nc){return c;}
 __device__ static inline int pidx_my(int c,int nc){return nc+c;}
@@ -61,10 +45,7 @@ __device__ static inline int pidx_mz(int c,int nc){return 2*nc+c;}
 __device__ static inline int pwrap_x(int x,int ng){return(x<0)?(x+ng):((x>=ng)?(x-ng):x);}
 __device__ static inline int pwrap_y(int y,int ny){return(y<0)?(y+ny):((y>=ny)?(y-ny):y);}
 
-<<<<<<< HEAD
 /* Kernel 1: build J self-block per cell */
-=======
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
 __global__ static void build_J_kernel(
     const sunrealtype* __restrict__ y,
     sunrealtype*       __restrict__ d_J,
@@ -83,11 +64,7 @@ __global__ static void build_J_kernel(
   const int yu=pwrap_y(gy-1,ny),ydn=pwrap_y(gy+1,ny);
   const int lc=gy*ng+xl,rc=gy*ng+xr,uc=yu*ng+gx,dc=ydn*ng+gx;
 
-<<<<<<< HEAD
   const sunrealtype che_chb = pc_che + pc_chb;
-=======
-  const sunrealtype che_chb = pc_che + pc_chb;  /* 4.3 */
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
 
   const sunrealtype h1 =
       che_chb*(y[pidx_mx(lc,ncell)]+y[pidx_mx(rc,ncell)]) +
@@ -109,7 +86,6 @@ __global__ static void build_J_kernel(
   const sunrealtype d3 = h3;
 
   const int b=cell*9;
-<<<<<<< HEAD
 
   /* Row 0 */
   d_J[b+0] = pc_alpha*(pc_chk - d1*m1 - mh);
@@ -128,19 +104,6 @@ __global__ static void build_J_kernel(
 }
 
 /* Kernel 2: build P^-1 = (I - gamma*J)^-1 via Cramer's rule */
-=======
-  d_J[b+0] = pc_alpha*(-d1*m1-mh);
-  d_J[b+1] = -pc_chg*h3-pc_alpha*d2*m1;
-  d_J[b+2] =  pc_chg*h2-pc_alpha*d3*m1;
-  d_J[b+3] =  pc_chg*h3-pc_alpha*d1*m2;
-  d_J[b+4] = pc_alpha*(-d2*m2-mh);
-  d_J[b+5] = -pc_chg*h1-pc_alpha*d3*m2;
-  d_J[b+6] = -pc_chg*h2-pc_alpha*d1*m3;
-  d_J[b+7] =  pc_chg*h1-pc_alpha*d2*m3;
-  d_J[b+8] = pc_alpha*(-d3*m3-mh);
-}
-
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
 __global__ static void build_Pinv_kernel(
     const sunrealtype* __restrict__ d_J,
     sunrealtype gamma,
@@ -150,7 +113,6 @@ __global__ static void build_Pinv_kernel(
   const int cell=(int)(blockIdx.x*blockDim.x+threadIdx.x);
   if(cell>=ncell) return;
   const int b=cell*9;
-<<<<<<< HEAD
 
   const sunrealtype P00=1.0-gamma*d_J[b+0], P01=-gamma*d_J[b+1], P02=-gamma*d_J[b+2];
   const sunrealtype P10=-gamma*d_J[b+3],    P11=1.0-gamma*d_J[b+4], P12=-gamma*d_J[b+5];
@@ -161,13 +123,6 @@ __global__ static void build_Pinv_kernel(
                         + P02*(P10*P21-P11*P20);
   const sunrealtype id=(det!=0.0)?(1.0/det):1.0;
 
-=======
-  const sunrealtype P00=1.0-gamma*d_J[b+0],P01=-gamma*d_J[b+1],P02=-gamma*d_J[b+2];
-  const sunrealtype P10=-gamma*d_J[b+3],P11=1.0-gamma*d_J[b+4],P12=-gamma*d_J[b+5];
-  const sunrealtype P20=-gamma*d_J[b+6],P21=-gamma*d_J[b+7],P22=1.0-gamma*d_J[b+8];
-  const sunrealtype det=P00*(P11*P22-P12*P21)-P01*(P10*P22-P12*P20)+P02*(P10*P21-P11*P20);
-  const sunrealtype id=(det!=0.0)?(1.0/det):1.0;
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
   d_Pinv[b+0]= id*(P11*P22-P12*P21);
   d_Pinv[b+1]=-id*(P01*P22-P02*P21);
   d_Pinv[b+2]= id*(P01*P12-P02*P11);
@@ -179,10 +134,7 @@ __global__ static void build_Pinv_kernel(
   d_Pinv[b+8]= id*(P00*P11-P01*P10);
 }
 
-<<<<<<< HEAD
 /* Kernel 3: apply P^-1 to residual: z = P^-1 * r */
-=======
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
 __global__ static void psolve_kernel(
     const sunrealtype* __restrict__ r,
     sunrealtype*       __restrict__ z,
@@ -199,40 +151,38 @@ __global__ static void psolve_kernel(
   z[i2]=Pinv[b+6]*r0+Pinv[b+7]*r1+Pinv[b+8]*r2;
 }
 
-PrecondData* Precond_Create(int ng,int ny,int ncell)
+/* Public API */
+PrecondData* Precond_Create(int ng, int ny, int ncell)
 {
   PrecondData*pd=(PrecondData*)malloc(sizeof(PrecondData));
   if(!pd){fprintf(stderr,"precond: malloc failed\n");return NULL;}
-  pd->ng=ng;pd->ny=ny;pd->ncell=ncell;pd->last_gamma=0.0;
-  pd->d_J=NULL;pd->d_Pinv=NULL;
+  pd->ng=ng; pd->ny=ny; pd->ncell=ncell; pd->last_gamma=0.0;
+  pd->d_J=NULL; pd->d_Pinv=NULL;
+
   const size_t sz=(size_t)ncell*9*sizeof(sunrealtype);
   if(cudaMalloc((void**)&pd->d_J,sz)!=cudaSuccess||
      cudaMalloc((void**)&pd->d_Pinv,sz)!=cudaSuccess){
     fprintf(stderr,"precond: cudaMalloc failed\n");
-    Precond_Destroy(pd);return NULL;
+    Precond_Destroy(pd); return NULL;
   }
-<<<<<<< HEAD
   printf("[Precond] x-axis, c_chb=0.3, full c_chk cross-terms. %zu MB each.\n",
          sz/(1024*1024));
-=======
-  printf("[Precond] x-axis, c_chb=0.3. Storage: %zu MB each.\n",sz/(1024*1024));
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
   return pd;
 }
 
 void Precond_Destroy(PrecondData*pd)
 {
-  if(!pd)return;
-  if(pd->d_J)cudaFree(pd->d_J);
-  if(pd->d_Pinv)cudaFree(pd->d_Pinv);
+  if(!pd) return;
+  if(pd->d_J)    cudaFree(pd->d_J);
+  if(pd->d_Pinv) cudaFree(pd->d_Pinv);
   free(pd);
 }
 
-int PrecondSetup(sunrealtype t,N_Vector y,N_Vector fy,
-                 sunbooleantype jok,sunbooleantype*jcurPtr,
-                 sunrealtype gamma,void*user_data)
+int PrecondSetup(sunrealtype t,
+                 N_Vector y, N_Vector fy,
+                 sunbooleantype jok, sunbooleantype* jcurPtr,
+                 sunrealtype gamma, void* user_data)
 {
-<<<<<<< HEAD
   (void)t; (void)fy;
   PrecondData*pd=*(PrecondData**)user_data;
 
@@ -252,27 +202,10 @@ int PrecondSetup(sunrealtype t,N_Vector y,N_Vector fy,
   if(cudaPeekAtLastError()!=cudaSuccess){
     fprintf(stderr,"precond: build_Pinv failed\n"); return -1;}
 
-=======
-  (void)t;(void)fy;
-  PrecondData*pd=*(PrecondData**)user_data;
-  if(!jok){
-    const sunrealtype*yd=N_VGetDeviceArrayPointer_Cuda(y);
-    const dim3 b2(16,8),g2((pd->ng+15)/16,(pd->ny+7)/8);
-    build_J_kernel<<<g2,b2>>>(yd,pd->d_J,pd->ng,pd->ny,pd->ncell);
-    if(cudaPeekAtLastError()!=cudaSuccess){
-      fprintf(stderr,"precond: build_J failed\n");return -1;}
-    *jcurPtr=SUNTRUE;
-  } else *jcurPtr=SUNFALSE;
-  const int b1=256,g1=(pd->ncell+255)/256;
-  build_Pinv_kernel<<<g1,b1>>>(pd->d_J,gamma,pd->d_Pinv,pd->ncell);
-  if(cudaPeekAtLastError()!=cudaSuccess){
-    fprintf(stderr,"precond: build_Pinv failed\n");return -1;}
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
   pd->last_gamma=gamma;
   return 0;
 }
 
-<<<<<<< HEAD
 int PrecondSolve(sunrealtype t,
                  N_Vector y, N_Vector fy,
                  N_Vector r, N_Vector z,
@@ -286,19 +219,5 @@ int PrecondSolve(sunrealtype t,
                          pd->d_Pinv, pd->ncell);
   if(cudaPeekAtLastError()!=cudaSuccess){
     fprintf(stderr,"precond: psolve failed\n"); return -1;}
-=======
-int PrecondSolve(sunrealtype t,N_Vector y,N_Vector fy,
-                 N_Vector r,N_Vector z,
-                 sunrealtype gamma,sunrealtype delta,int lr,void*user_data)
-{
-  (void)t;(void)y;(void)fy;(void)gamma;(void)delta;(void)lr;
-  PrecondData*pd=*(PrecondData**)user_data;
-  const int b=256,g=(pd->ncell+255)/256;
-  psolve_kernel<<<g,b>>>(N_VGetDeviceArrayPointer_Cuda(r),
-                         N_VGetDeviceArrayPointer_Cuda(z),
-                         pd->d_Pinv,pd->ncell);
-  if(cudaPeekAtLastError()!=cudaSuccess){
-    fprintf(stderr,"precond: psolve failed\n");return -1;}
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
   return 0;
 }

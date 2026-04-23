@@ -1,5 +1,4 @@
 /*
-<<<<<<< HEAD
  * jtv.cu -- Analytic Jacobian-times-vector, x-axis anisotropy, with demag
  *
  * Constants match 2d_fft.cu:
@@ -15,19 +14,6 @@
  *
  * Demag (h_d linear in m): h_d(m+eps*v) = h_d(m) + eps*h_d(v)
  *   Compute hdv = h_d(v) via Demag_Apply, then add demag Jacobian to Jv.
-=======
- * jtv.cu — Analytic Jacobian-times-vector, x-axis anisotropy
- *
- * ALL constants MUST match 2d_fft.cu exactly, including c_chb=0.3.
- *
- * H1 = (c_che+c_chb)*(m1_L+m1_R) + c_che*(m1_U+m1_D) + c_chk*m1
- * H2 = c_che*(all m2 neighbors)
- * H3 = c_che*(all m3 neighbors)
- *
- * dH1 = (c_che+c_chb)*(v1_L+v1_R) + c_che*(v1_U+v1_D) + c_chk*v1
- * dH2 = c_che*(all v2 neighbors)
- * dH3 = c_che*(all v3 neighbors)
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
  */
 
 #include "jtv.h"
@@ -43,11 +29,7 @@ __constant__ sunrealtype jc_che   = 4.0;
 __constant__ sunrealtype jc_alpha = 0.2;
 __constant__ sunrealtype jc_chg   = 1.0;
 __constant__ sunrealtype jc_cha   = 0.0;
-<<<<<<< HEAD
 __constant__ sunrealtype jc_chb   = 0.3;
-=======
-__constant__ sunrealtype jc_chb   = 0.3;   /* MUST match 2d_fft.cu */
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
 
 __device__ static inline int jidx_mx(int c,int nc){return c;}
 __device__ static inline int jidx_my(int c,int nc){return nc+c;}
@@ -83,11 +65,7 @@ __global__ static void jtv_kernel(
   const sunrealtype v3L=v[jidx_mz(lc,ncell)],v3R=v[jidx_mz(rc,ncell)];
   const sunrealtype v3U=v[jidx_mz(uc,ncell)],v3D=v[jidx_mz(dc,ncell)];
 
-<<<<<<< HEAD
   const sunrealtype che_chb = jc_che + jc_chb;
-=======
-  const sunrealtype che_chb = jc_che + jc_chb;  /* 4.3 */
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
 
   const sunrealtype h1 =
       che_chb*(y[jidx_mx(lc,ncell)]+y[jidx_mx(rc,ncell)]) +
@@ -155,22 +133,16 @@ __global__ static void jtv_demag_kernel(
  *   48 : int neq
  */
 typedef struct {
-<<<<<<< HEAD
   void *pd_opaque;
   void *demag_opaque;
   void *d_hdmag_opaque;
   void *d_hdmag_v_opaque;
   int nx, ny, ng, ncell, neq;
-=======
-  void *pd_opaque,*demag_opaque,*d_hdmag_opaque;
-  int nx,ny,ng,ncell,neq;
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
 } JtvUserData;
 
-int JtvProduct(N_Vector v,N_Vector Jv,sunrealtype t,
-               N_Vector y,N_Vector fy,void*user_data,N_Vector tmp)
+int JtvProduct(N_Vector v, N_Vector Jv, sunrealtype t,
+               N_Vector y, N_Vector fy, void* user_data, N_Vector tmp)
 {
-<<<<<<< HEAD
   (void)t; (void)fy; (void)tmp;
   const JtvUserData* ud = (const JtvUserData*)user_data;
 
@@ -198,18 +170,6 @@ int JtvProduct(N_Vector v,N_Vector Jv,sunrealtype t,
 
   if (cudaPeekAtLastError() != cudaSuccess) {
     fprintf(stderr,"jtv failed: %s\n",cudaGetErrorString(cudaGetLastError()));
-=======
-  (void)t;(void)fy;(void)tmp;
-  const JtvUserData*ud=(const JtvUserData*)user_data;
-  const dim3 block(16,8),grid((ud->ng+15)/16,(ud->ny+7)/8);
-  jtv_kernel<<<grid,block>>>(
-      N_VGetDeviceArrayPointer_Cuda(y),
-      N_VGetDeviceArrayPointer_Cuda(v),
-      N_VGetDeviceArrayPointer_Cuda(Jv),
-      ud->ng,ud->ny,ud->ncell);
-  if(cudaPeekAtLastError()!=cudaSuccess){
-    fprintf(stderr,"jtv_kernel failed: %s\n",cudaGetErrorString(cudaGetLastError()));
->>>>>>> 5e1afd0e843c729c7f8997eab55c72923ae7dc15
     return -1;
   }
   return 0;
