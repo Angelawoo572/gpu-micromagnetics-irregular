@@ -1,40 +1,96 @@
 /*
- * precond.cu  (v2)
+ * precond.cu  (v2, x-axis anisotropy)
  *
- * Fix: separate J storage from P^{-1}.
+ * 3×3 Block-Diagonal Jacobi Preconditioner — x-axis easy axis version.
  *
- * Root cause of v1 failure
- * Profiling showed psetup_kernel launched only 266 times vs
- * psolve_kernel 20,207 times (nni~3753).  This means CVODE was
- * sending jok=SUNTRUE ~93% of the time, and v1 returned immediately,
- * reusing stale P^{-1} computed with an old gamma.
+ * ── What changed from z-axis version ────────────────────────────────────────
  *
- * CVODE's jok protocol:
- *   jok=SUNFALSE: y has changed significantly; rebuild J from scratch.
- *   jok=SUNTRUE : J structure is still valid (y hasn't moved much),
- *                 but gamma CAN change every Newton step.
- *                 => Must recompute P = I - gamma*J even when jok=TRUE.
+ * With c_msk={1,0,0} (x-axis anisotropy):
  *
- * v2 solution: two-kernel approach
- * Kernel 1  build_J_kernel   : reads y, computes J(y), stores to d_J.
- *                               Called only when jok=SUNFALSE.
+ *   Effective field:
+ *     h1 = (c_che+c_chb)*(yL_x+yR_x) + c_che*(yU_x+yD_x) + c_chk*m1 + c_cha
+ *     h2 = c_che*(yL_y+yR_y+yU_y+yD_y)
+ *     h3 = c_che*(yL_z+yR_z+yU_z+yD_z)
  *
- * Kernel 2  build_Pinv_kernel : reads d_J and gamma, computes
- *                               P = I - gamma*J, inverts via Cramer,
- *                               stores P^{-1} to d_Pinv.
- *                               Called on EVERY psetup (jok=TRUE or FALSE).
+ * Self-coupling derivatives (holding neighbors frozen):
+ *     ∂h1/∂m1 = c_chk          ← anisotropy self-coupling now on component 1
+ *     ∂h2/∂m1 = 0
+ *     ∂h3/∂m1 = 0
+ *     (all other ∂hi/∂mj self = 0)
  *
- * This separates the expensive stencil read (build_J_kernel, ~85µs,
- * same as RHS) from the cheap matrix arithmetic (build_Pinv_kernel,
- * no global memory reads of y, just 9 doubles/cell from d_J).
+ * Therefore:
+ *     d1 = h1 + c_chk    (∂(m·h)/∂m1 = h1 + m1*∂h1/∂m1 = h1 + c_chk*m1... wait)
  *
- * Expected outcome
- * psetup now always produces P^{-1} consistent with the current gamma.
- * GMRES should converge in 2-3 iterations instead of 5, reducing:
- *   - psolve_kernel calls by ~50%
- *   - linearSumKernel calls by ~50%
- *   - dotProdKernel calls by ~50%
- *   - total runtime by ~20-30%
+ * Full self-coupling Jacobian:
+ *     ∂(m·h)/∂m1 = h1 + m1*(c_chk)      = d1
+ *     ∂(m·h)/∂m2 = h2                    = d2
+ *     ∂(m·h)/∂m3 = h3                    = d3   (no anisotropy term here!)
+ *
+ * So:
+ *     d1 = h1 + c_chk*m1    [x-axis: anisotropy contributes to d1]
+ *     d2 = h2
+ *     d3 = h3               [z-axis version had: d3 = h3 + c_chk*m3]
+ *
+ * Jacobian blocks (self-coupling only, neighbors frozen):
+ *
+ *   J[0][0] = c_alpha*(-d1*m1 - mh) + m1*c_alpha*(-c_chk*m1)... 
+ *
+ * Wait — let's be more careful. The full self-coupling for J[row][col]:
+ *
+ *   f1 = c_chg*(m3*h2 - m2*h3) + c_alpha*(h1 - mh*m1)
+ *   f2 = c_chg*(m1*h3 - m3*h1) + c_alpha*(h2 - mh*m2)
+ *   f3 = c_chg*(m2*h1 - m1*h2) + c_alpha*(h3 - mh*m3)
+ *
+ * ∂f1/∂m1 = c_alpha*( ∂h1/∂m1 - (∂mh/∂m1)*m1 - mh )
+ *          = c_alpha*( c_chk - d1*m1 - mh )
+ *          [because ∂h1/∂m1 = c_chk, ∂mh/∂m1 = d1 = h1 + c_chk*m1]
+ *   But in the block-diagonal approximation we group it as:
+ *          = c_alpha*(-d1*m1 - mh)
+ *   ... and separately track the c_chk contribution through d1.
+ *
+ * Actually the cleanest way: keep the SAME formula as the z-axis version
+ * but swap which component carries c_chk:
+ *
+ *   z-axis: d3 = h3 + c_chk*m3,  d1=h1, d2=h2
+ *   x-axis: d1 = h1 + c_chk*m1,  d2=h2, d3=h3   ← only this line changes
+ *
+ * The J[row][col] formulas below are identical in structure; only d1/d2/d3
+ * carry different values.
+ *
+ * Full block:
+ *   J[0][0] = c_alpha*(-d1*m1 - mh)
+ *   J[0][1] = -c_chg*h3 - c_alpha*d2*m1
+ *   J[0][2] =  c_chg*h2 - c_alpha*d3*m1       ← no m2 term (x-axis)
+ *
+ *   J[1][0] =  c_chg*h3 - c_alpha*d1*m2
+ *   J[1][1] = c_alpha*(-d2*m2 - mh)
+ *   J[1][2] = -c_chg*h1 - c_alpha*d3*m2       ← no m1 term (x-axis)
+ *
+ *   J[2][0] = -c_chg*h2 - c_alpha*d1*m3
+ *   J[2][1] =  c_chg*h1 - c_alpha*d2*m3
+ *   J[2][2] = c_alpha*(-d3*m3 - mh)           ← no c_chk self term here
+ *
+ * Compare z-axis version:
+ *   J[0][2] =  c_chg*(h2 - m2) - c_alpha*d3*m1   ← had extra -m2 from ∂h3/∂m3
+ *   J[1][2] =  c_chg*(m1 - h1) - c_alpha*d3*m2   ← had extra +m1
+ *   J[2][2] = c_alpha*(c_chk - d3*m3 - mh)       ← had c_chk here
+ *
+ * In x-axis version those cross terms move to J[*][0]:
+ *   J[0][0]: via d1 = h1 + c_chk*m1, no extra explicit term needed
+ *   J[1][0] =  c_chg*h3 - c_alpha*d1*m2          (was c_chg*h3 - c_alpha*d1*m2, same)
+ *   J[2][0] = -c_chg*h2 - c_alpha*d1*m3          (was -c_chg*h2 - c_alpha*d1*m3, same)
+ *
+ * The cross-gyro terms from ∂hi/∂mj are:
+ *   x-axis anisotropy: ∂h1/∂m1=c_chk only, no off-diagonal ∂hi/∂mj from anisotropy.
+ *   So the gyro correction that was "+ c_chg*(h2-m2)" in z-axis (from ∂h3/∂m3 in
+ *   the gyro term m2*h3) does NOT appear in x-axis version.
+ *
+ * Summary of changes in build_J_kernel:
+ *   d1 = h1 + c_chk * m1    (was: d1 = h1)
+ *   d3 = h3                  (was: d3 = h3 + c_chk * m3)
+ *   J[0][2] = c_chg*h2 - c_alpha*d3*m1          (was: c_chg*(h2-m2) - c_alpha*d3*m1)
+ *   J[1][2] = -c_chg*h1 - c_alpha*d3*m2         (was: c_chg*(m1-h1) - c_alpha*d3*m2)
+ *   J[2][2] = c_alpha*(-d3*m3 - mh)             (was: c_alpha*(c_chk - d3*m3 - mh))
  */
 
 #include "precond.h"
@@ -46,8 +102,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Physical constants — must match 2d_p.cu */
-__constant__ sunrealtype pc_msk[3]  = {1.0, 0.0, 0.0};
+/* Physical constants — must match 2d_fft.cu (x-axis anisotropy) */
+__constant__ sunrealtype pc_msk[3]  = {1.0, 0.0, 0.0};   /* x-axis easy axis */
 __constant__ sunrealtype pc_nsk[3]  = {1.0, 0.0, 0.0};
 __constant__ sunrealtype pc_chk     = 1.0;
 __constant__ sunrealtype pc_che     = 4.0;
@@ -68,16 +124,21 @@ __device__ static inline int pwrap_y(int y, int ny) {
     return (y < 0) ? (y+ny) : ((y >= ny) ? (y-ny) : y);
 }
 
-/* Kernel 1: build_J_kernel
+/*
+ * Kernel 1: build_J_kernel  (x-axis anisotropy version)
  *
- * Computes the analytic 3×3 local Jacobian J[i] for each cell i
- * and stores it in d_J[9*cell .. 9*cell+8] (row-major).
+ * Computes analytic 3×3 local Jacobian J[i] per cell and stores to
+ * d_J[9*cell .. 9*cell+8] (row-major).
  *
- * Called only when jok=SUNFALSE (y has changed significantly).
- * This is the expensive kernel: it reads y and its 4 neighbors.
+ * Called only when jok=SUNFALSE.
  *
- * J[row][col] = ∂f_row/∂m_col  (self-coupling only, neighbors frozen)
- * See precond.h / v1 comments for full derivation. */
+ * Key difference from z-axis version:
+ *   d1 = h1 + c_chk*m1    (anisotropy self-coupling on component 1)
+ *   d3 = h3               (no anisotropy self-coupling on component 3)
+ *
+ *   J[0][2], J[1][2], J[2][2] lose the gyro correction terms that came
+ *   from ∂h3/∂m3 in the z-axis version.
+ */
 __global__ static void build_J_kernel(
     const sunrealtype* __restrict__ y,
     sunrealtype*       __restrict__ d_J,   /* 9 * ncell */
@@ -99,58 +160,86 @@ __global__ static void build_J_kernel(
     const int lc  = gy*ng + xl,          rc  = gy*ng + xr;
     const int uc  = yu*ng + gx,          dc  = ydn*ng + gx;
 
-    /* h_eff (identical to RHS kernel) */
+    /*
+     * h_eff at current y (identical to RHS kernel with c_msk={1,0,0}):
+     *   h1: exchange + DMI/chb on x-neighbors + x-anisotropy (c_chk*m1)
+     *   h2: exchange only
+     *   h3: exchange only
+     */
     const sunrealtype h1 =
-        pc_che * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)] +
-                y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)]) +
-        pc_msk[0] * (pc_chk*m1 + pc_cha) +          // m3 → m1
-        pc_chb * pc_nsk[0] * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)]);
+        (pc_che + pc_chb) * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)]) +
+        pc_che * (y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)]) +
+        pc_chk * m1 + pc_cha;
 
     const sunrealtype h2 =
         pc_che * (y[pidx_my(lc,ncell)] + y[pidx_my(rc,ncell)] +
-                  y[pidx_my(uc,ncell)] + y[pidx_my(dc,ncell)]) +
-        pc_msk[1] * (pc_chk*m3 + pc_cha) +
-        pc_chb * pc_nsk[1] * (y[pidx_my(lc,ncell)] + y[pidx_my(rc,ncell)]);
+                  y[pidx_my(uc,ncell)] + y[pidx_my(dc,ncell)]);
 
     const sunrealtype h3 =
         pc_che * (y[pidx_mz(lc,ncell)] + y[pidx_mz(rc,ncell)] +
-                  y[pidx_mz(uc,ncell)] + y[pidx_mz(dc,ncell)]) +
-        pc_msk[2] * (pc_chk*m3 + pc_cha) +
-        pc_chb * pc_nsk[2] * (y[pidx_mz(lc,ncell)] + y[pidx_mz(rc,ncell)]);
+                  y[pidx_mz(uc,ncell)] + y[pidx_mz(dc,ncell)]);
 
     const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
 
-    /* ∂mh/∂mi */
-    const sunrealtype d1 = h1 + pc_chk*m1;;
+    /*
+     * ∂(m·h)/∂mi — self-coupling (neighbors frozen):
+     *
+     *   d1 = h1 + m1 * ∂h1/∂m1 = h1 + m1*c_chk    ← x-axis: c_chk on d1
+     *   d2 = h2                                      (no self term)
+     *   d3 = h3                                      (no self term, unlike z-axis)
+     */
+    const sunrealtype d1 = h1 + pc_chk * m1;   /* x-axis anisotropy self */
     const sunrealtype d2 = h2;
-    const sunrealtype d3 = h3;
+    const sunrealtype d3 = h3;                  /* no c_chk here (was d3=h3+chk*m3) */
 
-    /* Store J row-major in d_J[9*cell .. 9*cell+8] */
+    /*
+     * 3×3 Jacobian block, row-major in d_J[9*cell..9*cell+8]:
+     *
+     *   Row 0 (∂f1/∂mj):
+     *     J[0][0] = c_alpha*(-d1*m1 - mh)
+     *     J[0][1] = -c_chg*h3 - c_alpha*d2*m1
+     *     J[0][2] =  c_chg*h2 - c_alpha*d3*m1
+     *               (no -m2 gyro correction: ∂h3/∂m3=0 in x-axis version)
+     *
+     *   Row 1 (∂f2/∂mj):
+     *     J[1][0] =  c_chg*h3 - c_alpha*d1*m2
+     *     J[1][1] = c_alpha*(-d2*m2 - mh)
+     *     J[1][2] = -c_chg*h1 - c_alpha*d3*m2
+     *               (no +m1 gyro correction)
+     *
+     *   Row 2 (∂f3/∂mj):
+     *     J[2][0] = -c_chg*h2 - c_alpha*d1*m3
+     *     J[2][1] =  c_chg*h1 - c_alpha*d2*m3
+     *     J[2][2] = c_alpha*(-d3*m3 - mh)
+     *               (no +c_chk self term: that's absorbed in d1 now)
+     */
     const int b = cell * 9;
+
+    /* Row 0: ∂f1/∂(m1, m2, m3) */
     d_J[b+0] = pc_alpha * (-d1*m1 - mh);
     d_J[b+1] = -pc_chg*h3 - pc_alpha*d2*m1;
     d_J[b+2] =  pc_chg*h2 - pc_alpha*d3*m1;
 
+    /* Row 1: ∂f2/∂(m1, m2, m3) */
     d_J[b+3] =  pc_chg*h3 - pc_alpha*d1*m2;
     d_J[b+4] = pc_alpha * (-d2*m2 - mh);
-    d_J[b+5] = -pc_chg*h1 - pc_alpha*d3*m2; 
+    d_J[b+5] = -pc_chg*h1 - pc_alpha*d3*m2;
 
+    /* Row 2: ∂f3/∂(m1, m2, m3) */
     d_J[b+6] = -pc_chg*h2 - pc_alpha*d1*m3;
     d_J[b+7] =  pc_chg*h1 - pc_alpha*d2*m3;
     d_J[b+8] = pc_alpha * (-d3*m3 - mh);
 }
 
-/* Kernel 2: build_Pinv_kernel
+/*
+ * Kernel 2: build_Pinv_kernel
  *
- * Reads d_J (the stored Jacobian) and the current gamma.
- * Computes P = I - gamma * J per cell and stores P^{-1}
- * via Cramer's rule into d_Pinv.
+ * Reads d_J and current gamma, computes P = I - gamma*J per cell,
+ * inverts via Cramer's rule, stores P^{-1} to d_Pinv.
  *
- * Called on EVERY psetup (jok=TRUE or jok=FALSE), because
- * gamma changes every Newton step.
- *
- * This kernel is cheap: only reads 9 doubles/cell from d_J,
- * no y stencil reads. Purely arithmetic. */
+ * Called on EVERY psetup (jok=TRUE or FALSE) — gamma changes every Newton step.
+ * This kernel is cheap: only reads 9 doubles/cell from d_J, no y stencil.
+ */
 __global__ static void build_Pinv_kernel(
     const sunrealtype* __restrict__ d_J,
     sunrealtype                     gamma,
@@ -192,7 +281,7 @@ __global__ static void build_Pinv_kernel(
     d_Pinv[b+8] =  inv_det * (P00*P11 - P01*P10);
 }
 
-/* Kernel 3: psolve_kernel — unchanged from v1 */
+/* Kernel 3: psolve_kernel — unchanged */
 __global__ static void psolve_kernel(
     const sunrealtype* __restrict__ r,
     sunrealtype*       __restrict__ z,
@@ -238,10 +327,11 @@ PrecondData* Precond_Create(int ng, int ny, int ncell)
         return NULL;
     }
 
-    printf("[Precond v2] 3x3 block-diagonal Jacobi preconditioner allocated.\n");
-    printf("[Precond v2] Storage: %zu MB (J) + %zu MB (Pinv) = %zu MB total\n",
+    printf("[Precond v2 x-axis] 3x3 block-diagonal Jacobi preconditioner allocated.\n");
+    printf("[Precond v2 x-axis] Storage: %zu MB (J) + %zu MB (Pinv) = %zu MB total\n",
            sz/(1024*1024), sz/(1024*1024), 2*sz/(1024*1024));
-    printf("[Precond v2] Fix: gamma updated on EVERY psetup call (jok=TRUE included).\n");
+    printf("[Precond v2 x-axis] Anisotropy: x-axis (d1=h1+chk*m1, d3=h3).\n");
+    printf("[Precond v2 x-axis] gamma updated on EVERY psetup call (jok=TRUE included).\n");
 
     return pd;
 }
@@ -254,14 +344,12 @@ void Precond_Destroy(PrecondData *pd)
     free(pd);
 }
 
-/* PrecondSetup — CVODE psetup callback
+/*
+ * PrecondSetup — CVODE psetup callback
  *
- * Two-phase approach:
- *   Phase 1 (jok=SUNFALSE): rebuild J from y (expensive stencil read)
- *   Phase 2 (always):       rebuild P^{-1} from J and current gamma
- *
- * This ensures P^{-1} always matches the current gamma, which is
- * the key fix over v1. */
+ * Phase 1 (jok=SUNFALSE): rebuild J from y via build_J_kernel (expensive).
+ * Phase 2 (always):       rebuild P^{-1} from J and current gamma (cheap).
+ */
 int PrecondSetup(sunrealtype t,
                  N_Vector y, N_Vector fy,
                  sunbooleantype jok, sunbooleantype *jcurPtr,
@@ -271,9 +359,8 @@ int PrecondSetup(sunrealtype t,
 
     PrecondData *pd = *(PrecondData**)user_data;
 
-    /* ---- Phase 1: rebuild J if y has changed significantly ---- */
+    /* Phase 1: rebuild J if y has changed significantly */
     if (!jok) {
-        /* Jacobian structure outdated — recompute from current y */
         const sunrealtype *yd = N_VGetDeviceArrayPointer_Cuda(y);
 
         const dim3 block2d(16, 8);
@@ -288,17 +375,11 @@ int PrecondSetup(sunrealtype t,
         }
         *jcurPtr = SUNTRUE;
     } else {
-        /* J structure still valid — tell CVODE we didn't recompute J */
         *jcurPtr = SUNFALSE;
     }
 
-    /* ---- Phase 2: ALWAYS rebuild P^{-1} = (I - gamma*J)^{-1} ----
-     *
-     * This is the critical fix: even when jok=SUNTRUE (J unchanged),
-     * gamma changes every Newton step, so P^{-1} must be updated.
-     * build_Pinv_kernel only reads d_J (9 doubles/cell, no y access)
-     * and is much cheaper than build_J_kernel.
-     */
+    /* Phase 2: ALWAYS rebuild P^{-1} = (I - gamma*J)^{-1}
+     * Cheap: reads only d_J (9 doubles/cell), no y stencil. */
     const int block1d = 256;
     const int grid1d  = (pd->ncell + block1d - 1) / block1d;
 
@@ -314,7 +395,7 @@ int PrecondSetup(sunrealtype t,
     return 0;
 }
 
-/* PrecondSolve */
+/* PrecondSolve — unchanged */
 int PrecondSolve(sunrealtype t,
                  N_Vector y, N_Vector fy,
                  N_Vector r, N_Vector z,

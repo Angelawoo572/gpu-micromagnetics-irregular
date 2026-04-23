@@ -1,7 +1,9 @@
 /*
  * jtv.cu  —  Analytic Jacobian-times-vector for the 2D periodic LLG solver.
  *
- * JtvUserData must mirror UserData from 2d_p.cu EXACTLY.
+ * x-axis anisotropy version (c_msk={1,0,0}, c_nsk={1,0,0})
+ *
+ * JtvUserData must mirror UserData from 2d_fft.cu EXACTLY.
  * Current UserData layout:
  *   PrecondData  *pd;        // +0  (8 bytes)
  *   DemagData    *demag;     // +8  (8 bytes)
@@ -11,6 +13,38 @@
  *   int ng;                  // +32
  *   int ncell;               // +36
  *   int neq;                 // +40
+ *
+ * ── Derivation (x-axis anisotropy) ──────────────────────────────────────────
+ *
+ * Effective field at cell i (with c_msk={1,0,0}, c_nsk={1,0,0}):
+ *
+ *   h1 = (c_che+c_chb)*(y1L+y1R) + c_che*(y1U+y1D) + c_chk*m1 + c_cha
+ *   h2 = c_che*(y2L+y2R+y2U+y2D)
+ *   h3 = c_che*(y3L+y3R+y3U+y3D)
+ *
+ * KEY DIFFERENCE from z-axis version:
+ *   - Anisotropy self-coupling is now in h1 via c_chk*m1  (not h3 via c_chk*m3)
+ *   - Therefore ∂h1/∂m1 gets the +c_chk term  (not ∂h3/∂m3)
+ *
+ * Perturbation (v is the Krylov vector, y is frozen):
+ *
+ *   dh1 = (c_che+c_chb)*(v1L+v1R) + c_che*(v1U+v1D) + c_chk*v1
+ *   dh2 = c_che*(v2L+v2R+v2U+v2D)
+ *   dh3 = c_che*(v3L+v3R+v3U+v3D)
+ *
+ * Note: dh1 has the anisotropy self-coupling c_chk*v1 (not dh3).
+ *
+ * LLG linearization:
+ *   d(m·h)/dt |_v = (v·h) + (m·dh)  ≡ dmh
+ *
+ *   (Jv)1 = c_chg*(v3*h2 + m3*dh2 - v2*h3 - m2*dh3)
+ *            + c_alpha*(dh1 - dmh*m1 - mh*v1)
+ *
+ *   (Jv)2 = c_chg*(v1*h3 + m1*dh3 - v3*h1 - m3*dh1)
+ *            + c_alpha*(dh2 - dmh*m2 - mh*v2)
+ *
+ *   (Jv)3 = c_chg*(v2*h1 + m2*dh1 - v1*h2 - m1*dh2)
+ *            + c_alpha*(dh3 - dmh*m3 - mh*v3)
  */
 
 #include "jtv.h"
@@ -21,9 +55,9 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-/* Physical constants — must match 2d_p.cu */
-__constant__ sunrealtype jc_msk[3]  = {1.0, 0.0, 0.0};
-__constant__ sunrealtype jc_nsk[3]  = {1.0, 0.0, 0.0};
+/* Physical constants — must match 2d_fft.cu (x-axis anisotropy) */
+__constant__ sunrealtype jc_msk[3]  = {1.0, 0.0, 0.0};   /* x-axis easy axis */
+__constant__ sunrealtype jc_nsk[3]  = {1.0, 0.0, 0.0};   /* DMI/chb along x  */
 __constant__ sunrealtype jc_chk     = 1.0;
 __constant__ sunrealtype jc_che     = 4.0;
 __constant__ sunrealtype jc_alpha   = 0.2;
@@ -65,6 +99,7 @@ __global__ static void jtv_kernel(
     const sunrealtype m1 = y[mx], m2 = y[my], m3 = y[mz];
     const sunrealtype v1 = v[mx], v2 = v[my], v3 = v[mz];
 
+    /* neighbor v values */
     const sunrealtype v1L=v[jidx_mx(lc,ncell)], v1R=v[jidx_mx(rc,ncell)];
     const sunrealtype v1U=v[jidx_mx(uc,ncell)], v1D=v[jidx_mx(dc,ncell)];
     const sunrealtype v2L=v[jidx_my(lc,ncell)], v2R=v[jidx_my(rc,ncell)];
@@ -72,36 +107,58 @@ __global__ static void jtv_kernel(
     const sunrealtype v3L=v[jidx_mz(lc,ncell)], v3R=v[jidx_mz(rc,ncell)];
     const sunrealtype v3U=v[jidx_mz(uc,ncell)], v3D=v[jidx_mz(dc,ncell)];
 
+    /*
+     * Effective field at current y (frozen):
+     *
+     *   h1: exchange + DMI/chb on x-neighbors + x-anisotropy self (c_chk*m1)
+     *   h2: exchange only
+     *   h3: exchange only
+     *
+     * With c_msk={1,0,0} and c_nsk={1,0,0}:
+     *   (c_che + c_chb) for x-neighbors of component 1
+     *   c_che           for y-neighbors of component 1
+     *   c_chk*m1        for anisotropy self-coupling (now on m1, not m3!)
+     */
     const sunrealtype che_chb = jc_che + jc_chb;
 
     const sunrealtype h1 =
         che_chb*(y[jidx_mx(lc,ncell)]+y[jidx_mx(rc,ncell)]) +
         jc_che *(y[jidx_mx(uc,ncell)]+y[jidx_mx(dc,ncell)]) +
-        m1;          // ← c_msk[0]*c_chk*m1 = 1*1*m1
+        jc_chk * m1 + jc_cha;
 
     const sunrealtype h2 =
         jc_che*(y[jidx_my(lc,ncell)]+y[jidx_my(rc,ncell)]+
-                y[jidx_my(uc,ncell)]+y[jidx_my(dc,ncell)]); // c_msk[1]=0 no self
+                y[jidx_my(uc,ncell)]+y[jidx_my(dc,ncell)]);
 
     const sunrealtype h3 =
         jc_che*(y[jidx_mz(lc,ncell)]+y[jidx_mz(rc,ncell)]+
-                y[jidx_mz(uc,ncell)]+y[jidx_mz(dc,ncell)]); // c_msk[2]=0 no self
+                y[jidx_mz(uc,ncell)]+y[jidx_mz(dc,ncell)]);
 
     const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
 
-    const sunrealtype dh1 = che_chb*(v1L+v1R) + jc_che*(v1U+v1D) + v1;  // +v1
+    /*
+     * Linearized field perturbation dh = ∂h/∂m · v:
+     *
+     *   dh1: exchange + DMI/chb of v-neighbors + anisotropy self c_chk*v1
+     *        (self-coupling in component 1, NOT component 3)
+     *   dh2: exchange only
+     *   dh3: exchange only
+     */
+    const sunrealtype dh1 = che_chb*(v1L+v1R) + jc_che*(v1U+v1D) + jc_chk*v1;
     const sunrealtype dh2 = jc_che*(v2L+v2R+v2U+v2D);
     const sunrealtype dh3 = jc_che*(v3L+v3R+v3U+v3D);
 
+    /* d(m·h) = (v·h) + (m·dh) */
     const sunrealtype dmh = (v1*h1+v2*h2+v3*h3) + (m1*dh1+m2*dh2+m3*dh3);
 
+    /* Jv = d/dε [γ(m+εv)×h(m+εv) + α(h - (m·h)m)]|_{ε=0} */
     Jv[mx] = jc_chg*(v3*h2+m3*dh2-v2*h3-m2*dh3) + jc_alpha*(dh1-dmh*m1-mh*v1);
     Jv[my] = jc_chg*(v1*h3+m1*dh3-v3*h1-m3*dh1) + jc_alpha*(dh2-dmh*m2-mh*v2);
     Jv[mz] = jc_chg*(v2*h1+m2*dh1-v1*h2-m1*dh2) + jc_alpha*(dh3-dmh*m3-mh*v3);
 }
 
 /*
- * JtvUserData — mirrors UserData from 2d_p.cu exactly.
+ * JtvUserData — mirrors UserData from 2d_fft.cu exactly.
  * Three pointer fields before the ints.
  */
 typedef struct {

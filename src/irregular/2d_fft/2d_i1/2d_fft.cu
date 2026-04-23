@@ -1,10 +1,19 @@
 /**
- * 2D periodic smooth-texture LLG solver
+ * 2D periodic head-on transition LLG solver
  * CVODE + CUDA, SoA layout
  *
  * Demag field ( Newell tensor, calt/ctt, Z2Z cuFFT):
  *   h_dmag(i,j) = Σ_{m,n} N(i-m, j-n) · M(m,n)   [convolution]
  *               = IFFT[ N̂(k) · M̂(k) ]             [via cuFFT Z2Z]
+ *
+ * Initialization: head-on transition along x
+ *   mx = -1  for i < ng/4
+ *   mx = +1  for ng/4 <= i < 3*ng/4
+ *   mx = -1  for i >= 3*ng/4
+ *   (smooth tanh transitions at the two domain walls)
+ *   my = mz = 0 everywhere
+ *
+ * Anisotropy axis: x  (c_msk = {1,0,0}, c_nsk = {1,0,0})
  *
  * Enable:  make DEMAG_STRENGTH=1.0 DEMAG_THICK=1.0
  * Disable: make DEMAG_STRENGTH=0.0  (zero overhead in f())
@@ -83,33 +92,13 @@
 #define BLOCK_Y 8
 #endif
 
-/* Circle parameters */
-#ifndef CIRCLE_CENTER_X_FRAC
-#define CIRCLE_CENTER_X_FRAC 0.50
-#endif
-
-#ifndef CIRCLE_CENTER_Y_FRAC
-#define CIRCLE_CENTER_Y_FRAC 0.50
-#endif
-
-#ifndef CIRCLE_RADIUS_FRAC_Y
-#define CIRCLE_RADIUS_FRAC_Y 0.22
-#endif
-
-#ifndef TEXTURE_CORE_MZ
-#define TEXTURE_CORE_MZ -0.998
-#endif
-
-#ifndef TEXTURE_OUTER_MZ
-#define TEXTURE_OUTER_MZ 0.998
-#endif
-
-#ifndef TEXTURE_WIDTH_FRAC
-#define TEXTURE_WIDTH_FRAC 0.35
-#endif
-
-#ifndef TEXTURE_EPS
-#define TEXTURE_EPS 1.0e-12
+/*
+ * Domain wall transition width, as a fraction of ng.
+ * E.g. 0.02 means the 10%-90% transition spans ~2% of the grid width.
+ * Larger values give a wider, smoother wall.
+ */
+#ifndef WALL_WIDTH_FRAC
+#define WALL_WIDTH_FRAC 0.02
 #endif
 
 #ifndef EARLY_SAVE_UNTIL
@@ -124,7 +113,17 @@
 #define LATE_SAVE_EVERY 100
 #endif
 
-/* typed constant memory */
+/*
+ * Physical constants — x-axis easy axis
+ *
+ * c_msk = {1,0,0} : anisotropy along x  → H_ani = chk * m1 * x̂
+ * c_nsk = {1,0,0} : DMI / chb term along x
+ *
+ * RHS field components:
+ *   h1 = c_che*(sum neighbors mx) + c_chk*m1 + c_cha + c_chb*(ml_x + mr_x)
+ *   h2 = c_che*(sum neighbors my)
+ *   h3 = c_che*(sum neighbors mz)
+ */
 __constant__ sunrealtype c_msk[3] = {
     SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
 __constant__ sunrealtype c_nsk[3] = {
@@ -201,7 +200,23 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
 }
 
 /*
- * Exchange RHS kernel — unchanged from original 2d_p.cu
+ * Exchange + anisotropy RHS kernel — x-axis anisotropy version
+ *
+ * Effective field components:
+ *   h1 = c_che*(ml_x+mr_x+mu_x+md_x) + c_msk[0]*(c_chk*m1+c_cha)
+ *                                      + c_chb*c_nsk[0]*(ml_x+mr_x)
+ *   h2 = c_che*(ml_y+mr_y+mu_y+md_y) + c_msk[1]*(c_chk*m1+c_cha)
+ *                                      + c_chb*c_nsk[1]*(ml_y+mr_y)
+ *   h3 = c_che*(ml_z+mr_z+mu_z+md_z) + c_msk[2]*(c_chk*m1+c_cha)
+ *                                      + c_chb*c_nsk[2]*(ml_z+mr_z)
+ *
+ * With c_msk={1,0,0} and c_nsk={1,0,0}:
+ *   h1 = c_che*(neighbors mx) + c_chk*m1 + c_cha + c_chb*(ml_x+mr_x)
+ *   h2 = c_che*(neighbors my)
+ *   h3 = c_che*(neighbors mz)
+ *
+ * LLG:
+ *   ṁ = c_chg*(m × h) + c_alpha*(h - (m·h)*m)
  */
 __global__ static void f_kernel_group_soa_periodic(
     const sunrealtype* __restrict__ y,
@@ -248,6 +263,13 @@ __global__ static void f_kernel_group_soa_periodic(
   const int uz = idx_mz(up_cell,    ncell);
   const int dz = idx_mz(down_cell,  ncell);
 
+  /*
+   * h1: exchange + x-axis anisotropy (self: c_chk*m1) + DMI/chb on x neighbors
+   * h2: exchange only
+   * h3: exchange only
+   * Note: c_msk[0]=1, c_msk[1]=c_msk[2]=0
+   *       c_nsk[0]=1, c_nsk[1]=c_nsk[2]=0
+   */
   const sunrealtype h1 =
       c_che * (y[lx] + y[rx] + y[ux] + y[dx]) +
       c_msk[0] * (c_chk * m1 + c_cha) +
@@ -275,8 +297,6 @@ __global__ static void f_kernel_group_soa_periodic(
  *
  * Adds the LLG contribution of h_dmag to ydot:
  *   ydot += γ(m × h_dmag) + α(h_dmag - (m·h_dmag)·m)
- *
- * Exactly as in src/2d_fft/2d_fft.cu.
  */
 __global__ static void demag_correction_kernel(
     const sunrealtype* __restrict__ y,
@@ -299,8 +319,8 @@ __global__ static void demag_correction_kernel(
 /*
  * RHS wrapper for CVODE
  *
- * Step 1: exchange stencil (original kernel, unchanged)
- * Step 2: demag field via FFT convolution ( Newell tensor)
+ * Step 1: exchange + anisotropy kernel
+ * Step 2: demag field via FFT convolution
  *         h_dmag = IFFT[ N̂(k) · M̂(k) ]
  *         ydot  += LLG(m, h_dmag)
  */
@@ -317,7 +337,7 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
     return -1;
   }
 
-  /* Step 1: exchange + anisotropy (original, unchanged) */
+  /* Step 1: exchange + anisotropy */
   dim3 block(BLOCK_X, BLOCK_Y);
   dim3 grid((udata->ng + block.x - 1) / block.x,
             (udata->ny + block.y - 1) / block.y);
@@ -327,16 +347,13 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
 
   /* Step 2: demag (only when enabled) */
   if (udata->demag && DEMAG_STRENGTH > 0.0) {
-    /* zero the demag field buffer */
     cudaMemsetAsync(udata->d_hdmag, 0,
                     (size_t)3 * udata->ncell * sizeof(sunrealtype), 0);
 
-    /* h_dmag = IFFT[ N̂ · M̂ ]  —  algorithm */
     Demag_Apply(udata->demag,
                 (const double*)ydata,
                 (double*)udata->d_hdmag);
 
-    /* ydot += LLG(m, h_dmag) */
     const int b = 256, g = (udata->ncell + b - 1) / b;
     demag_correction_kernel<<<g, b>>>(ydata, udata->d_hdmag,
                                       ydotdata, udata->ncell);
@@ -352,7 +369,7 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   return 0;
 }
 
-/* final stats — unchanged */
+/* final stats */
 static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
   (void)LS;
 
@@ -454,11 +471,6 @@ int main(int argc, char* argv[]) {
   FILE* fp = NULL; (void)fp;
 #endif
 
-  /* circle geometry */
-  const double cx = CIRCLE_CENTER_X_FRAC * (double)(ng - 1);
-  const double cy = CIRCLE_CENTER_Y_FRAC * (double)(ny - 1);
-  const double radius = CIRCLE_RADIUS_FRAC_Y * (double)ny;
-
   /* fill user data */
   udata.nx    = nx;
   udata.ny    = ny;
@@ -479,11 +491,6 @@ int main(int argc, char* argv[]) {
   const double dstr = (double)DEMAG_STRENGTH;
   const double dthk = (double)DEMAG_THICK;
   if (dstr > 0.0) {
-    /*
-     * NOTE: Demag_Init takes (nx, ny) where nx=number of columns.
-     * Here ng = nx/GROUPSIZE is the number of physical columns in the grid.
-     * We pass (ng, ny) so the tensor matches the actual grid dimensions.
-     */
     udata.demag = Demag_Init(ng, ny, dthk, dstr);
     if (!udata.demag) {
       fprintf(stderr, "Demag_Init failed\n");
@@ -510,34 +517,53 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
 
-  /* Initialize y — mx domain wall structure
-   * Three regions along x (using ng columns):
-   *   [0,        ng/4)   : mx = -1
-   *   [ng/4,   3*ng/4)   : mx = +1
-   *   [3*ng/4,    ng)    : mx = -1
-   * my = mz = 0 everywhere
+  /*
+   * Initialize y — head-on transition along x:
+   *
+   *   mx = -1  for i < ng/4
+   *   mx = +1  for ng/4 <= i < 3*ng/4
+   *   mx = -1  for i >= 3*ng/4
+   *   my = mz = 0 everywhere
+   *
+   * Profile: mx(x) = tanh((x - x1)/w) * (-tanh((x - x2)/w))
+   *
+   *   x < x1:        tanh → -1, -tanh → +1  →  mx = -1  ✓
+   *   x1 < x < x2:   tanh → +1, -tanh → +1  →  mx = +1  ✓
+   *   x > x2:        tanh → +1, -tanh → -1  →  mx = -1  ✓
+   *
+   * where x1 = ng/4, x2 = 3*ng/4, w = WALL_WIDTH_FRAC * ng.
    */
   {
-    const int x1 = ng / 4;
-    const int x2 = 3 * ng / 4;
+    const double x1 = 0.25 * (double)ng;
+    const double x2 = 0.75 * (double)ng;
+    const double w  = fmax(1.0, (double)WALL_WIDTH_FRAC * (double)ng);
 
     for (int j = 0; j < ny; j++) {
       for (int i = 0; i < ng; i++) {
         cell = j * ng + i;
 
-        const int mx = idx_mx(cell, ncell);
-        const int my = idx_my(cell, ncell);
-        const int mz = idx_mz(cell, ncell);
+        const int imx = idx_mx(cell, ncell);
+        const int imy = idx_my(cell, ncell);
+        const int imz = idx_mz(cell, ncell);
 
-        double mx0 = (i >= x1 && i < x2) ? 1.0 : -1.0;
+        const double xi = (double)i;
+        const double t1 = tanh((xi - x1) / w);
+        const double t2 = tanh((xi - x2) / w);
 
-        ydata[mx] = SUN_RCONST(mx0);
-        ydata[my] = SUN_RCONST(0.0);
-        ydata[mz] = SUN_RCONST(0.0);
+        /* mx: -1 | +1 | -1 with smooth tanh walls */
+        double mx0 = t1 * (-t2);
 
-        abstol_data[mx] = ATOL1;
-        abstol_data[my] = ATOL2;
-        abstol_data[mz] = ATOL3;
+        /* clamp to [-1, 1] for safety */
+        if (mx0 >  1.0) mx0 =  1.0;
+        if (mx0 < -1.0) mx0 = -1.0;
+
+        ydata[imx] = SUN_RCONST(mx0);
+        ydata[imy] = SUN_RCONST(0.0);
+        ydata[imz] = SUN_RCONST(0.0);
+
+        abstol_data[imx] = ATOL1;
+        abstol_data[imy] = ATOL2;
+        abstol_data[imz] = ATOL3;
       }
     }
   }
@@ -585,11 +611,13 @@ int main(int argc, char* argv[]) {
   CHECK_SUNDIALS(CVodeSetMaxOrd(cvode_mem, MAX_BDF_ORDER));
   printf("Max BDF order: %d   Krylov dim: %d\n", MAX_BDF_ORDER, KRYLOV_DIM);
 
-  printf("\n2D periodic smooth-texture LLG + FFT Demag [Newell calt/ctt, Z2Z]\n\n");
+  printf("\n2D periodic head-on transition LLG + FFT Demag [Newell calt/ctt, Z2Z]\n\n");
   printf("nx=%d  ny=%d  ng=%d  ncell=%d  neq=%d\n", nx, ny, ng, ncell, neq);
   printf("periodic BC: x and y\n");
-  // printf("circle center=(%.2f,%.2f), radius=%.2f cells\n", cx, cy, radius);
-  printf("mx domain walls at ng/4=%d and 3*ng/4=%d\n", ng/4, 3*ng/4);
+  printf("anisotropy axis: x  (c_msk={1,0,0})\n");
+  printf("init: mx=-1|+1|-1  walls at ng/4=%.1f, 3*ng/4=%.1f  width=%.2f cells\n",
+         0.25*(double)ng, 0.75*(double)ng,
+         fmax(1.0, (double)WALL_WIDTH_FRAC * (double)ng));
   printf("DEMAG_STRENGTH=%.4f  DEMAG_THICK=%.4f  (%s)\n",
          dstr, dthk,
          dstr > 0.0 ? "h_dmag=IFFT[N̂·M̂] via cuFFT Z2Z" : "disabled");
