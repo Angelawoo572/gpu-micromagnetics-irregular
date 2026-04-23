@@ -207,7 +207,7 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
   return (y < 0) ? (y + ny) : ((y >= ny) ? (y - ny) : y);
 }
 
-/* ─────────────────────────────────────────────────────────────────────
+/* 
  * UNIFIED RHS kernel
  *
  * Reads y (self + 4 neighbors) and h_dmag (self only) from global memory,
@@ -221,7 +221,7 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
  * then writes the single LLG update for this cell.
  *
  * No separate demag_correction_kernel anywhere.
- * ───────────────────────────────────────────────────────────────────── */
+ *  */
 __global__ static void f_kernel_unified_soa_periodic(
     const sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ h_dmag,
@@ -296,7 +296,7 @@ __global__ static void f_kernel_unified_soa_periodic(
   yd[mz] = c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3);
 }
 
-/* ─────────────────────────────────────────────────────────────────────
+/* 
  * RHS wrapper for CVODE
  *
  * Step 1: compute h_dmag = IFFT[ f̂ · FFT(y) ]
@@ -305,7 +305,7 @@ __global__ static void f_kernel_unified_soa_periodic(
  *
  * Step 2: single unified kernel sums all fields (exchange + anisotropy
  *         + DMI + demag) and writes ydot.
- * ───────────────────────────────────────────────────────────────────── */
+ *  */
 static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   (void)t;
 
