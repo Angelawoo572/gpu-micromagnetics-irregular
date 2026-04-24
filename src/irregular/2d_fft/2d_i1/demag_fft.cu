@@ -1,35 +1,33 @@
 /*
- * demag_fft.cu  —  v2: batched cuFFT pipeline.
+ * demag_fft.cu  —  v3: D2Z/Z2D real-to-complex FFT (half-spectrum).
  *
- * ─── What changed from v1 ────────────────────────────────────────────
- * Switched from 6 individual cufftExecZ2Z calls per Apply (3 forward +
- * 3 inverse) to 2 batched calls (cufftPlanMany with batch=3).
+ * ─── What changed from v2 ────────────────────────────────────────────
+ * Switched from complex-to-complex (Z2Z) to real-to-complex (D2Z/Z2D).
+ * Exploits Hermitian symmetry: for real input, f̂(-k) = f̂(k)*, so we only
+ * need to store half the spectrum.
  *
- * Nsight profile showed cuFFT was 23.6% of GPU kernel time (3.42 s).
- * Each of the 6 calls launches 2 sub-kernels (regular_fft + vector_fft),
- * so 12 kernel launches per f() call × 27,631 calls = 331,572 launches.
+ * Benefits:
+ *   1. FFT bandwidth: ~2× faster (half the data to process)
+ *   2. Tensor memory: 9 × ncell_half instead of 9 × ncell → ~50% reduction
+ *   3. Multiply kernel: half the work
  *
- * Batching reduces this to 4 launches per f() call (2 batched calls ×
- * 2 sub-kernels each) = 110,524 launches — a 3× reduction in FFT launch
- * overhead.  cuFFT can also internally optimize memory access patterns
- * for the 3-batch case.
+ * Frequency-domain layout:
+ *   ncell_half = ny × (nx/2 + 1)   ← only positive kx frequencies + Nyquist
  *
- * Memory layout change:
- *   Old: 12 separate cufftDoubleComplex arrays (dim/dom/dkh/drh × a/b/c)
- *   New: 2 contiguous arrays of 3*ncell complex elements each:
- *     d_m_io:  pack M here → FFT forward in-place → contains M̂
- *     d_h_io:  multiply writes Ĥ here → FFT inverse in-place → contains H
- *   Scratch memory: 2 × 3*ncell × 16 = 6.3 MB (was 12 × ncell × 16 = 12.6 MB)
+ * cuFFT D2Z forward:  real[ny][nx]       → complex[ny][nx/2+1]
+ * cuFFT Z2D inverse:  complex[ny][nx/2+1] → real[ny][nx]
+ *
+ * The batched plan now uses CUFFT_D2Z / CUFFT_Z2D with batch=3.
  *
  * ─── Pipeline per Apply (every f() call) ─────────────────────────────
- *  1. pack_m_kernel:    y_dev (SoA real) → d_m_io (3 contiguous complex)
- *  2. cufftExecZ2Z FORWARD (batch=3, in-place on d_m_io) → M̂
- *  3. multiply_kernel:  Ĥ = f̂ · M̂ (read d_m_io, write d_h_io)
- *  4. cufftExecZ2Z INVERSE (batch=3, in-place on d_h_io) → H
- *  5. unshift_h_kernel: real-part + FFT-shift + scale → h_out_dev (SoA)
+ *  1. gather_real_kernel: y_dev (SoA real) → d_m_real (3 × ny×nx doubles)
+ *  2. cufftExecD2Z (batch=3, d_m_real → d_m_hat) → M̂ (half-spectrum)
+ *  3. multiply_kernel:  Ĥ = f̂ · M̂ (read d_m_hat, write d_h_hat, ncell_half)
+ *  4. cufftExecZ2D (batch=3, d_h_hat → d_h_real) → H (real)
+ *  5. scatter_real_kernel: d_h_real + FFT-shift + scale → h_out_dev (SoA)
  *
- * f̂ (tensor spectra, 9 arrays) is computed ONCE in Demag_Init and stored
- * permanently on device.  No host transfers during Apply.
+ * f̂ (tensor spectra, 9 arrays × ncell_half) is computed ONCE in Demag_Init
+ * using D2Z and stored permanently on device. No host transfers during Apply.
  */
 
 #include "demag_fft.h"
@@ -110,29 +108,33 @@ static void calt(double thik, int mdx, int mdy,
 
 /* ── Device kernels ────────────────────────────────────────────────── */
 
-/* pack_m_kernel: SoA real y → 3 contiguous complex arrays (imag=0).
- * Layout in d_m_io:
- *   [0       .. ncell-1]   = mx + 0i
- *   [ncell   .. 2ncell-1]  = my + 0i
- *   [2*ncell .. 3ncell-1]  = mz + 0i
+/* gather_real_kernel: SoA real y → 3 contiguous real arrays.
+ * Layout in d_m_real (double, not complex):
+ *   [0       .. ncell-1]   = mx
+ *   [ncell   .. 2ncell-1]  = my
+ *   [2*ncell .. 3ncell-1]  = mz
+ *
+ * cuFFT D2Z will read this as 3 separate real arrays and produce
+ * 3 half-spectrum complex arrays in d_m_hat.
  */
-__global__ static void pack_m_kernel(
-    const double*            __restrict__ y_dev,
-    cufftDoubleComplex*      __restrict__ d_m_io,
+__global__ static void gather_real_kernel(
+    const double* __restrict__ y_dev,
+    double*       __restrict__ d_m_real,
     int ncell)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= ncell) return;
-    d_m_io[idx].x              = y_dev[idx];           d_m_io[idx].y              = 0.0;
-    d_m_io[ncell + idx].x      = y_dev[ncell + idx];   d_m_io[ncell + idx].y      = 0.0;
-    d_m_io[2*ncell + idx].x    = y_dev[2*ncell + idx]; d_m_io[2*ncell + idx].y    = 0.0;
+    d_m_real[idx]           = y_dev[idx];
+    d_m_real[ncell + idx]   = y_dev[ncell + idx];
+    d_m_real[2*ncell + idx] = y_dev[2*ncell + idx];
 }
 
 /* multiply_kernel: Ĥ_α(k) = Σ_β f̂_αβ(k) · M̂_β(k)
  *
- * Reads M̂ from d_m_io (contiguous: [mx_hat | my_hat | mz_hat])
- * Writes Ĥ to d_h_io (contiguous: [hx_hat | hy_hat | hz_hat])
- * Tensor spectra f̂_αβ are separate (permanent on device).
+ * Now operates on HALF-SPECTRUM: k ∈ [0, ncell_half).
+ * Reads M̂ from d_m_hat (3 × ncell_half complex).
+ * Writes Ĥ to d_h_hat (3 × ncell_half complex).
+ * Tensor spectra f̂_αβ are also half-spectrum (permanent on device).
  */
 __global__ static void multiply_kernel(
     const cufftDoubleComplex* __restrict__ dofaa,
@@ -144,45 +146,45 @@ __global__ static void multiply_kernel(
     const cufftDoubleComplex* __restrict__ dofca,
     const cufftDoubleComplex* __restrict__ dofcb,
     const cufftDoubleComplex* __restrict__ dofcc,
-    const cufftDoubleComplex* __restrict__ d_m_io,     /* M̂: 3*ncell */
-    cufftDoubleComplex*       __restrict__ d_h_io,     /* Ĥ: 3*ncell */
-    int ncell)
+    const cufftDoubleComplex* __restrict__ d_m_hat,  /* M̂: 3 × ncell_half */
+    cufftDoubleComplex*       __restrict__ d_h_hat,  /* Ĥ: 3 × ncell_half */
+    int ncell_half)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= ncell) return;
+    if (k >= ncell_half) return;
 
-    /* Read M̂ components from contiguous batch layout */
-    const cufftDoubleComplex ma = d_m_io[k];
-    const cufftDoubleComplex mb = d_m_io[ncell + k];
-    const cufftDoubleComplex mc = d_m_io[2*ncell + k];
+    /* Read M̂ components from half-spectrum batch layout */
+    const cufftDoubleComplex ma = d_m_hat[k];
+    const cufftDoubleComplex mb = d_m_hat[ncell_half + k];
+    const cufftDoubleComplex mc = d_m_hat[2*ncell_half + k];
 
 #define CMUL_R(F,M) ((F)[k].x*(M).x - (F)[k].y*(M).y)
 #define CMUL_I(F,M) ((F)[k].x*(M).y + (F)[k].y*(M).x)
 
     /* Ĥ_x = f̂_xx M̂_x + f̂_xy M̂_y + f̂_xz M̂_z */
-    d_h_io[k].x           = CMUL_R(dofaa,ma) + CMUL_R(dofab,mb) + CMUL_R(dofac,mc);
-    d_h_io[k].y           = CMUL_I(dofaa,ma) + CMUL_I(dofab,mb) + CMUL_I(dofac,mc);
+    d_h_hat[k].x                = CMUL_R(dofaa,ma) + CMUL_R(dofab,mb) + CMUL_R(dofac,mc);
+    d_h_hat[k].y                = CMUL_I(dofaa,ma) + CMUL_I(dofab,mb) + CMUL_I(dofac,mc);
 
     /* Ĥ_y = f̂_yx M̂_x + f̂_yy M̂_y + f̂_yz M̂_z */
-    d_h_io[ncell+k].x     = CMUL_R(dofba,ma) + CMUL_R(dofbb,mb) + CMUL_R(dofbc,mc);
-    d_h_io[ncell+k].y     = CMUL_I(dofba,ma) + CMUL_I(dofbb,mb) + CMUL_I(dofbc,mc);
+    d_h_hat[ncell_half+k].x     = CMUL_R(dofba,ma) + CMUL_R(dofbb,mb) + CMUL_R(dofbc,mc);
+    d_h_hat[ncell_half+k].y     = CMUL_I(dofba,ma) + CMUL_I(dofbb,mb) + CMUL_I(dofbc,mc);
 
     /* Ĥ_z = f̂_zx M̂_x + f̂_zy M̂_y + f̂_zz M̂_z */
-    d_h_io[2*ncell+k].x   = CMUL_R(dofca,ma) + CMUL_R(dofcb,mb) + CMUL_R(dofcc,mc);
-    d_h_io[2*ncell+k].y   = CMUL_I(dofca,ma) + CMUL_I(dofcb,mb) + CMUL_I(dofcc,mc);
+    d_h_hat[2*ncell_half+k].x   = CMUL_R(dofca,ma) + CMUL_R(dofcb,mb) + CMUL_R(dofcc,mc);
+    d_h_hat[2*ncell_half+k].y   = CMUL_I(dofca,ma) + CMUL_I(dofcb,mb) + CMUL_I(dofcc,mc);
 
 #undef CMUL_R
 #undef CMUL_I
 }
 
-/* unshift_h_kernel:
- *   Reads d_h_io (contiguous: [hx | hy | hz], each ncell complex).
+/* scatter_real_kernel:
+ *   Reads d_h_real (3 contiguous real arrays, each ncell = ny × nx).
  *   FFT-shift: src_idx = ((i+nx2) mod nx, (j+ny2) mod ny)
  *   Writes to h_out_dev SoA (3*ncell real), scaled by strength/(nx*ny).
  */
-__global__ static void unshift_h_kernel(
-    const cufftDoubleComplex* __restrict__ d_h_io,
-    double*                   __restrict__ h_out,
+__global__ static void scatter_real_kernel(
+    const double* __restrict__ d_h_real,
+    double*       __restrict__ h_out,
     double scale,
     int nx, int ny, int ncell, int nx2, int ny2)
 {
@@ -195,14 +197,15 @@ __global__ static void unshift_h_kernel(
     int sj  = (j + ny2) % ny;
     int src = sj*nx + si;
 
-    h_out[dst]           = d_h_io[src].x           * scale;
-    h_out[ncell + dst]   = d_h_io[ncell + src].x   * scale;
-    h_out[2*ncell + dst] = d_h_io[2*ncell + src].x * scale;
+    h_out[dst]           = d_h_real[src]           * scale;
+    h_out[ncell + dst]   = d_h_real[ncell + src]   * scale;
+    h_out[2*ncell + dst] = d_h_real[2*ncell + src] * scale;
 }
 
 /* ── DemagData ─────────────────────────────────────────────────────── */
 struct DemagData {
     int    nx, ny, ncell;
+    int    ncell_half;       /* ny × (nx/2 + 1) — half-spectrum size */
     int    nx2, ny2;
     double strength;
 
@@ -210,42 +213,53 @@ struct DemagData {
     double Nxx0_scaled, Nyy0_scaled, Nzz0_scaled;
 
     /* cuFFT plans */
-    cufftHandle plan_single;      /* for init: 1 × (ny, nx) Z2Z */
-    cufftHandle plan_batch;       /* for Apply: 3 × (ny, nx) Z2Z, stride ncell */
+    cufftHandle plan_d2z_single;    /* for init: 1 × (ny, nx) D2Z */
+    cufftHandle plan_d2z_batch;     /* for Apply: 3 × (ny, nx) D2Z */
+    cufftHandle plan_z2d_batch;     /* for Apply: 3 × (ny, nx) Z2D */
 
-    /* permanent on device: tensor spectra (9 × ncell complex) */
+    /* permanent on device: tensor spectra (9 × ncell_half complex) */
     cufftDoubleComplex *dofaa, *dofab, *dofac;
     cufftDoubleComplex *dofba, *dofbb, *dofbc;
     cufftDoubleComplex *dofca, *dofcb, *dofcc;
 
-    /* scratch on device: batched M and H (2 contiguous blocks) */
-    cufftDoubleComplex *d_m_io;   /* 3*ncell: pack → FFT forward in-place → M̂ */
-    cufftDoubleComplex *d_h_io;   /* 3*ncell: multiply → FFT inverse in-place → H */
+    /* scratch on device:
+     *   d_m_real: 3*ncell doubles (input to D2Z)
+     *   d_m_hat:  3*ncell_half complex (output of D2Z, input to multiply)
+     *   d_h_hat:  3*ncell_half complex (output of multiply, input to Z2D)
+     *   d_h_real: 3*ncell doubles (output of Z2D) */
+    double             *d_m_real, *d_h_real;
+    cufftDoubleComplex *d_m_hat,  *d_h_hat;
 };
 
 /* ── Demag_Init (run once) ─────────────────────────────────────────── */
 DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
 {
-    printf("[Demag GPU v2] Init: nx=%d ny=%d thick=%.4f strength=%.4f\n",
+    printf("[Demag GPU v3] Init: nx=%d ny=%d thick=%.4f strength=%.4f\n",
            nx, ny, thick, demag_strength);
-    printf("[Demag GPU v2] Batched cuFFT (batch=3): 2 calls/Apply instead of 6.\n");
-    printf("[Demag GPU v2] In-place FFT, no per-step host transfers.\n");
+    printf("[Demag GPU v3] Real-to-complex FFT (D2Z/Z2D): half-spectrum layout.\n");
+    printf("[Demag GPU v3] Batched (batch=3): forward and inverse in 2 calls/Apply.\n");
 
     DemagData *d = (DemagData*)calloc(1, sizeof(DemagData));
     if (!d) { fprintf(stderr,"[demag] calloc failed\n"); return NULL; }
 
-    d->nx       = nx;
-    d->ny       = ny;
-    d->ncell    = nx * ny;
-    d->nx2      = nx / 2;
-    d->ny2      = ny / 2;
-    d->strength = demag_strength;
+    d->nx         = nx;
+    d->ny         = ny;
+    d->ncell      = nx * ny;
+    d->ncell_half = ny * (nx / 2 + 1);
+    d->nx2        = nx / 2;
+    d->ny2        = ny / 2;
+    d->strength   = demag_strength;
 
-    const size_t csz  = (size_t)(nx * ny) * sizeof(cufftDoubleComplex);
-    const size_t csz3 = (size_t)3 * csz;   /* batched buffer size */
+    const size_t rsz  = (size_t)(nx * ny) * sizeof(double);           /* real array */
+    const size_t rsz3 = (size_t)3 * rsz;                              /* 3 real arrays */
+    const size_t csz_half  = (size_t)d->ncell_half * sizeof(cufftDoubleComplex);
+    const size_t csz_half3 = (size_t)3 * csz_half;
+
+    printf("[Demag GPU v3] ncell=%d, ncell_half=%d (%.1f%% of full spectrum)\n",
+           d->ncell, d->ncell_half, 100.0 * d->ncell_half / d->ncell);
 
     /* ── calt on CPU ──────────────────────────────────────────────── */
-    printf("[Demag GPU v2] Computing Newell tensor (calt/ctt, 81-pt avg)...\n");
+    printf("[Demag GPU v3] Computing Newell tensor (calt/ctt, 81-pt avg)...\n");
 
     double *taa=(double*)calloc(nx*ny,sizeof(double));
     double *tab=(double*)calloc(nx*ny,sizeof(double));
@@ -271,63 +285,84 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
         d->Nxx0_scaled = taa[i0] * demag_strength;
         d->Nyy0_scaled = tbb[i0] * demag_strength;
         d->Nzz0_scaled = tcc[i0] * demag_strength;
-        printf("[Demag GPU v2] N(0) = diag(%.4e, %.4e, %.4e)  [unscaled]\n",
+        printf("[Demag GPU v3] N(0) = diag(%.4e, %.4e, %.4e)  [unscaled]\n",
                taa[i0], tbb[i0], tcc[i0]);
-        printf("[Demag GPU v2] N(0) off-diag at origin: tab=%.2e tac=%.2e tbc=%.2e\n",
+        printf("[Demag GPU v3] N(0) off-diag at origin: tab=%.2e tac=%.2e tbc=%.2e\n",
                tab[i0], tac[i0], tbc[i0]);
     }
 
     /* ── cuFFT plans ─────────────────────────────────────────────── */
-    /* Single plan: used during init to FFT the 9 tensor components. */
-    if (cufftPlan2d(&d->plan_single, ny, nx, CUFFT_Z2Z) != CUFFT_SUCCESS) {
-        fprintf(stderr,"[demag] cufftPlan2d failed\n");
+    /* Single D2Z plan: used during init to FFT the 9 tensor components. */
+    if (cufftPlan2d(&d->plan_d2z_single, ny, nx, CUFFT_D2Z) != CUFFT_SUCCESS) {
+        fprintf(stderr,"[demag] cufftPlan2d (D2Z single) failed\n");
         free(taa);free(tab);free(tac);free(tba);free(tbb);
         free(tbc);free(tca);free(tcb);free(tcc);free(d);
         return NULL;
     }
 
-    /* Batched plan: used every Apply call — 3 transforms at once.
-     * dims[0]=ny (rows), dims[1]=nx (cols).
-     * stride=1: elements within one 2D array are contiguous.
-     * dist=ncell: gap between batch 0 and batch 1 is ncell complex elements. */
+    /* Batched D2Z plan: forward FFT in Apply (3 real arrays → 3 half-spectrum).
+     * inembed: [ny, nx]       — real input dims
+     * onembed: [ny, nx/2+1]   — complex output dims (half-spectrum)
+     * istride=1, idist=ncell  — real arrays are contiguous, batch offset ncell
+     * ostride=1, odist=ncell_half — half-spectrum arrays contiguous, offset ncell_half
+     */
     {
-        int dims[2] = {ny, nx};
-        if (cufftPlanMany(&d->plan_batch, 2, dims,
-                          dims, 1, d->ncell,   /* inembed, istride, idist */
-                          dims, 1, d->ncell,   /* onembed, ostride, odist */
-                          CUFFT_Z2Z, 3) != CUFFT_SUCCESS) {
-            fprintf(stderr,"[demag] cufftPlanMany (batch=3) failed\n");
-            cufftDestroy(d->plan_single);
+        int n[2] = {ny, nx};
+        int inembed[2] = {ny, nx};
+        int onembed[2] = {ny, nx/2 + 1};
+        if (cufftPlanMany(&d->plan_d2z_batch, 2, n,
+                          inembed, 1, d->ncell,      /* real input */
+                          onembed, 1, d->ncell_half, /* complex output */
+                          CUFFT_D2Z, 3) != CUFFT_SUCCESS) {
+            fprintf(stderr,"[demag] cufftPlanMany (D2Z batch) failed\n");
+            cufftDestroy(d->plan_d2z_single);
             free(taa);free(tab);free(tac);free(tba);free(tbb);
             free(tbc);free(tca);free(tcb);free(tcc);free(d);
             return NULL;
         }
     }
 
-    /* ── Allocate permanent f̂ device arrays (9 × ncell) ──────────── */
-    cudaMalloc((void**)&d->dofaa,csz); cudaMalloc((void**)&d->dofab,csz);
-    cudaMalloc((void**)&d->dofac,csz); cudaMalloc((void**)&d->dofba,csz);
-    cudaMalloc((void**)&d->dofbb,csz); cudaMalloc((void**)&d->dofbc,csz);
-    cudaMalloc((void**)&d->dofca,csz); cudaMalloc((void**)&d->dofcb,csz);
-    cudaMalloc((void**)&d->dofcc,csz);
+    /* Batched Z2D plan: inverse FFT in Apply (3 half-spectrum → 3 real arrays).
+     * inembed: [ny, nx/2+1]   — complex input dims
+     * onembed: [ny, nx]       — real output dims
+     */
+    {
+        int n[2] = {ny, nx};
+        int inembed[2] = {ny, nx/2 + 1};
+        int onembed[2] = {ny, nx};
+        if (cufftPlanMany(&d->plan_z2d_batch, 2, n,
+                          inembed, 1, d->ncell_half, /* complex input */
+                          onembed, 1, d->ncell,      /* real output */
+                          CUFFT_Z2D, 3) != CUFFT_SUCCESS) {
+            fprintf(stderr,"[demag] cufftPlanMany (Z2D batch) failed\n");
+            cufftDestroy(d->plan_d2z_single);
+            cufftDestroy(d->plan_d2z_batch);
+            free(taa);free(tab);free(tac);free(tba);free(tbb);
+            free(tbc);free(tca);free(tcb);free(tcc);free(d);
+            return NULL;
+        }
+    }
+
+    /* ── Allocate permanent f̂ device arrays (9 × ncell_half) ────────── */
+    cudaMalloc((void**)&d->dofaa, csz_half); cudaMalloc((void**)&d->dofab, csz_half);
+    cudaMalloc((void**)&d->dofac, csz_half); cudaMalloc((void**)&d->dofba, csz_half);
+    cudaMalloc((void**)&d->dofbb, csz_half); cudaMalloc((void**)&d->dofbc, csz_half);
+    cudaMalloc((void**)&d->dofca, csz_half); cudaMalloc((void**)&d->dofcb, csz_half);
+    cudaMalloc((void**)&d->dofcc, csz_half);
+
+    /* ── Allocate scratch buffers ─────────────────────────────────── */
+    cudaMalloc((void**)&d->d_m_real, rsz3);
+    cudaMalloc((void**)&d->d_h_real, rsz3);
+    cudaMalloc((void**)&d->d_m_hat,  csz_half3);
+    cudaMalloc((void**)&d->d_h_hat,  csz_half3);
 
     /* ── FFT tensor components one at a time (init only) ─────────── */
-    /* Use d_m_io as temporary buffer (allocate it now). */
-    cudaMalloc((void**)&d->d_m_io, csz3);
-    cudaMalloc((void**)&d->d_h_io, csz3);
-
-    /* Helper: pack one real tensor to complex on host, H2D, FFT, store. */
+    /* Use d_m_real as temporary real buffer, d_m_hat as temporary complex output. */
     {
-        cufftDoubleComplex *h_tmp = (cufftDoubleComplex*)malloc(csz);
-        /* We use d_m_io[0..ncell-1] as a temp device buffer for single FFTs. */
-        cufftDoubleComplex *d_tmp_in  = d->d_m_io;            /* reuse batch buf */
-
         auto fft_one_tensor = [&](double *t_host, cufftDoubleComplex *d_out) {
-            for (int idx = 0; idx < nx*ny; idx++) {
-                h_tmp[idx].x = t_host[idx]; h_tmp[idx].y = 0.0;
-            }
-            cudaMemcpy(d_tmp_in, h_tmp, csz, cudaMemcpyHostToDevice);
-            cufftExecZ2Z(d->plan_single, d_tmp_in, d_out, CUFFT_FORWARD);
+            cudaMemcpy(d->d_m_real, t_host, rsz, cudaMemcpyHostToDevice);
+            cufftExecD2Z(d->plan_d2z_single, d->d_m_real, d->d_m_hat);
+            cudaMemcpy(d_out, d->d_m_hat, csz_half, cudaMemcpyDeviceToDevice);
         };
 
         fft_one_tensor(taa, d->dofaa);
@@ -340,60 +375,67 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
         fft_one_tensor(tcb, d->dofcb);
         fft_one_tensor(tcc, d->dofcc);
         cudaDeviceSynchronize();
-
-        free(h_tmp);
     }
 
     free(taa);free(tab);free(tac);free(tba);free(tbb);
     free(tbc);free(tca);free(tcb);free(tcc);
 
-    /* plan_single is no longer needed after init — free it to save cuFFT state */
-    cufftDestroy(d->plan_single);
-    d->plan_single = 0;
+    /* plan_d2z_single is no longer needed after init */
+    cufftDestroy(d->plan_d2z_single);
+    d->plan_d2z_single = 0;
 
-    printf("[Demag GPU v2] Device: %.1f MB (tensor spectra) + %.1f MB (scratch)\n",
-           (double)9 * csz / 1e6, (double)2 * csz3 / 1e6);
-    printf("[Demag GPU v2] Ready.\n");
+    printf("[Demag GPU v3] Device: %.1f MB (tensor spectra) + %.1f MB (scratch)\n",
+           (double)9 * csz_half / 1e6, (double)(rsz3 + rsz3 + csz_half3 + csz_half3) / 1e6);
+    printf("[Demag GPU v3] Memory saving vs Z2Z: tensor %.1f%%, total scratch similar.\n",
+           100.0 * (1.0 - (double)d->ncell_half / d->ncell));
+    printf("[Demag GPU v3] Ready.\n");
     return d;
 }
 
-/* ── Demag_Apply (per RHS call, fully GPU, batched FFT) ────────────── */
+/* ── Demag_Apply (per RHS call, fully GPU, D2Z/Z2D batched) ──────────── */
 void Demag_Apply(DemagData *d, const double *y_dev, double *h_out_dev)
 {
     if (!d) return;
 
-    const int nx    = d->nx;
-    const int ny    = d->ny;
-    const int ncell = d->ncell;
-    const double scale = d->strength / (double)(nx * ny);
+    const int nx         = d->nx;
+    const int ny         = d->ny;
+    const int ncell      = d->ncell;
+    const int ncell_half = d->ncell_half;
+    const double scale   = d->strength / (double)(nx * ny);
 
     const int BLK = 256;
-    const int GRD = (ncell + BLK - 1) / BLK;
 
-    /* Step 1: pack SoA real y → 3 contiguous complex in d_m_io */
-    pack_m_kernel<<<GRD, BLK>>>(y_dev, d->d_m_io, ncell);
+    /* Step 1: gather SoA real y → 3 contiguous real arrays in d_m_real */
+    {
+        const int GRD = (ncell + BLK - 1) / BLK;
+        gather_real_kernel<<<GRD, BLK>>>(y_dev, d->d_m_real, ncell);
+    }
 
-    /* Step 2: FFT forward, batch=3, IN-PLACE on d_m_io
-     * After this, d_m_io contains [M̂_x | M̂_y | M̂_z]. */
-    cufftExecZ2Z(d->plan_batch, d->d_m_io, d->d_m_io, CUFFT_FORWARD);
+    /* Step 2: FFT forward (D2Z), batch=3
+     * d_m_real (3 × ncell real) → d_m_hat (3 × ncell_half complex) */
+    cufftExecD2Z(d->plan_d2z_batch, d->d_m_real, d->d_m_hat);
 
-    /* Step 3: Ĥ = f̂ · M̂ (read d_m_io, write d_h_io) */
-    multiply_kernel<<<GRD, BLK>>>(
-        d->dofaa, d->dofab, d->dofac,
-        d->dofba, d->dofbb, d->dofbc,
-        d->dofca, d->dofcb, d->dofcc,
-        d->d_m_io, d->d_h_io, ncell);
+    /* Step 3: Ĥ = f̂ · M̂ (read d_m_hat, write d_h_hat) — half-spectrum only */
+    {
+        const int GRD = (ncell_half + BLK - 1) / BLK;
+        multiply_kernel<<<GRD, BLK>>>(
+            d->dofaa, d->dofab, d->dofac,
+            d->dofba, d->dofbb, d->dofbc,
+            d->dofca, d->dofcb, d->dofcc,
+            d->d_m_hat, d->d_h_hat, ncell_half);
+    }
 
-    /* Step 4: FFT inverse, batch=3, IN-PLACE on d_h_io */
-    cufftExecZ2Z(d->plan_batch, d->d_h_io, d->d_h_io, CUFFT_INVERSE);
+    /* Step 4: FFT inverse (Z2D), batch=3
+     * d_h_hat (3 × ncell_half complex) → d_h_real (3 × ncell real) */
+    cufftExecZ2D(d->plan_z2d_batch, d->d_h_hat, d->d_h_real);
 
-    /* Step 5: real-part + FFT-shift + scale → SoA h_out_dev */
+    /* Step 5: FFT-shift + scale → SoA h_out_dev */
     {
         dim3 block(16, 16);
         dim3 grid((nx + block.x - 1) / block.x,
                   (ny + block.y - 1) / block.y);
-        unshift_h_kernel<<<grid, block>>>(
-            d->d_h_io, h_out_dev, scale,
+        scatter_real_kernel<<<grid, block>>>(
+            d->d_h_real, h_out_dev, scale,
             nx, ny, ncell, d->nx2, d->ny2);
     }
 }
@@ -417,15 +459,17 @@ void Demag_GetSelfCoupling(DemagData *d,
 void Demag_Destroy(DemagData *d)
 {
     if (!d) return;
-    if (d->plan_batch) cufftDestroy(d->plan_batch);
-    /* plan_single already destroyed in Init */
+
+    if (d->plan_d2z_batch) cufftDestroy(d->plan_d2z_batch);
+    if (d->plan_z2d_batch) cufftDestroy(d->plan_z2d_batch);
+    /* plan_d2z_single already destroyed in Init */
 
     cudaFree(d->dofaa); cudaFree(d->dofab); cudaFree(d->dofac);
     cudaFree(d->dofba); cudaFree(d->dofbb); cudaFree(d->dofbc);
     cudaFree(d->dofca); cudaFree(d->dofcb); cudaFree(d->dofcc);
 
-    cudaFree(d->d_m_io);
-    cudaFree(d->d_h_io);
+    cudaFree(d->d_m_real); cudaFree(d->d_h_real);
+    cudaFree(d->d_m_hat);  cudaFree(d->d_h_hat);
 
     free(d);
 }
