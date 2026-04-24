@@ -1,7 +1,7 @@
 /*
- * demag_direct_apply.cu
+ * demag_direct.cu
  *
- * Same Demag_Init/Apply/Destroy interface as demag_fft.cu.
+ * Same Demag_Init/Apply/Destroy/GetSelfCoupling interface as demag_fft.cu.
  * Drop-in replacement for timing comparison:
  *
  *   FFT version:    h(i,j) = IFFT[ f̂aa · m̂ ]          O(N log N)
@@ -16,7 +16,7 @@
  * CVODE setup) is identical.
  *
  * Compile into 2d_direct target via Makefile:
- *   DEMAG_SRC = demag_direct_apply.cu
+ *   DEMAG_SRC = demag_direct.cu
  *   TARGET    = 2d_direct
  */
 
@@ -95,7 +95,7 @@ static void calt(double thik, int mdx, int mdy,
     }
 }
 
-/* 
+/*
  * CUDA kernel: O(N²) direct convolution
  *
  * Each thread = one target cell (ti, tj).
@@ -114,7 +114,7 @@ static void calt(double thik, int mdx, int mdy,
  *
  * This matches how calt stores values: faa[j*nx+i] for displacement
  * (i - nx/2, j - ny/2).
- *  */
+ */
 __global__ static void direct_conv_kernel(
     /* source magnetization on device (SoA: mx|my|mz) */
     const double* __restrict__ mx,
@@ -167,12 +167,16 @@ __global__ static void direct_conv_kernel(
     hz[dst] = sumz;
 }
 
-/* 
+/*
  * DemagData for direct version
- *  */
+ */
 struct DemagData {
     int nx, ny, ncell;
     double strength;
+
+    /* self-coupling N(0), scaled by strength (for preconditioner).
+     * Off-diagonals of N at r=0 vanish by 4-fold cell-face symmetry. */
+    double Nxx0_scaled, Nyy0_scaled, Nzz0_scaled;
 
     /* device: tensor (9 components) */
     double *d_faa, *d_fab, *d_fac;
@@ -186,10 +190,10 @@ struct DemagData {
     double *d_hx, *d_hy, *d_hz;
 };
 
-/* 
+/*
  * Demag_Init
  * Computes calt tensor and uploads to device. No FFT.
- *  */
+ */
 DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
 {
     printf("[Demag DIRECT] Init: nx=%d ny=%d thick=%.4f strength=%.4f\n",
@@ -230,6 +234,23 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
     calt(thick, nx, ny, taa,tab,tac, tba,tbb,tbc, tca,tcb,tcc);
     printf("[Demag DIRECT] calt done.\n");
 
+    /* extract N(0) — stored at index (ny2, nx2) in centered convention.
+     * Scaled by strength so the preconditioner sees the same magnitude
+     * as what Demag_Apply produces in h_out. */
+    {
+        const int nx2 = nx / 2;
+        const int ny2 = ny / 2;
+        const int i0  = ny2 * nx + nx2;
+        d->Nxx0_scaled = taa[i0] * demag_strength;
+        d->Nyy0_scaled = tbb[i0] * demag_strength;
+        d->Nzz0_scaled = tcc[i0] * demag_strength;
+        printf("[Demag DIRECT] N(0) = diag(%.4e, %.4e, %.4e)  [unscaled]\n",
+               taa[i0], tbb[i0], tcc[i0]);
+        printf("[Demag DIRECT] N(0) off-diag at origin: "
+               "tab=%.2e tac=%.2e tbc=%.2e\n",
+               tab[i0], tac[i0], tbc[i0]);
+    }
+
     /* step 2: upload tensor to device */
     cudaMalloc((void**)&d->d_faa, rsz); cudaMalloc((void**)&d->d_fab, rsz);
     cudaMalloc((void**)&d->d_fac, rsz); cudaMalloc((void**)&d->d_fba, rsz);
@@ -263,7 +284,7 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
     return d;
 }
 
-/* 
+/*
  * Demag_Apply  —  O(N²) direct convolution
  *
  * h_x(i,j) = Σ_{m,n} faa(i-m, j-n) · mx(m,n) + ...
@@ -274,7 +295,7 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
  *
  * vs FFT version:
  *   → ĥ_x = f̂aa · m̂   (right arrow, frequency domain)
- *  */
+ */
 void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
 {
     if (!d) return;
@@ -332,9 +353,29 @@ void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
     free(h_hout); free(h_hx); free(h_hy); free(h_hz);
 }
 
-/* 
+/*
+ * Demag_GetSelfCoupling — expose N(0)·strength for the preconditioner.
+ *
+ * Matches the signature used by demag_fft.cu. Values were extracted once
+ * in Demag_Init from the centered-tensor origin taa[i0]/tbb[i0]/tcc[i0].
+ */
+void Demag_GetSelfCoupling(DemagData *d,
+                           double *nxx0, double *nyy0, double *nzz0)
+{
+    if (!d) {
+        if (nxx0) *nxx0 = 0.0;
+        if (nyy0) *nyy0 = 0.0;
+        if (nzz0) *nzz0 = 0.0;
+        return;
+    }
+    if (nxx0) *nxx0 = d->Nxx0_scaled;
+    if (nyy0) *nyy0 = d->Nyy0_scaled;
+    if (nzz0) *nzz0 = d->Nzz0_scaled;
+}
+
+/*
  * Demag_Destroy
- *  */
+ */
 void Demag_Destroy(DemagData *d)
 {
     if (!d) return;

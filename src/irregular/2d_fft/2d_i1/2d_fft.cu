@@ -584,6 +584,7 @@ int main(int argc, char* argv[]) {
   }
 
   CHECK_SUNDIALS(CVodeInit(cvode_mem, f, T0, y));
+  CVodeSetMaxNumSteps(cvode_mem, 20000);
   CHECK_SUNDIALS(CVodeSetUserData(cvode_mem, &udata));
   CHECK_SUNDIALS(CVodeSVtolerances(cvode_mem, RTOL, abstol));
 
