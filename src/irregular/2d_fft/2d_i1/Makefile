@@ -33,7 +33,7 @@ T_TOTAL  ?= 1000.0
 #       nli=75,314 with average 3.2 iters/solve but ~30% of solves hit
 #       the restart limit.  dim=15 lets those continue instead of restarting.
 #       Cost: 15 N_Vectors (~22 MB) vs 5 (~7.5 MB).  Easily fits.
-KRYLOV_DIM ?= 0
+KRYLOV_DIM ?= 15
 
 # ====== FFT Demagnetization (professor's Newell calt/ctt) ======
 # DEMAG_STRENGTH = 0.0  → disabled (exchange-only, original behaviour)

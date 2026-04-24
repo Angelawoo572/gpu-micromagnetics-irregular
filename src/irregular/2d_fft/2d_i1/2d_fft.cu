@@ -21,21 +21,21 @@
  *
  * and then read inside the unified kernel just like any other SoA field.
  *
- * ─── LLG form (|m|-preserving) ──────────────────────────────────────
- * We use the generalized Landau-Lifshitz form that preserves |m| EXACTLY
- * regardless of whether |m|=1 on the integration manifold:
+ * ─── Unit-sphere constraint (normalize-in-f) ────────────────────────
+ * The standard LLG form  dm/dt = γ(m×h) + α(h − (m·h)m)  assumes
+ * |m|=1.  BDF interpolation can drift |m| away from 1, and if m·h < 0
+ * (common in domain walls with strong demag) the drift is amplified
+ * exponentially, causing CVODE to stall.
  *
- *   dm/dt = γ (m × h) + α ( |m|² h − (m·h) m )
+ * Solution (per professor): at the top of every f() call, normalize y
+ * in-place so |m|=1 at every cell:
  *
- * Here m·(dm/dt) = α(|m|²(m·h) − (m·h)|m|²) = 0 IDENTICALLY — no feedback
- * on |m|−1 drift. The simplified form α(h − (m·h)m) assumes |m|=1 strictly
- * and has the feedback term α(m·h)(1−|m|²) on m·(dm/dt), which becomes
- * UNSTABLE whenever m·h < 0 (common in head-on domain walls with demag).
- * That instability is what caused CVODE to stall near t≈13 at
- * DEMAG_STRENGTH=2.0 — strong negative demag field created large regions
- * with m·h < 0 and BDF's O(h^p) drift in |m| was amplified exponentially.
- * The |m|² factor removes the instability entirely (on the |m|=1 manifold
- * both forms give identical dynamics).
+ *   ymp = sqrt(y[mx]² + y[my]² + y[mz]²)
+ *   y[mx] /= ymp;  y[my] /= ymp;  y[mz] /= ymp
+ *
+ * This is a lightweight GPU kernel (~2 µs) that projects onto the unit
+ * sphere before the RHS kernel sees y.  The simplified LLG form is then
+ * always evaluated exactly on the manifold — no modified formulas needed.
  *
  * ─── Build knobs ────────────────────────────────────────────────────
  * Enable:  make DEMAG_STRENGTH=1.0 DEMAG_THICK=1.0
@@ -224,24 +224,66 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
 }
 
 /*
+ * normalize_m_kernel
+ *
+ * Per-cell in-place normalization of y so that |m| = 1 exactly:
+ *
+ *   ymp = sqrt(y[mx]² + y[my]² + y[mz]²)
+ *   y[mx] /= ymp
+ *   y[my] /= ymp
+ *   y[mz] /= ymp
+ *
+ * Called at the top of every f() evaluation, BEFORE the RHS kernel.
+ * This ensures the simplified LLG form (which assumes |m|=1) is always
+ * evaluated on the unit sphere, regardless of BDF interpolation drift.
+ *
+ * Cost: one lightweight kernel launch (~2 µs at ncell=65536) per f() call.
+ * The normalize is applied to the CVODE-owned y vector in-place; CVODE
+ * passes y as non-const to f(), so this is legal.  The BDF interpolant
+ * itself is not modified — only the evaluation point seen by f().
+ */
+__global__ static void normalize_m_kernel(
+    sunrealtype* __restrict__ y,
+    int ncell) {
+  const int cell = blockIdx.x * blockDim.x + threadIdx.x;
+  if (cell >= ncell) return;
+
+  const int mx = idx_mx(cell, ncell);
+  const int my = idx_my(cell, ncell);
+  const int mz = idx_mz(cell, ncell);
+
+  const sunrealtype m1 = y[mx];
+  const sunrealtype m2 = y[my];
+  const sunrealtype m3 = y[mz];
+
+  const sunrealtype ymp = sqrt(m1 * m1 + m2 * m2 + m3 * m3);
+
+  if (ymp > SUN_RCONST(1.0e-30)) {
+    const sunrealtype inv_ymp = SUN_RCONST(1.0) / ymp;
+    y[mx] = m1 * inv_ymp;
+    y[my] = m2 * inv_ymp;
+    y[mz] = m3 * inv_ymp;
+  }
+}
+
+/*
  * UNIFIED RHS kernel
  *
  * Reads y (self + 4 neighbors) and h_dmag (self only) from global memory,
  * assembles the TOTAL effective field in one pass:
  *
  *   h_total = h_exchange(neighbors)
- *           + h_anisotropy(m3)
+ *           + h_anisotropy(m1)
  *           + h_DMI(x-neighbors)
  *           + h_demag(self)         ← precomputed via FFT outside
  *
- * then writes the single LLG update for this cell using the strictly
- * |m|-preserving generalized Landau-Lifshitz form:
+ * then writes the standard LLG update for this cell:
  *
- *   dm/dt = γ (m × h) + α ( |m|² h − (m·h) m )
+ *   dm/dt = γ (m × h) + α ( h − (m·h) m )
  *
- * Note the |m|² multiplying h in the damping term — this is what keeps
- * d|m|²/dt identically zero regardless of drift on the unit-sphere
- * manifold. See the header comment at the top of this file.
+ * This is the original simplified form that assumes |m|=1.  The assumption
+ * is enforced by normalize_m_kernel which runs at the top of every f() call,
+ * projecting y back to the unit sphere before the RHS is evaluated.
  */
 __global__ static void f_kernel_unified_soa_periodic(
     const sunrealtype* __restrict__ y,
@@ -309,16 +351,12 @@ __global__ static void f_kernel_unified_soa_periodic(
       c_chb * c_nsk[2] * (y[lz] + y[rz]) +
       h_dmag[mz];
 
-  /* |m|-preserving Landau-Lifshitz: damping term is α(|m|² h − (m·h) m).
-   * On the |m|=1 manifold this equals α(h − (m·h)m) — same physics —
-   * but it has ZERO d|m|²/dt regardless of drift, unlike the simplified
-   * form which amplifies |m|-drift whenever m·h < 0. */
+  /* Standard LLG (|m|=1 enforced by normalize_m_kernel before this). */
   const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
-  const sunrealtype mm = m1 * m1 + m2 * m2 + m3 * m3;
 
-  yd[mx] = c_chg * (m3 * h2 - m2 * h3) + c_alpha * (mm * h1 - mh * m1);
-  yd[my] = c_chg * (m1 * h3 - m3 * h1) + c_alpha * (mm * h2 - mh * m2);
-  yd[mz] = c_chg * (m2 * h1 - m1 * h2) + c_alpha * (mm * h3 - mh * m3);
+  yd[mx] = c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1);
+  yd[my] = c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2);
+  yd[mz] = c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3);
 }
 
 /*
@@ -342,6 +380,16 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
     fprintf(stderr, "Invalid block size: BLOCK_X * BLOCK_Y = %d > 1024\n",
             BLOCK_X * BLOCK_Y);
     return -1;
+  }
+
+  /* Step 0: normalize y in-place so |m| = 1 at every cell.
+   * BDF interpolation can drift |m| away from 1; this projection
+   * ensures the simplified LLG (which assumes |m|=1) is evaluated
+   * on the unit sphere.  Cost: ~2 µs per call at ncell=65536. */
+  {
+    const int nb = 256;
+    const int ng_norm = (udata->ncell + nb - 1) / nb;
+    normalize_m_kernel<<<ng_norm, nb>>>(ydata, udata->ncell);
   }
 
   /* Step 1: demag field (constant f̂ × current m̂, inverse FFT).
@@ -645,7 +693,7 @@ int main(int argc, char* argv[]) {
   printf("Max BDF order: %d   Krylov dim: %d\n", MAX_BDF_ORDER, KRYLOV_DIM);
 
   printf("\n2D periodic LLG — head-on transition + unified-field RHS\n");
-  printf("LLG form: |m|-preserving Landau-Lifshitz (damping = alpha*(|m|^2 h - (m.h) m))\n\n");
+  printf("LLG form: standard (damping = alpha*(h - (m.h)*m)), |m|=1 enforced by normalize-in-f\n\n");
   printf("nx=%d  ny=%d  ng=%d  ncell=%d  neq=%d\n", nx, ny, ng, ncell, neq);
   printf("periodic BC: x and y\n");
   printf("Init: head-on stripes   q1=%d (x=%.2f*ng)   q3=%d (x=%.2f*ng)\n",

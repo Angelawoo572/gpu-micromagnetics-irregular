@@ -10,12 +10,11 @@
  * mat-vec per cell.
  *
  * ─── LLG form matched here ──────────────────────────────────────────
- *   dm/dt = chg (m × h) + alpha (|m|² h − (m·h) m)
+ *   dm/dt = chg (m × h) + alpha ( h − (m·h) m )
  *
- * This is the strictly |m|-preserving form used by f_kernel_unified_soa_periodic
- * in 2d_fft.cu and by jtv_kernel in jtv.cu. Its Jacobian differs from the
- * simplified "damping = α(h − (m·h)m)" form OFF the |m|=1 manifold, so keeping
- * them consistent is critical for Newton convergence once BDF drifts slightly.
+ * This is the standard simplified form assuming |m|=1.  The assumption is
+ * enforced by normalize_m_kernel in 2d_fft.cu's f(), which projects y onto
+ * the unit sphere at the top of every RHS evaluation.
  *
  * ─── What contributes to J_local ─────────────────────────────────────
  *   h_cell = h_exchange(neighbors) + h_DMI(neighbors)
@@ -169,40 +168,21 @@ __global__ static void build_J_kernel(
     const sunrealtype e2 = h2 + m2 * k2;
     const sunrealtype e3 = h3 + m3 * k3;
     const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
-    const sunrealtype mm = m1 * m1 + m2 * m2 + m3 * m3;
 
-    /* ─── Local 3×3 J (|m|-preserving LL) ──────────────────────────────
-     *
-     * Diagonal:
-     *   J[α][α] = alpha * (m_α h_α + (mm − m_α²) k_α − mh)
-     *
-     * Off-diagonal:
-     *   J[α][β] = chg * (prec_αβ) + alpha * (2 m_β h_α − e_β m_α)
-     *
-     * Precession sign convention matches 2d_fft.cu:
-     *   yd[mx] = chg (m3 h2 − m2 h3) + ...
-     * so prec_αβ is obtained by direct differentiation of those three
-     * bilinear expressions (see file header for all nine entries).
-     * ──────────────────────────────────────────────────────────────── */
-    const sunrealtype two = SUN_RCONST(2.0);
+    /* Local 3×3 J for standard LLG: dm/dt = chg(m×h) + α(h − (m·h)m).
+     * |m|=1 is enforced by normalize_m_kernel in f(), so we can use the
+     * simplified Jacobian (no |m|² terms needed). */
+    const sunrealtype J00 = pc_alpha * (k1 - e1 * m1 - mh);
+    const sunrealtype J01 = pc_chg * (m3 * k2 - h3) - pc_alpha * e2 * m1;
+    const sunrealtype J02 = pc_chg * (h2 - m2 * k3) - pc_alpha * e3 * m1;
 
-    const sunrealtype J00 = pc_alpha * (m1*h1 + (mm - m1*m1)*k1 - mh);
-    const sunrealtype J01 = pc_chg * (m3*k2 - h3)
-                          + pc_alpha * (two*m2*h1 - e2*m1);
-    const sunrealtype J02 = pc_chg * (h2 - m2*k3)
-                          + pc_alpha * (two*m3*h1 - e3*m1);
+    const sunrealtype J10 = pc_chg * (h3 - m3 * k1) - pc_alpha * e1 * m2;
+    const sunrealtype J11 = pc_alpha * (k2 - e2 * m2 - mh);
+    const sunrealtype J12 = pc_chg * (m1 * k3 - h1) - pc_alpha * e3 * m2;
 
-    const sunrealtype J10 = pc_chg * (h3 - m3*k1)
-                          + pc_alpha * (two*m1*h2 - e1*m2);
-    const sunrealtype J11 = pc_alpha * (m2*h2 + (mm - m2*m2)*k2 - mh);
-    const sunrealtype J12 = pc_chg * (m1*k3 - h1)
-                          + pc_alpha * (two*m3*h2 - e3*m2);
-
-    const sunrealtype J20 = pc_chg * (m2*k1 - h2)
-                          + pc_alpha * (two*m1*h3 - e1*m3);
-    const sunrealtype J21 = pc_chg * (h1 - m1*k2)
-                          + pc_alpha * (two*m2*h3 - e2*m3);
-    const sunrealtype J22 = pc_alpha * (m3*h3 + (mm - m3*m3)*k3 - mh);
+    const sunrealtype J20 = pc_chg * (m2 * k1 - h2) - pc_alpha * e1 * m3;
+    const sunrealtype J21 = pc_chg * (h1 - m1 * k2) - pc_alpha * e2 * m3;
+    const sunrealtype J22 = pc_alpha * (k3 - e3 * m3 - mh);
 
     /* A = I − γ J */
     const sunrealtype A00 = SUN_RCONST(1.0) - gamma * J00;
@@ -311,7 +291,7 @@ PrecondData* Precond_Create(int ng, int ny, int ncell)
     }
     cudaMemset(pd->d_P, 0, bytes);
 
-    printf("[Precond] Block-Jacobi 3x3 (|m|-preserving LL): ncell=%d, "
+    printf("[Precond] Block-Jacobi 3x3: ncell=%d, "
            "device mem = %.2f MB\n",
            ncell, (double)bytes / 1e6);
     return pd;

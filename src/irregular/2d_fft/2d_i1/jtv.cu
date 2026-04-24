@@ -1,27 +1,17 @@
 /*
- * jtv.cu — Analytic Jv for exchange + anisotropy + DMI (no demag).
+ * jtv.cu — Analytic Jv for exchange + x-axis anisotropy + DMI.
  *
- * Matches the |m|-preserving LLG form used in 2d_fft.cu:
+ * Uses the standard simplified LLG form:
  *
- *   dm/dt = γ (m × h) + α ( |m|² h − (m·h) m )
+ *   dm/dt = γ (m × h) + α ( h − (m·h) m )
  *
- * The damping term's |m|² factor keeps d|m|²/dt ≡ 0 identically on ANY
- * state (not just |m|=1). This is essential at DEMAG_STRENGTH ≥ 2.0 —
- * without it, BDF's O(h^p) drift in |m| is amplified exponentially
- * wherever m·h < 0.
+ * which assumes |m|=1.  This is enforced by normalize_m_kernel in
+ * 2d_fft.cu which projects y onto the unit sphere at the top of every
+ * f() call, before CVODE evaluates the RHS or Jv.
  *
- * ─── Derivative of damping term ──────────────────────────────────────
- * Let D = α ( |m|² h − (m·h) m ).  Then
- *   ∂D/∂m applied to v =  α ( (2 m·v) h + |m|² dh − (dmh) m − (m·h) v )
- * where dh = ∂h/∂m · v and dmh = v·h + m·dh.
- *
- * ─── Fields included in the LOCAL Jv ────────────────────────────────
- *   exchange (5-point stencil, neighbors only → enters dh via v_neighbors)
- *   anisotropy (c_msk = {1,0,0} → c_chk * m1 contributes to dh1)
- *   DMI (c_nsk = {1,0,0} → c_chb*(v_xL + v_xR) contributes to dh1)
- * Demag is NOT included — CVODE's finite-difference Jv would cover it,
- * but this analytic Jv is registered unconditionally; the inexactness in
- * the demag direction is handled by the preconditioned Krylov iteration.
+ * Demag is NOT included in this analytic Jv — adding it would require
+ * a second FFT pipeline per Jv call.  The inexactness is handled by
+ * the preconditioned Krylov iteration without issue.
  *
  * JtvUserData is a 3-pointer mirror matching UserData's first 3 pointers:
  *   offset 0  : void* pd_opaque
@@ -77,8 +67,6 @@ __global__ static void jtv_kernel(
   const sunrealtype v3L=v[jidx_mz(lc,ncell)],v3R=v[jidx_mz(rc,ncell)];
   const sunrealtype v3U=v[jidx_mz(uc,ncell)],v3D=v[jidx_mz(dc,ncell)];
 
-  /* Effective field at this cell (exchange + DMI + easy-axis anisotropy).
-   * DMI on x-axis only affects h1 (c_nsk = {1,0,0}): h1 picks up c_chb*(lx+rx). */
   const sunrealtype che_chb = jc_che + jc_chb;
 
   const sunrealtype h1 =
@@ -95,31 +83,16 @@ __global__ static void jtv_kernel(
               y[jidx_mz(uc,ncell)]+y[jidx_mz(dc,ncell)]);
 
   const sunrealtype mh = m1*h1+m2*h2+m3*h3;
-  const sunrealtype mm = m1*m1+m2*m2+m3*m3;
 
-  /* dh = ∂h/∂m · v */
   const sunrealtype dh1 = che_chb*(v1L+v1R)+jc_che*(v1U+v1D)+jc_chk*v1;
   const sunrealtype dh2 = jc_che*(v2L+v2R+v2U+v2D);
   const sunrealtype dh3 = jc_che*(v3L+v3R+v3U+v3D);
 
-  /* dmh = ∂(m·h)/∂m · v = v·h + m·dh */
   const sunrealtype dmh = (v1*h1+v2*h2+v3*h3)+(m1*dh1+m2*dh2+m3*dh3);
 
-  /* dmm = ∂|m|²/∂m · v = 2 m·v */
-  const sunrealtype dmm = SUN_RCONST(2.0)*(m1*v1+m2*v2+m3*v3);
-
-  /* J v for dm/dt = chg (m × h) + alpha (|m|² h − (m·h) m)
-   *
-   * Precession:  d/dm (m × h)·v = v × h + m × dh
-   * Damping:     d/dm [α(|m|² h − (m·h) m)]·v
-   *              = α ( dmm * h + mm * dh − dmh * m − mh * v )
-   */
-  Jv[mx] = jc_chg*(v3*h2 + m3*dh2 - v2*h3 - m2*dh3)
-         + jc_alpha*(dmm*h1 + mm*dh1 - dmh*m1 - mh*v1);
-  Jv[my] = jc_chg*(v1*h3 + m1*dh3 - v3*h1 - m3*dh1)
-         + jc_alpha*(dmm*h2 + mm*dh2 - dmh*m2 - mh*v2);
-  Jv[mz] = jc_chg*(v2*h1 + m2*dh1 - v1*h2 - m1*dh2)
-         + jc_alpha*(dmm*h3 + mm*dh3 - dmh*m3 - mh*v3);
+  Jv[mx] = jc_chg*(v3*h2+m3*dh2-v2*h3-m2*dh3)+jc_alpha*(dh1-dmh*m1-mh*v1);
+  Jv[my] = jc_chg*(v1*h3+m1*dh3-v3*h1-m3*dh1)+jc_alpha*(dh2-dmh*m2-mh*v2);
+  Jv[mz] = jc_chg*(v2*h1+m2*dh1-v1*h2-m1*dh2)+jc_alpha*(dh3-dmh*m3-mh*v3);
 }
 
 typedef struct {

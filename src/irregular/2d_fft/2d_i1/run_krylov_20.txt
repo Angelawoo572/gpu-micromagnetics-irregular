@@ -1,5 +1,5 @@
-[Precond] Block-Jacobi 3x3 (|m|-preserving LL): ncell=65536, device mem = 4.72 MB
-[Demag GPU v2] Init: nx=256 ny=256 thick=1.0000 strength=1.0000
+[Precond] Block-Jacobi 3x3: ncell=65536, device mem = 4.72 MB
+[Demag GPU v2] Init: nx=256 ny=256 thick=1.0000 strength=2.0000
 [Demag GPU v2] Batched cuFFT (batch=3): 2 calls/Apply instead of 6.
 [Demag GPU v2] In-place FFT, no per-step host transfers.
 [Demag GPU v2] Computing Newell tensor (calt/ctt, 81-pt avg)...
@@ -7,7 +7,7 @@
 [Demag GPU v2] N(0) off-diag at origin: tab=-1.10e-17 tac=0.00e+00 tbc=0.00e+00
 [Demag GPU v2] Device: 9.4 MB (tensor spectra) + 6.3 MB (scratch)
 [Demag GPU v2] Ready.
-[main] Demag self-coupling (strength-scaled): nxx0=-4.5733e+00  nyy0=-4.5733e+00  nzz0=-3.4198e+00
+[main] Demag self-coupling (strength-scaled): nxx0=-9.1465e+00  nyy0=-9.1465e+00  nzz0=-6.8397e+00
 [FusedNVec v4] neq=196608: multi_dot override active.
               linear_comb DISABLED (profile: L2 thrashing at K>=5).
               N_VLinearCombination -> sequential N_VLinearSum fallback.
@@ -16,16 +16,16 @@ GS type: Classical (overhead-limited, neq=196608)
 Max BDF order: 5   Krylov dim: 20
 
 2D periodic LLG — head-on transition + unified-field RHS
-LLG form: |m|-preserving Landau-Lifshitz (damping = alpha*(|m|^2 h - (m.h) m))
+LLG form: standard (damping = alpha*(h - (m.h)*m)), |m|=1 enforced by normalize-in-f
 
 nx=768  ny=256  ng=256  ncell=65536  neq=196608
 periodic BC: x and y
 Init: head-on stripes   q1=64 (x=0.25*ng)   q3=192 (x=0.75*ng)
       mx = -1 | +1 | -1       random my,mz amplitude = 0.010
-DEMAG_STRENGTH=1.0000  DEMAG_THICK=1.0000  (h_dmag = IFFT[f_hat * m_hat] via cuFFT Z2Z, fused into RHS)
+DEMAG_STRENGTH=2.0000  DEMAG_THICK=1.0000  (h_dmag = IFFT[f_hat * m_hat] via cuFFT Z2Z, fused into RHS)
 T_TOTAL=1000.00  RTOL/ATOL=1.0e-04
-GPU simulation took 9628.329 ms
+GPU simulation took 15710.814 ms
 
 Final Statistics:
-nst = 12537  nfe  = 17303  nsetups = 1824   nni = 17300  ncfn = 529    netf = 44     nge = 0
-nli = 63315  nlcf = 2      njvevals = 63315
+nst = 26564  nfe  = 33657  nsetups = 1342   nni = 33654  ncfn = 0      netf = 11     nge = 0
+nli = 90342  nlcf = 0      njvevals = 90342

@@ -321,7 +321,6 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
         cufftDoubleComplex *h_tmp = (cufftDoubleComplex*)malloc(csz);
         /* We use d_m_io[0..ncell-1] as a temp device buffer for single FFTs. */
         cufftDoubleComplex *d_tmp_in  = d->d_m_io;            /* reuse batch buf */
-        cufftDoubleComplex *d_tmp_out;                         /* permanent f̂ target */
 
         auto fft_one_tensor = [&](double *t_host, cufftDoubleComplex *d_out) {
             for (int idx = 0; idx < nx*ny; idx++) {
