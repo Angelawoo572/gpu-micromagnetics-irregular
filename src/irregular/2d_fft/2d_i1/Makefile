@@ -293,7 +293,7 @@ reallyclean: clean
 	rm -f $(PROFILE_OUT).nsys-rep $(PROFILE_OUT).qdrep $(PROFILE_OUT).sqlite
 	rm -f ncu_$(TARGET).ncu-rep ncu_$(DIRECT_TARGET).ncu-rep
 	rm -rf csv_out
-	rm -f *.txt
+	rm -f output.txt
 
 reports:
 	$(NSYS) stats --help-reports || true
