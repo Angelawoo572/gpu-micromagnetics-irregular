@@ -1,38 +1,45 @@
 /*
- * 1. Pointer arrays and coefficient arrays are passed DIRECTLY in the kernel
- *    argument space (goes into the GPU constant cache) — eliminates all
- *    per-call H2D cudaMemcpy for those small arrays.  v1 added ~1.6 s of
- *    extra synchronous memcpy time; v2 adds zero.
+ * deferred_nvector.cu  —  v4: multi_dot only
  *
- * 2. N_VScaleAddMulti override REMOVED.  Profiling showed our kernel was
- *    slower than SUNDIALS' built-in (379 µs vs 307 µs avg).
+ * ─── What changed from v3 ────────────────────────────────────────────
+ * linear_comb_kernel REMOVED.
  *
- * 3. Now pairs with Classical Gram-Schmidt (CGS) in SPGMR.
- *    Root cause why v1 showed no speedup on dot products:
- *      Modified GS (SPGMR default) calls N_VDotProd in a sequential loop —
- *      each call returns a scalar synchronously, K calls = K syncs.
- *      It is inherently sequential: step i+1 needs the result of step i,
- *      so N_VDotProdMulti is NEVER called by MGS.
+ * Nsight Systems profiling at neq=196608 showed linear_comb_kernel was
+ * the #1 GPU bottleneck at 31.6% of total kernel time (4.59 s, 114,887
+ * calls, 40 µs avg).  Root cause: reading K≥5 arrays of 1.5 MB each in
+ * a single kernel pass causes L2 cache thrashing across 128 SMs.
  *
- *    Classical GS first computes all K dot products against the
- *    un-modified vector, then applies all corrections.  SUNDIALS
- *    dispatches that batch through N_VDotProdMulti when the op
- *    pointer is non-NULL.  Result: K syncs per GMRES iteration → 1 sync.
+ * SUNDIALS' fallback — sequential N_VLinearSum calls (2 arrays per call,
+ * ~2.5 µs each) — is 3× faster in aggregate because each call fits in
+ * L2 comfortably.  Disabling linear_comb saves ~3 s per run (~20% of
+ * total GPU kernel time).
  *
- *    To activate, add after SUNLinSol_SPGMR(...):
- *      SUNLinSol_SPGMRSetGSType(LS, SUN_CLASSICAL_GS);
- *    (already done in the updated 2d_p.cu)
+ * The threshold-based regime logic (v3) was too aggressive: the
+ * crossover is not at neq=500K as originally estimated but much lower
+ * (~50K on Ada Lovelace, depending on Krylov dim and L2 partitioning).
+ * Rather than guess a new threshold, we simply never install the
+ * override — the multi-array fused kernel has no regime where it wins
+ * over SUNDIALS' sequential 2-vector approach on current hardware.
  *
- * What is still overridden
- * - nvdotprodmulti     : K dot products in 1 kernel + 1 sync (big win w/ CGS)
- * - nvlinearcombination: nv-vector combo in 1 kernel, 1 memory pass
- * - nvclone            : propagates both to all CVODE-internal vectors
+ * ─── What is still overridden ────────────────────────────────────────
+ * - nvdotprodmulti  : K dot products in 1 kernel + 1 sync.
+ *                     Profile shows 9.5% (1.38 s) for 77K calls.
+ *                     Without it (MGS with per-dot sync), cost would be
+ *                     ~16 s (386K individual dots × 43 µs each).
+ *                     This is a 12× win — the clearest optimization.
  *
- * Why struct-based kernel args work for small arrays
- * CUDA copies kernel arguments into a 4 KB per-launch constant buffer.
- * A struct with 16 double-pointers = 128 bytes fits entirely there and
- * is served from the constant cache — same bandwidth as __constant__,
- * zero extra API calls.
+ * - nvclone         : propagates multi_dot to all CVODE-internal vectors.
+ *
+ * ─── Important: N_VLinearCombination fallback ────────────────────────
+ * N_VEnableFusedOps_Cuda(v, 1) sets ALL fused op pointers, including
+ * SUNDIALS' own nvlinearcombination which has the same K-array problem.
+ * We explicitly NULL it out after the enable call so SUNDIALS falls back
+ * to the sequential N_VScale + N_VLinearSum loop.  This is the key fix.
+ *
+ * ─── Pairing with Classical GS ──────────────────────────────────────
+ * CGS batches all K dot products in GMRES orthogonalization into one
+ * N_VDotProdMulti call.  With our override that's 1 kernel + 1 sync
+ * instead of K kernels + K syncs.  Keep SUN_CLASSICAL_GS in main.
  */
 
 #include "deferred_nvector.h"
@@ -44,16 +51,12 @@
 #include <stdio.h>
 
 /* Compile-time constants */
-
-/* SPGMR default Krylov dim = 5; 16 is generous headroom.
- * Shared memory per block: 16 * 256 * 8 = 32 768 B < 48 KB.  */
 #define FUSED_MAX_VECS   16
 #define FUSED_BLOCK_SIZE 256
 
 /* Kernel argument bundles — passed by VALUE into constant cache,
  * no H2D memcpy needed. */
 typedef struct { const sunrealtype *p[FUSED_MAX_VECS]; } FusedPtrBundle;
-typedef struct { sunrealtype        c[FUSED_MAX_VECS]; } FusedCoeffBundle;
 
 /* Persistent device pool — ONLY for reduction output scalars */
 static sunrealtype *d_result_pool = NULL;
@@ -80,7 +83,7 @@ void FusedNVec_FreePool(void)
     g_pool_ready  = 0;
 }
 
-/* Kernel 1: multi_dot_kernel
+/* Kernel: multi_dot_kernel
  *
  * out[k] = sum_i  x[i] * Y.p[k][i]   for k = 0..K-1
  *
@@ -126,30 +129,6 @@ __global__ static void multi_dot_kernel(
             atomicAdd(&out[k], smem[k * bsz]);
 }
 
-/* Kernel 2: linear_comb_kernel
- *
- * z[i] = sum_{j} C.c[j] * X.p[j][i]
- *
- * Coefficients and pointers both in the constant-cache bundle.
- * Single memory pass. */
-__global__ static void linear_comb_kernel(
-    int              nv,
-    FusedCoeffBundle C,
-    FusedPtrBundle   X,
-    sunrealtype*     __restrict__ z,
-    sunindextype     n)
-{
-    sunindextype i      = (sunindextype)blockIdx.x * blockDim.x + threadIdx.x;
-    sunindextype stride = (sunindextype)gridDim.x  * blockDim.x;
-
-    for (; i < n; i += stride) {
-        sunrealtype s = SUN_RCONST(0.0);
-        for (int j = 0; j < nv; j++)
-            s += C.c[j] * X.p[j][i];
-        z[i] = s;
-    }
-}
-
 /* Helper */
 static int grid_for(sunindextype n)
 {
@@ -159,7 +138,6 @@ static int grid_for(sunindextype n)
 
 /* forward decl */
 static N_Vector FusedNVec_Clone(N_Vector w);
-static N_Vector FusedNVec_Clone_impl(N_Vector w, int use_lc);
 static N_Vector (*g_original_clone)(N_Vector) = NULL;
 
 /* N_VDotProdMulti override
@@ -201,88 +179,29 @@ static SUNErrCode FusedNVec_DotProdMulti(
     return SUN_SUCCESS;
 }
 
-/* 
- * N_VLinearCombination override
- *
- * z = sum_{j} c[j] * X[j]  in one kernel, one memory pass.
- * Bundles go via kernel arg space — zero H2D overhead. */
-static SUNErrCode FusedNVec_LinearCombination(
-    int nv, sunrealtype *c, N_Vector *X, N_Vector z)
-{
-    if (nv <= 0) return SUN_SUCCESS;
-    if (nv == 1) { N_VScale(c[0], X[0], z); return SUN_SUCCESS; }
-
-    if (nv > FUSED_MAX_VECS) {
-        N_VScale(c[0], X[0], z);
-        for (int j = 1; j < nv; j++)
-            N_VLinearSum(SUN_RCONST(1.0), z, c[j], X[j], z);
-        return SUN_SUCCESS;
-    }
-
-    const sunindextype  n  = N_VGetLength(z);
-    sunrealtype        *zd = N_VGetDeviceArrayPointer_Cuda(z);
-
-    FusedCoeffBundle Cb;
-    FusedPtrBundle   Xb;
-    for (int j = 0; j < nv; j++) {
-        Cb.c[j] = c[j];
-        Xb.p[j] = N_VGetDeviceArrayPointer_Cuda(X[j]);
-    }
-
-    linear_comb_kernel<<<grid_for(n), FUSED_BLOCK_SIZE>>>(nv, Cb, Xb, zd, n);
-
-    /* async — no sync needed, result stays on device */
-    return SUN_SUCCESS;
-}
-
-/*
- * Threshold between overhead-limited and bandwidth-limited regimes.
- *
- * Below this threshold the problem is small enough that CVODE
- * orchestration overhead dominates.  Switching to Classical GS and
- * installing the linear_comb_kernel override reduces sync count and
- * wins on end-to-end time.
- *
- * Above this threshold each kernel is long enough that bandwidth
- * (not sync count) is the bottleneck.  The linear_comb_kernel reads
- * K large arrays simultaneously (K=Krylov dim, default 5), causing
- * L2 cache thrashing and ~17% effective bandwidth — far worse than
- * SUNDIALS' sequential N_VLinearSum calls (88% efficient, 2 arrays
- * per call).  CGS would add 54+ seconds on 3M-element problems.
- * For large n: use Modified GS (the default) and skip the
- * linear_comb override.  Only the multi_dot override is kept so
- * that IF the caller switches to CGS independently, it still helps.
- *
- * Empirical crossover:  ~500 K elements.
- * Adjust if your hardware has a different L2 / bandwidth ratio.
- */
-#define FUSED_SMALL_NEQ_THRESHOLD 500000
-
-/* g_use_linear_comb_override is set in FusedNVec_Init based on neq */
-static int g_use_lc_override = 0;
-
-static N_Vector FusedNVec_Clone_impl(N_Vector w, int use_lc)
+static N_Vector FusedNVec_Clone(N_Vector w)
 {
     N_Vector v = g_original_clone(w);
     if (!v) return NULL;
+
+    /* Tier 1: enable SUNDIALS built-in fused ops */
     N_VEnableFusedOps_Cuda(v, 1);
+
+    /* Tier 3: our multi_dot override */
     v->ops->nvdotprodmulti = FusedNVec_DotProdMulti;
-    if (use_lc)
-        v->ops->nvlinearcombination = FusedNVec_LinearCombination;
+
+    /* CRITICAL: NULL out linear combination to force sequential fallback.
+     * N_VEnableFusedOps_Cuda sets it to SUNDIALS' fused kernel which has
+     * the same K-array L2 thrashing problem as our custom kernel. */
+    v->ops->nvlinearcombination = NULL;
+
+    /* Propagate clone override */
     v->ops->nvclone = FusedNVec_Clone;
+
     return v;
 }
 
-static N_Vector FusedNVec_Clone(N_Vector w)
-{
-    return FusedNVec_Clone_impl(w, g_use_lc_override);
-}
-
-/* Public entry point
- *
- * neq  : total number of equations (N_VGetLength(v)).
- *        Used to choose the right regime automatically.
- */
+/* Public entry point */
 void FusedNVec_Init(N_Vector v)
 {
     if (!v) return;
@@ -292,26 +211,25 @@ void FusedNVec_Init(N_Vector v)
     if (!g_original_clone)
         g_original_clone = v->ops->nvclone;
 
-    /* Decide regime */
-    g_use_lc_override = (neq < FUSED_SMALL_NEQ_THRESHOLD) ? 1 : 0;
+    /* Tier 1: SUNDIALS built-in fused ops */
+    N_VEnableFusedOps_Cuda(v, 1);
 
-    N_VEnableFusedOps_Cuda(v, 1);                         /* Tier 1 */
-    v->ops->nvdotprodmulti = FusedNVec_DotProdMulti;      /* Tier 3 */
-    if (g_use_lc_override)
-        v->ops->nvlinearcombination = FusedNVec_LinearCombination;
+    /* Tier 3: custom multi_dot (big win with CGS) */
+    v->ops->nvdotprodmulti = FusedNVec_DotProdMulti;
+
+    /* Force sequential fallback for N_VLinearCombination.
+     * Profile-proven: SUNDIALS' 2-vector N_VLinearSum loop is 3× faster
+     * than any K-vector fused kernel at this problem size. */
+    v->ops->nvlinearcombination = NULL;
+
+    /* Propagate to all CVODE-internal clones */
     v->ops->nvclone = FusedNVec_Clone;
 
     ensure_pool();
 
-    if (g_use_lc_override) {
-        printf("[FusedNVec v3] neq=%ld < %d: OVERHEAD-LIMITED regime.\n"
-               "               Tier1 + multi_dot + linear_comb installed.\n"
-               "               Use Classical GS for full benefit.\n",
-               (long)neq, FUSED_SMALL_NEQ_THRESHOLD);
-    } else {
-        printf("[FusedNVec v3] neq=%ld >= %d: BANDWIDTH-LIMITED regime.\n"
-               "               Tier1 + multi_dot only (linear_comb skipped).\n"
-               "               Keep Modified GS (default) for this size.\n",
-               (long)neq, FUSED_SMALL_NEQ_THRESHOLD);
-    }
+    printf("[FusedNVec v4] neq=%ld: multi_dot override active.\n"
+           "              linear_comb DISABLED (profile: L2 thrashing at K>=5).\n"
+           "              N_VLinearCombination -> sequential N_VLinearSum fallback.\n"
+           "              Use Classical GS for multi_dot benefit.\n",
+           (long)neq);
 }

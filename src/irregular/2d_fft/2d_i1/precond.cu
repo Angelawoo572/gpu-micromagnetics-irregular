@@ -23,8 +23,8 @@
  *
  *   Only terms that depend on THIS cell's m appear in ∂h/∂m_self:
  *     ∂h1/∂m1 = c_chk  + Nxx(0)·strength
- *     ∂h2/∂m2 = Nyy(0)·strength
- *     ∂h3/∂m3 = Nzz(0)·strength
+ *     ∂h2/∂m2 =           Nyy(0)·strength
+ *     ∂h3/∂m3 =           Nzz(0)·strength
  *     off-diagonals zero (c_msk components off, N(0) diagonal by symmetry).
  *
  *   Shorthand:  k1 = c_chk + Nxx0,  k2 = Nyy0,  k3 = Nzz0.
@@ -171,7 +171,8 @@ __global__ static void build_J_kernel(
     const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
     const sunrealtype mm = m1 * m1 + m2 * m2 + m3 * m3;
 
-    /* Local 3×3 J (|m|-preserving LL)
+    /* ─── Local 3×3 J (|m|-preserving LL) ──────────────────────────────
+     *
      * Diagonal:
      *   J[α][α] = alpha * (m_α h_α + (mm − m_α²) k_α − mh)
      *
@@ -182,7 +183,7 @@ __global__ static void build_J_kernel(
      *   yd[mx] = chg (m3 h2 − m2 h3) + ...
      * so prec_αβ is obtained by direct differentiation of those three
      * bilinear expressions (see file header for all nine entries).
-     */
+     * ──────────────────────────────────────────────────────────────── */
     const sunrealtype two = SUN_RCONST(2.0);
 
     const sunrealtype J00 = pc_alpha * (m1*h1 + (mm - m1*m1)*k1 - mh);

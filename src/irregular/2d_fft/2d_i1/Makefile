@@ -27,17 +27,22 @@ RTOL_VAL ?= 1.0e-4
 ATOL_VAL ?= 1.0e-4
 T_TOTAL  ?= 1000.0
 
+# KRYLOV_DIM: max Krylov subspace dimension for SPGMR.
+#   0 = SUNDIALS default (min(neq, 5)).
+#  15 = more GMRES headroom before restart.  Profile at dim=5 showed
+#       nli=75,314 with average 3.2 iters/solve but ~30% of solves hit
+#       the restart limit.  dim=15 lets those continue instead of restarting.
+#       Cost: 15 N_Vectors (~22 MB) vs 5 (~7.5 MB).  Easily fits.
+KRYLOV_DIM ?= 0
+
 # ====== FFT Demagnetization (professor's Newell calt/ctt) ======
 # DEMAG_STRENGTH = 0.0  → disabled (exchange-only, original behaviour)
 # DEMAG_STRENGTH = 1.0  → full dipolar demag via cuFFT Z2Z
 # DEMAG_THICK           → cell thickness in z (in cell-spacing units)
-DEMAG_STRENGTH ?= 1.0
+DEMAG_STRENGTH ?= 2.0
 DEMAG_THICK    ?= 1.0
 
 # ====== Output schedule ======
-# EARLY_SAVE_UNTIL ?= 80.0
-# EARLY_SAVE_EVERY ?= 5
-# LATE_SAVE_EVERY  ?= 100
 EARLY_SAVE_UNTIL ?= 0.0
 EARLY_SAVE_EVERY ?= 100
 LATE_SAVE_EVERY  ?= 100
@@ -52,6 +57,7 @@ NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) \
               -DRTOL_VAL=$(RTOL_VAL) -DATOL_VAL=$(ATOL_VAL) \
               -DT_TOTAL=$(T_TOTAL) \
+              -DKRYLOV_DIM=$(KRYLOV_DIM) \
               -DEARLY_SAVE_UNTIL=$(EARLY_SAVE_UNTIL) \
               -DEARLY_SAVE_EVERY=$(EARLY_SAVE_EVERY) \
               -DLATE_SAVE_EVERY=$(LATE_SAVE_EVERY) \
@@ -90,7 +96,7 @@ NCU_FLAGS ?= --set roofline -o ncu_$(TARGET)
 
 .PHONY: all run run-debug build-debug build-release \
         run-print run-noprint run-demag run-no-demag \
-        sweep-block sweep-tol sweep-demag \
+        sweep-block sweep-tol sweep-demag sweep-krylov \
         profile profile-light profile-ext stats \
         export-csv export-sqlite ui compute \
         show-config clean reallyclean reports
@@ -110,7 +116,7 @@ $(JTV_OBJ): $(JTV_SRC) jtv.h
 	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
 	    $(INCLUDE_FLAGS) -c $< -o $@
 
-# Professor's Newell tensor (calt/ctt) + cuFFT Z2Z convolution
+# Professor's Newell tensor (calt/ctt) + cuFFT Z2Z convolution (batched)
 $(DEMAG_OBJ): $(DEMAG_SRC) demag_fft.h
 	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
 	    $(INCLUDE_FLAGS) -c $< -o $@
@@ -187,6 +193,15 @@ sweep-demag:
 	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_demag_$${s}.txt; \
 	done
 
+sweep-krylov:
+	@for kd in 0 5 10 15 20 30; do \
+	  echo "========================================"; \
+	  echo "Testing KRYLOV_DIM=$$kd"; \
+	  $(MAKE) clean >/dev/null 2>&1; \
+	  $(MAKE) BUILD=release PRINT=0 KRYLOV_DIM=$$kd >/dev/null && \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_krylov_$${kd}.txt; \
+	done
+
 # ====== Nsight Systems ======
 profile: $(TARGET)
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
@@ -231,6 +246,7 @@ show-config:
 	@echo "TARGET         = $(TARGET)"
 	@echo "DEMAG_STRENGTH = $(DEMAG_STRENGTH)  (0=off, 1=full Newell tensor)"
 	@echo "DEMAG_THICK    = $(DEMAG_THICK)"
+	@echo "KRYLOV_DIM     = $(KRYLOV_DIM)  (0=SUNDIALS default=5)"
 	@echo "RTOL_VAL       = $(RTOL_VAL)"
 	@echo "ATOL_VAL       = $(ATOL_VAL)"
 	@echo "T_TOTAL        = $(T_TOTAL)"
@@ -240,16 +256,6 @@ show-config:
 
 
 # ====== Direct (O(N²)) target — drop-in swap of demag module ======
-# Uses same 2d_fft.cu but links demag_direct.o instead of demag_fft.o
-# Everything else (CVODE, precond, jtv, fused_nvec) is identical.
-#
-# Build:
-#   make 2d_direct
-# Run:
-#   make run-direct
-# Compare timing:
-#   make bench
-
 DIRECT_TARGET  := 2d_direct
 DIRECT_DEMAG_SRC := demag_direct.cu
 DIRECT_DEMAG_OBJ := demag_direct.o
@@ -259,8 +265,6 @@ $(DIRECT_DEMAG_OBJ): $(DIRECT_DEMAG_SRC) demag_fft.h
 	$(NVCC) $(CUDA_ARCH) -O3 --use_fast_math \
 	    $(INCLUDE_FLAGS) -c $< -o $@
 
-# Note: SRC (2d_fft.cu) is reused — it includes demag_fft.h which both
-# demag_fft.cu and demag_direct.cu implement. Only the linked .o differs.
 $(DIRECT_TARGET): 2d_fft.cu $(DIRECT_OBJS) deferred_nvector.h precond.h jtv.h demag_fft.h
 	$(NVCC) $(NVCC_FLAGS) $(INCLUDE_FLAGS) -o $@ 2d_fft.cu $(DIRECT_OBJS) \
 	    $(LIBRARY_FLAGS) $(LDLIBS)
@@ -268,9 +272,6 @@ $(DIRECT_TARGET): 2d_fft.cu $(DIRECT_OBJS) deferred_nvector.h precond.h jtv.h de
 run-direct: $(DIRECT_TARGET)
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(DIRECT_TARGET) $(ARGS)
 
-# ── Side-by-side timing benchmark ──────────────────────────────────────
-# Builds both targets and runs each once, printing GPU time.
-# Redirect stderr to /dev/null to suppress calt progress messages.
 bench: $(TARGET) $(DIRECT_TARGET)
 	@echo "========================================================"
 	@echo "FFT version    (O(N log N)):"

@@ -344,14 +344,19 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
     return -1;
   }
 
-  /* Step 1: demag field (constant f̂ × current m̂, inverse FFT). */
-  cudaMemsetAsync(udata->d_hdmag, 0,
-                  (size_t)3 * udata->ncell * sizeof(sunrealtype), 0);
-
+  /* Step 1: demag field (constant f̂ × current m̂, inverse FFT).
+   *
+   * When demag is active, Demag_Apply's unshift_h_kernel OVERWRITES
+   * h_out (not +=), so the memset is redundant — skip it.
+   * When demag is off, zero the buffer once so the unified kernel
+   * reads zeros from h_dmag[mx/my/mz] and demag contributes nothing. */
   if (udata->demag && DEMAG_STRENGTH > 0.0) {
     Demag_Apply(udata->demag,
                 (const double*)ydata,
                 (double*)udata->d_hdmag);
+  } else {
+    cudaMemsetAsync(udata->d_hdmag, 0,
+                    (size_t)3 * udata->ncell * sizeof(sunrealtype), 0);
   }
 
   /* Step 2: unified kernel — one pass over y + h_dmag → ydot. */
@@ -560,7 +565,7 @@ int main(int argc, char* argv[]) {
    * to break the y-z symmetry; after normalization |m| = 1. Under LLG
    * relaxation these perturbations are what allow the chevron/zigzag
    * domain-wall structure (Fig. 5.7) to emerge from the sharp step.
-   */
+   * ─────────────────────────────────────────────────────────────────── */
   {
     const double eps = (double)INIT_RANDOM_EPS;
     srand((unsigned int)INIT_RANDOM_SEED);
