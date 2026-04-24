@@ -1,13 +1,23 @@
 /**
- * 2D periodic smooth-texture LLG solver
- * CVODE + CUDA, SoA layout
+ * 2D periodic smooth-texture LLG solver — unified-field RHS + GPU-only demag.
+ * CVODE + CUDA, SoA layout.
  *
- * Demag field ( Newell tensor, calt/ctt, Z2Z cuFFT):
- *   h_dmag(i,j) = Σ_{m,n} N(i-m, j-n) · M(m,n)   [convolution]
- *               = IFFT[ N̂(k) · M̂(k) ]             [via cuFFT Z2Z]
+ * Easy axis along z (c_msk = {0,0,1}); DMI along x (c_nsk = {1,0,0}).
+ * Initial condition: smooth Néel-like circular texture.
+ *
+ * ─── Effective-field structure ──────────────────────────────────────
+ * Every RHS cell sees ONE total field assembled inside a single kernel:
+ *
+ *   h_total = h_exchange + h_anisotropy + h_DMI + h_demag
+ *
+ * Demag is NOT a post-processing step. It is precomputed per f() as
+ *
+ *   h_dmag = IFFT[ f̂(k) · ŷ(k) ]        ← f̂ constant, computed once
+ *
+ * and then read inside the unified kernel just like any other SoA field.
  *
  * Enable:  make DEMAG_STRENGTH=1.0 DEMAG_THICK=1.0
- * Disable: make DEMAG_STRENGTH=0.0  (zero overhead in f())
+ * Disable: make DEMAG_STRENGTH=0.0   (h_dmag buffer stays zero)
  */
 
 #include <cvode/cvode.h>
@@ -25,14 +35,12 @@
 #include "deferred_nvector.h"
 #include "precond.h"
 #include "jtv.h"
-#include "demag_fft.h"   /*  Newell tensor demag */
+#include "demag_fft.h"
 
 /* Problem constants */
 #define GROUPSIZE 3
 
-/* -------------------------------------------------------
- * Solver tuning knobs
- * ------------------------------------------------------- */
+/* ─── Solver tuning knobs ─────────────────────────────────────────── */
 #ifndef KRYLOV_DIM
 #define KRYLOV_DIM 0
 #endif
@@ -49,7 +57,7 @@
 #define ATOL_VAL 1.0e-5
 #endif
 
-/* Demag controls */
+/* ─── Demag controls ──────────────────────────────────────────────── */
 #ifndef DEMAG_STRENGTH
 #define DEMAG_STRENGTH 0.0
 #endif
@@ -124,7 +132,9 @@
 #define LATE_SAVE_EVERY 100
 #endif
 
-/* typed constant memory */
+/* ─── Material constants (device constant memory) ─────────────────── */
+/* Easy axis along z: anisotropy feeds off m3 into h3.
+ * DMI direction along x: c_nsk = {1,0,0}. */
 __constant__ sunrealtype c_msk[3] = {
     SUN_RCONST(0.0), SUN_RCONST(0.0), SUN_RCONST(1.0)};
 __constant__ sunrealtype c_nsk[3] = {
@@ -137,7 +147,7 @@ __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
 __constant__ sunrealtype c_cha   = SUN_RCONST(0.0);
 __constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
 
-/* error checking */
+/* ─── Error checking ──────────────────────────────────────────────── */
 #define CHECK_CUDA(call)                                                     \
   do {                                                                       \
     cudaError_t _err = (call);                                               \
@@ -162,11 +172,14 @@ __constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
  * UserData
  *
  * IMPORTANT: field ORDER IS CRITICAL.
- *   - PrecondData *pd  MUST be at offset 0  (PrecondSetup/Solve cast rule)
- *   - DemagData   *demag  at offset 8
- *   - sunrealtype *d_hdmag at offset 16
+ *   - PrecondData *pd       at offset 0  (PrecondSetup/Solve cast rule)
+ *   - DemagData   *demag    at offset 8
+ *   - sunrealtype *d_hdmag  at offset 16 — always allocated, zero if demag off
  *   - ints follow at offset 24+
- * JtvUserData in jtv.cu mirrors this layout exactly.
+ *   - doubles (self-coupling Nαα(0)*strength) at the tail
+ *
+ * jtv.cu's JtvUserData and precond.cu's PcUserData mirror this layout
+ * byte-for-byte. When adding/reordering fields, update both mirrors.
  */
 typedef struct {
   PrecondData  *pd;        /* offset 0  — must be first */
@@ -177,35 +190,48 @@ typedef struct {
   int ng;                  /* offset 32 */
   int ncell;               /* offset 36 */
   int neq;                 /* offset 40 */
+  /* 4 bytes padding before double alignment */
+  double nxx0;             /* offset 48 — Nxx(0) * demag_strength */
+  double nyy0;             /* offset 56 — Nyy(0) * demag_strength */
+  double nzz0;             /* offset 64 — Nzz(0) * demag_strength */
 } UserData;
 
-/* SoA indexing helpers */
+/* ─── SoA indexing helpers ────────────────────────────────────────── */
 __host__ __device__ static inline int idx_mx(int cell, int ncell) {
   return cell;
 }
-
 __host__ __device__ static inline int idx_my(int cell, int ncell) {
   return ncell + cell;
 }
-
 __host__ __device__ static inline int idx_mz(int cell, int ncell) {
   return 2 * ncell + cell;
 }
-
 __host__ __device__ static inline int wrap_x(int x, int ng) {
   return (x < 0) ? (x + ng) : ((x >= ng) ? (x - ng) : x);
 }
-
 __host__ __device__ static inline int wrap_y(int y, int ny) {
   return (y < 0) ? (y + ny) : ((y >= ny) ? (y - ny) : y);
 }
 
 /*
- * Exchange RHS kernel — unchanged from original 2d_p.cu
+ * UNIFIED RHS kernel
+ *
+ * Reads y (self + 4 neighbors) and h_dmag (self only) from global memory,
+ * assembles the TOTAL effective field in one pass:
+ *
+ *   h_total = h_exchange(neighbors)
+ *           + h_anisotropy(m3)         ← c_msk = {0,0,1}, easy axis along z
+ *           + h_DMI(x-neighbors)
+ *           + h_demag(self)            ← precomputed via FFT outside
+ *
+ * then writes the single LLG update for this cell.
+ *
+ * No separate demag_correction_kernel.
  */
-__global__ static void f_kernel_group_soa_periodic(
+__global__ static void f_kernel_unified_soa_periodic(
     const sunrealtype* __restrict__ y,
-    sunrealtype* __restrict__ yd,
+    const sunrealtype* __restrict__ h_dmag,
+    sunrealtype*       __restrict__ yd,
     int ng, int ny, int ncell) {
 
   const int gx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -224,9 +250,9 @@ __global__ static void f_kernel_group_soa_periodic(
   const int yu   = wrap_y(gy - 1, ny);
   const int ydwn = wrap_y(gy + 1, ny);
 
-  const int left_cell  = gy * ng + xl;
-  const int right_cell = gy * ng + xr;
-  const int up_cell    = yu * ng + gx;
+  const int left_cell  = gy   * ng + xl;
+  const int right_cell = gy   * ng + xr;
+  const int up_cell    = yu   * ng + gx;
   const int down_cell  = ydwn * ng + gx;
 
   const sunrealtype m1 = y[mx];
@@ -248,21 +274,28 @@ __global__ static void f_kernel_group_soa_periodic(
   const int uz = idx_mz(up_cell,    ncell);
   const int dz = idx_mz(down_cell,  ncell);
 
+  /* Assemble TOTAL field — demag is just another SoA field in the sum.
+   * Anisotropy couples to m3 (easy axis along z): c_msk = {0,0,1},
+   * so only h3 gets (c_chk*m3 + c_cha). DMI (c_nsk={1,0,0}) only h1. */
   const sunrealtype h1 =
-      c_che * (y[lx] + y[rx] + y[ux] + y[dx]) +
-      c_msk[0] * (c_chk * m3 + c_cha) +
-      c_chb * c_nsk[0] * (y[lx] + y[rx]);
+      c_che * (y[lx] + y[rx] + y[ux] + y[dx]) +   /* exchange    */
+      c_msk[0] * (c_chk * m3 + c_cha) +           /* anisotropy  */
+      c_chb * c_nsk[0] * (y[lx] + y[rx]) +        /* DMI         */
+      h_dmag[mx];                                 /* demag (FFT) */
 
   const sunrealtype h2 =
       c_che * (y[ly] + y[ry] + y[uy] + y[dy]) +
       c_msk[1] * (c_chk * m3 + c_cha) +
-      c_chb * c_nsk[1] * (y[ly] + y[ry]);
+      c_chb * c_nsk[1] * (y[ly] + y[ry]) +
+      h_dmag[my];
 
   const sunrealtype h3 =
       c_che * (y[lz] + y[rz] + y[uz] + y[dz]) +
       c_msk[2] * (c_chk * m3 + c_cha) +
-      c_chb * c_nsk[2] * (y[lz] + y[rz]);
+      c_chb * c_nsk[2] * (y[lz] + y[rz]) +
+      h_dmag[mz];
 
+  /* Single LLG evaluation with the combined h. */
   const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
 
   yd[mx] = c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1);
@@ -271,38 +304,14 @@ __global__ static void f_kernel_group_soa_periodic(
 }
 
 /*
- * demag_correction_kernel
- *
- * Adds the LLG contribution of h_dmag to ydot:
- *   ydot += γ(m × h_dmag) + α(h_dmag - (m·h_dmag)·m)
- *
- * Exactly as in src/2d_fft/2d_fft.cu.
- */
-__global__ static void demag_correction_kernel(
-    const sunrealtype* __restrict__ y,
-    const sunrealtype* __restrict__ hd,
-    sunrealtype*       __restrict__ ydot,
-    int ncell)
-{
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= ncell) return;
-
-    const sunrealtype m1 = y[c],        m2 = y[ncell+c],    m3 = y[2*ncell+c];
-    const sunrealtype h1 = hd[c],       h2 = hd[ncell+c],   h3 = hd[2*ncell+c];
-    const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
-
-    ydot[c]          += c_chg*(m3*h2 - m2*h3) + c_alpha*(h1 - mh*m1);
-    ydot[ncell+c]    += c_chg*(m1*h3 - m3*h1) + c_alpha*(h2 - mh*m2);
-    ydot[2*ncell+c]  += c_chg*(m2*h1 - m1*h2) + c_alpha*(h3 - mh*m3);
-}
-
-/*
  * RHS wrapper for CVODE
  *
- * Step 1: exchange stencil (original kernel, unchanged)
- * Step 2: demag field via FFT convolution ( Newell tensor)
- *         h_dmag = IFFT[ N̂(k) · M̂(k) ]
- *         ydot  += LLG(m, h_dmag)
+ * Step 1: compute h_dmag = IFFT[ f̂ · FFT(y) ]
+ *         f̂ is precomputed once in Demag_Init, never recomputed.
+ *         If demag is disabled, h_dmag stays zero → contributes nothing.
+ *
+ * Step 2: single unified kernel sums all fields (exchange + anisotropy
+ *         + DMI + demag) and writes ydot.
  */
 static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   (void)t;
@@ -317,30 +326,24 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
     return -1;
   }
 
-  /* Step 1: exchange + anisotropy (original, unchanged) */
+  /* Step 1: demag field (constant f̂ × current m̂, inverse FFT). */
+  cudaMemsetAsync(udata->d_hdmag, 0,
+                  (size_t)3 * udata->ncell * sizeof(sunrealtype), 0);
+
+  if (udata->demag && DEMAG_STRENGTH > 0.0) {
+    Demag_Apply(udata->demag,
+                (const double*)ydata,
+                (double*)udata->d_hdmag);
+  }
+
+  /* Step 2: unified kernel — one pass over y + h_dmag → ydot. */
   dim3 block(BLOCK_X, BLOCK_Y);
   dim3 grid((udata->ng + block.x - 1) / block.x,
             (udata->ny + block.y - 1) / block.y);
 
-  f_kernel_group_soa_periodic<<<grid, block>>>(
-      ydata, ydotdata, udata->ng, udata->ny, udata->ncell);
-
-  /* Step 2: demag (only when enabled) */
-  if (udata->demag && DEMAG_STRENGTH > 0.0) {
-    /* zero the demag field buffer */
-    cudaMemsetAsync(udata->d_hdmag, 0,
-                    (size_t)3 * udata->ncell * sizeof(sunrealtype), 0);
-
-    /* h_dmag = IFFT[ N̂ · M̂ ]  —  algorithm */
-    Demag_Apply(udata->demag,
-                (const double*)ydata,
-                (double*)udata->d_hdmag);
-
-    /* ydot += LLG(m, h_dmag) */
-    const int b = 256, g = (udata->ncell + b - 1) / b;
-    demag_correction_kernel<<<g, b>>>(ydata, udata->d_hdmag,
-                                      ydotdata, udata->ncell);
-  }
+  f_kernel_unified_soa_periodic<<<grid, block>>>(
+      ydata, udata->d_hdmag, ydotdata,
+      udata->ng, udata->ny, udata->ncell);
 
   cudaError_t cuerr = cudaPeekAtLastError();
   if (cuerr != cudaSuccess) {
@@ -352,7 +355,7 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   return 0;
 }
 
-/* final stats — unchanged */
+/* ─── Final-stats reporter (unchanged) ────────────────────────────── */
 static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
   (void)LS;
 
@@ -431,7 +434,7 @@ int main(int argc, char* argv[]) {
   float elapsedTime = 0.0f;
 
   /* problem size */
-  const int nx = 600;
+  const int nx = 384;
   const int ny = 128;
 
   if (nx % GROUPSIZE != 0) {
@@ -465,9 +468,12 @@ int main(int argc, char* argv[]) {
   udata.ng    = ng;
   udata.ncell = ncell;
   udata.neq   = neq;
-  udata.pd    = NULL;
-  udata.demag = NULL;
+  udata.pd      = NULL;
+  udata.demag   = NULL;
   udata.d_hdmag = NULL;
+  udata.nxx0    = 0.0;
+  udata.nyy0    = 0.0;
+  udata.nzz0    = 0.0;
 
   CHECK_SUNDIALS(SUNContext_Create(SUN_COMM_NULL, &sunctx));
 
@@ -475,23 +481,37 @@ int main(int argc, char* argv[]) {
   udata.pd = Precond_Create(ng, ny, ncell);
   if (!udata.pd) { fprintf(stderr, "Precond_Create failed\n"); return 1; }
 
-  /* FFT demag ( Newell tensor) */
+  /* ─── Always allocate d_hdmag ──────────────────────────────────────
+   * The unified kernel always reads h_dmag[mx/my/mz]. If demag is
+   * disabled, the buffer is simply zeroed every f() call and contributes
+   * nothing to h_total. This is simpler than having two kernel paths.
+   * ─────────────────────────────────────────────────────────────────── */
+  CHECK_CUDA(cudaMalloc((void**)&udata.d_hdmag,
+                        (size_t)3 * ncell * sizeof(sunrealtype)));
+  CHECK_CUDA(cudaMemset(udata.d_hdmag, 0,
+                        (size_t)3 * ncell * sizeof(sunrealtype)));
+
+  /* FFT demag (Newell tensor f̂, computed once here). */
   const double dstr = (double)DEMAG_STRENGTH;
   const double dthk = (double)DEMAG_THICK;
   if (dstr > 0.0) {
-    /*
-     * NOTE: Demag_Init takes (nx, ny) where nx=number of columns.
-     * Here ng = nx/GROUPSIZE is the number of physical columns in the grid.
-     * We pass (ng, ny) so the tensor matches the actual grid dimensions.
-     */
+    /* Demag_Init takes (nx, ny) where nx is number of columns. Here
+     * ng = nx/GROUPSIZE is the number of physical columns in the grid. */
     udata.demag = Demag_Init(ng, ny, dthk, dstr);
     if (!udata.demag) {
       fprintf(stderr, "Demag_Init failed\n");
       Precond_Destroy(udata.pd);
+      cudaFree(udata.d_hdmag);
       return 1;
     }
-    CHECK_CUDA(cudaMalloc((void**)&udata.d_hdmag,
-                          (size_t)3 * ncell * sizeof(sunrealtype)));
+    /* Pull N(0)·strength into UserData so the preconditioner can include
+     * the demag self-coupling in its local 3x3 Jacobian block. Off-diagonals
+     * of N at r=0 vanish by 4-fold symmetry of the cell face integral. */
+    Demag_GetSelfCoupling(udata.demag,
+                          &udata.nxx0, &udata.nyy0, &udata.nzz0);
+    printf("[main] Demag self-coupling (strength-scaled): "
+           "nxx0=%.4e  nyy0=%.4e  nzz0=%.4e\n",
+           udata.nxx0, udata.nyy0, udata.nzz0);
   }
 
   y      = N_VNew_Cuda(neq, sunctx);
@@ -510,7 +530,7 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
 
-  /* Initialize y — smooth Néel-like texture */
+  /* Initialize y — smooth Néel-like circular texture */
   {
     const double core_mz  = (double)TEXTURE_CORE_MZ;
     const double outer_mz = (double)TEXTURE_OUTER_MZ;
@@ -573,6 +593,7 @@ int main(int argc, char* argv[]) {
   }
 
   CHECK_SUNDIALS(CVodeInit(cvode_mem, f, T0, y));
+  CVodeSetMaxNumSteps(cvode_mem, 20000);
   CHECK_SUNDIALS(CVodeSetUserData(cvode_mem, &udata));
   CHECK_SUNDIALS(CVodeSVtolerances(cvode_mem, RTOL, abstol));
 
@@ -602,13 +623,14 @@ int main(int argc, char* argv[]) {
   CHECK_SUNDIALS(CVodeSetMaxOrd(cvode_mem, MAX_BDF_ORDER));
   printf("Max BDF order: %d   Krylov dim: %d\n", MAX_BDF_ORDER, KRYLOV_DIM);
 
-  printf("\n2D periodic smooth-texture LLG + FFT Demag [Newell calt/ctt, Z2Z]\n\n");
+  printf("\n2D periodic smooth-texture LLG — unified-field RHS + GPU-only demag\n\n");
   printf("nx=%d  ny=%d  ng=%d  ncell=%d  neq=%d\n", nx, ny, ng, ncell, neq);
   printf("periodic BC: x and y\n");
   printf("circle center=(%.2f,%.2f), radius=%.2f cells\n", cx, cy, radius);
   printf("DEMAG_STRENGTH=%.4f  DEMAG_THICK=%.4f  (%s)\n",
          dstr, dthk,
-         dstr > 0.0 ? "h_dmag=IFFT[N̂·M̂] via cuFFT Z2Z" : "disabled");
+         dstr > 0.0 ? "h_dmag = IFFT[f_hat * m_hat] via cuFFT Z2Z, fused into RHS"
+                    : "disabled (h_dmag buffer stays zero)");
   printf("T_TOTAL=%.2f  RTOL/ATOL=%.1e\n",
          (double)T_TOTAL, (double)RTOL_VAL);
 #if ENABLE_OUTPUT

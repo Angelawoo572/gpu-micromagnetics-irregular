@@ -1,86 +1,116 @@
 /*
- * precond.cu  (v2)
+ * precond.cu — Block-Jacobi 3×3 preconditioner for CVODE Newton/GMRES.
  *
- * Fix: separate J storage from P^{-1}.
+ * Per cell we approximate the local Jacobian J_local = ∂f_cell/∂m_cell
+ * (neighbors held fixed) and form
  *
- * Root cause of v1 failure
- * Profiling showed psetup_kernel launched only 266 times vs
- * psolve_kernel 20,207 times (nni~3753).  This means CVODE was
- * sending jok=SUNTRUE ~93% of the time, and v1 returned immediately,
- * reusing stale P^{-1} computed with an old gamma.
+ *     A = I − γ J_local          (3×3)
  *
- * CVODE's jok protocol:
- *   jok=SUNFALSE: y has changed significantly; rebuild J from scratch.
- *   jok=SUNTRUE : J structure is still valid (y hasn't moved much),
- *                 but gamma CAN change every Newton step.
- *                 => Must recompute P = I - gamma*J even when jok=TRUE.
+ * then store A⁻¹ in device memory.  PrecondSolve is one dense 3×3
+ * mat-vec per cell.
  *
- * v2 solution: two-kernel approach
- * Kernel 1  build_J_kernel   : reads y, computes J(y), stores to d_J.
- *                               Called only when jok=SUNFALSE.
+ * ─── What contributes to J_local ─────────────────────────────────────
+ *   h_cell = h_exchange(neighbors) + h_DMI(neighbors)
+ *          + h_anisotropy(m3) + h_demag(convolution)
  *
- * Kernel 2  build_Pinv_kernel : reads d_J and gamma, computes
- *                               P = I - gamma*J, inverts via Cramer,
- *                               stores P^{-1} to d_Pinv.
- *                               Called on EVERY psetup (jok=TRUE or FALSE).
+ *   Only terms that depend on THIS cell's m appear in ∂h/∂m_self:
+ *     ∂h1/∂m1 =                   Nxx(0)·strength (demag self-term)
+ *     ∂h2/∂m2 =                   Nyy(0)·strength
+ *     ∂h3/∂m3 = c_chk            (anisotropy, c_msk = {0,0,1})
+ *             + Nzz(0)·strength
+ *     off-diagonals are zero (c_msk components off, N(0) diagonal by
+ *     4-fold cell-face symmetry).
  *
- * This separates the expensive stencil read (build_J_kernel, ~85µs,
- * same as RHS) from the cheap matrix arithmetic (build_Pinv_kernel,
- * no global memory reads of y, just 9 doubles/cell from d_J).
+ *   Shorthand:  k1 = Nxx0,  k2 = Nyy0,  k3 = c_chk + Nzz0.
  *
- * Expected outcome
- * psetup now always produces P^{-1} consistent with the current gamma.
- * GMRES should converge in 2-3 iterations instead of 5, reducing:
- *   - psolve_kernel calls by ~50%
- *   - linearSumKernel calls by ~50%
- *   - dotProdKernel calls by ~50%
- *   - total runtime by ~20-30%
+ * ─── LLG Jacobian (closed form) ──────────────────────────────────────
+ *   yd_1 = chg (m3 h2 − m2 h3) + α (h1 − (m·h) m1)              (etc.)
+ *
+ *   Let e_β = h_β + m_β k_β = ∂(m·h)/∂m_β, mh = m·h.  Then:
+ *
+ *     J[0][0] = α (k1 − e1 m1 − mh)
+ *     J[0][1] = chg (m3 k2 − h3) − α e2 m1
+ *     J[0][2] = chg (h2 − m2 k3) − α e3 m1
+ *     J[1][0] = chg (h3 − m3 k1) − α e1 m2
+ *     J[1][1] = α (k2 − e2 m2 − mh)
+ *     J[1][2] = chg (m1 k3 − h1) − α e3 m2
+ *     J[2][0] = chg (m2 k1 − h2) − α e1 m3
+ *     J[2][1] = chg (h1 − m1 k2) − α e2 m3
+ *     J[2][2] = α (k3 − e3 m3 − mh)
+ *
+ * h in the formulas is evaluated at the current state, using the
+ * cached h_dmag from the most recent f() call. CVODE calls f() right
+ * before PrecondSetup, so this is consistent with the y passed here.
  */
 
 #include "precond.h"
 
 #include <cvode/cvode.h>
-#include <sundials/sundials_types.h>
 #include <nvector/nvector_cuda.h>
+#include <sundials/sundials_types.h>
 #include <cuda_runtime.h>
-#include <stdio.h>
-#include <stdlib.h>
 
-/* Physical constants — must match 2d_p.cu */
-__constant__ sunrealtype pc_msk[3]  = {0.0, 0.0, 1.0};
-__constant__ sunrealtype pc_nsk[3]  = {1.0, 0.0, 0.0};
-__constant__ sunrealtype pc_chk     = 1.0;
-__constant__ sunrealtype pc_che     = 4.0;
-__constant__ sunrealtype pc_alpha   = 0.2;
-__constant__ sunrealtype pc_chg     = 1.0;
-__constant__ sunrealtype pc_cha     = 0.0;
-__constant__ sunrealtype pc_chb     = 0.3;
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
 
-/* Index / wrap helpers */
+/* ─── Material constants (mirror 2d_fft.cu values) ──────────────────── */
+__constant__ static sunrealtype pc_chk   = SUN_RCONST(1.0);
+__constant__ static sunrealtype pc_che   = SUN_RCONST(4.0);
+__constant__ static sunrealtype pc_alpha = SUN_RCONST(0.2);
+__constant__ static sunrealtype pc_chg   = SUN_RCONST(1.0);
+__constant__ static sunrealtype pc_cha   = SUN_RCONST(0.0);
+__constant__ static sunrealtype pc_chb   = SUN_RCONST(0.3);
+/* Anisotropy mask fixed at {0,0,1} (easy axis z);
+ * DMI mask fixed at {1,0,0} (DMI along x).
+ * These are baked into the kernel rather than loaded from constant mem
+ * to save some fetches — change here if the axes ever change. */
+
+/* ─── Indexing helpers ──────────────────────────────────────────────── */
 __device__ static inline int pidx_mx(int c, int nc) { return c; }
 __device__ static inline int pidx_my(int c, int nc) { return nc + c; }
 __device__ static inline int pidx_mz(int c, int nc) { return 2*nc + c; }
-
 __device__ static inline int pwrap_x(int x, int ng) {
-    return (x < 0) ? (x+ng) : ((x >= ng) ? (x-ng) : x);
+    return (x < 0) ? (x + ng) : ((x >= ng) ? (x - ng) : x);
 }
 __device__ static inline int pwrap_y(int y, int ny) {
-    return (y < 0) ? (y+ny) : ((y >= ny) ? (y-ny) : y);
+    return (y < 0) ? (y + ny) : ((y >= ny) ? (y - ny) : y);
 }
 
-/* Kernel 1: build_J_kernel
- *
- * Computes the analytic 3×3 local Jacobian J[i] for each cell i
- * and stores it in d_J[9*cell .. 9*cell+8] (row-major).
- *
- * Called only when jok=SUNFALSE (y has changed significantly).
- * This is the expensive kernel: it reads y and its 4 neighbors.
- *
- * J[row][col] = ∂f_row/∂m_col  (self-coupling only, neighbors frozen)
- * See precond.h / v1 comments for full derivation. */
+/* ─── Opaque types ──────────────────────────────────────────────────── */
+struct PrecondData {
+    int ng, ny, ncell;
+    sunrealtype *d_P;    /* 9*ncell doubles; SoA: P[s*ncell + cell] */
+};
+
+/*
+ * PcUserData: mirror of UserData in 2d_fft.cu (byte-compatible layout).
+ *   offset 0  : PrecondData*
+ *   offset 8  : DemagData*
+ *   offset 16 : sunrealtype *d_hdmag
+ *   offset 24 : int nx, ny, ng, ncell, neq   (5*4 = 20 bytes)
+ *   offset 48 : double nxx0, nyy0, nzz0      (after 4-byte pad)
+ */
+typedef struct {
+    void        *pd_opaque;
+    void        *demag_opaque;
+    sunrealtype *d_hdmag;
+    int nx, ny, ng, ncell, neq;
+    double nxx0, nyy0, nzz0;
+} PcUserData;
+
+/* ─── build_J_kernel ────────────────────────────────────────────────── */
+/*
+ * One thread per cell. Reads self + 4 neighbors (for h only — derivatives
+ * only need self quantities) plus h_dmag[mx/my/mz] for this cell, assembles
+ * the 3×3 local J, forms A = I − γJ, stores A⁻¹.
+ */
 __global__ static void build_J_kernel(
     const sunrealtype* __restrict__ y,
-    sunrealtype*       __restrict__ d_J,   /* 9 * ncell */
+    const sunrealtype* __restrict__ h_dmag,   /* may be non-null; SoA 3*ncell */
+    sunrealtype*       __restrict__ d_P,
+    sunrealtype gamma,
+    sunrealtype nxx0, sunrealtype nyy0, sunrealtype nzz0,
     int ng, int ny, int ncell)
 {
     const int gx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -88,255 +118,253 @@ __global__ static void build_J_kernel(
     if (gx >= ng || gy >= ny) return;
 
     const int cell = gy * ng + gx;
+    const int mx = pidx_mx(cell, ncell);
+    const int my = pidx_my(cell, ncell);
+    const int mz = pidx_mz(cell, ncell);
 
-    const sunrealtype m1 = y[pidx_mx(cell, ncell)];
-    const sunrealtype m2 = y[pidx_my(cell, ncell)];
-    const sunrealtype m3 = y[pidx_mz(cell, ncell)];
+    const int xl = pwrap_x(gx - 1, ng);
+    const int xr = pwrap_x(gx + 1, ng);
+    const int yu = pwrap_y(gy - 1, ny);
+    const int yd = pwrap_y(gy + 1, ny);
 
-    /* neighbor cells */
-    const int xl  = pwrap_x(gx-1, ng),  xr  = pwrap_x(gx+1, ng);
-    const int yu  = pwrap_y(gy-1, ny),  ydn = pwrap_y(gy+1, ny);
-    const int lc  = gy*ng + xl,          rc  = gy*ng + xr;
-    const int uc  = yu*ng + gx,          dc  = ydn*ng + gx;
+    const int lc = gy * ng + xl;
+    const int rc = gy * ng + xr;
+    const int uc = yu * ng + gx;
+    const int dc = yd * ng + gx;
 
-    /* h_eff (identical to RHS kernel) */
-    const sunrealtype h1 =
+    const sunrealtype m1 = y[mx];
+    const sunrealtype m2 = y[my];
+    const sunrealtype m3 = y[mz];
+
+    /* Total h at this cell (matches 2d_fft.cu's f_kernel_unified exactly).
+     * Anisotropy: c_msk = {0,0,1} → only h3 gets (c_chk*m3 + c_cha).
+     * DMI:        c_nsk = {1,0,0} → only h1 gets c_chb*(lx + rx). */
+    sunrealtype h1 =
         pc_che * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)] +
-                  y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)]) +
-        pc_msk[0] * (pc_chk*m3 + pc_cha) +
-        pc_chb * pc_nsk[0] * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)]);
+                  y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)])
+      + pc_chb * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)]);
 
-    const sunrealtype h2 =
+    sunrealtype h2 =
         pc_che * (y[pidx_my(lc,ncell)] + y[pidx_my(rc,ncell)] +
-                  y[pidx_my(uc,ncell)] + y[pidx_my(dc,ncell)]) +
-        pc_msk[1] * (pc_chk*m3 + pc_cha) +
-        pc_chb * pc_nsk[1] * (y[pidx_my(lc,ncell)] + y[pidx_my(rc,ncell)]);
+                  y[pidx_my(uc,ncell)] + y[pidx_my(dc,ncell)]);
 
-    const sunrealtype h3 =
+    sunrealtype h3 =
         pc_che * (y[pidx_mz(lc,ncell)] + y[pidx_mz(rc,ncell)] +
-                  y[pidx_mz(uc,ncell)] + y[pidx_mz(dc,ncell)]) +
-        pc_msk[2] * (pc_chk*m3 + pc_cha) +
-        pc_chb * pc_nsk[2] * (y[pidx_mz(lc,ncell)] + y[pidx_mz(rc,ncell)]);
+                  y[pidx_mz(uc,ncell)] + y[pidx_mz(dc,ncell)])
+      + (pc_chk * m3 + pc_cha);
 
-    const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
-
-    /* ∂mh/∂mi */
-    const sunrealtype d1 = h1;
-    const sunrealtype d2 = h2;
-    const sunrealtype d3 = h3 + pc_chk*m3;
-
-    /* Store J row-major in d_J[9*cell .. 9*cell+8] */
-    const int b = cell * 9;
-    d_J[b+0] = pc_alpha * (-d1*m1 - mh);
-    d_J[b+1] = -pc_chg*h3 - pc_alpha*d2*m1;
-    d_J[b+2] =  pc_chg*(h2 - m2) - pc_alpha*d3*m1;
-
-    d_J[b+3] =  pc_chg*h3 - pc_alpha*d1*m2;
-    d_J[b+4] = pc_alpha * (-d2*m2 - mh);
-    d_J[b+5] =  pc_chg*(m1 - h1) - pc_alpha*d3*m2;
-
-    d_J[b+6] = -pc_chg*h2 - pc_alpha*d1*m3;
-    d_J[b+7] =  pc_chg*h1 - pc_alpha*d2*m3;
-    d_J[b+8] = pc_alpha * (pc_msk[2]*pc_chk - d3*m3 - mh);
-}
-
-/* Kernel 2: build_Pinv_kernel
- *
- * Reads d_J (the stored Jacobian) and the current gamma.
- * Computes P = I - gamma * J per cell and stores P^{-1}
- * via Cramer's rule into d_Pinv.
- *
- * Called on EVERY psetup (jok=TRUE or jok=FALSE), because
- * gamma changes every Newton step.
- *
- * This kernel is cheap: only reads 9 doubles/cell from d_J,
- * no y stencil reads. Purely arithmetic. */
-__global__ static void build_Pinv_kernel(
-    const sunrealtype* __restrict__ d_J,
-    sunrealtype                     gamma,
-    sunrealtype*       __restrict__ d_Pinv,
-    int ncell)
-{
-    const int cell = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (cell >= ncell) return;
-
-    const int b = cell * 9;
-
-    /* P = I - gamma * J */
-    const sunrealtype P00 = 1.0 - gamma*d_J[b+0];
-    const sunrealtype P01 =      -gamma*d_J[b+1];
-    const sunrealtype P02 =      -gamma*d_J[b+2];
-    const sunrealtype P10 =      -gamma*d_J[b+3];
-    const sunrealtype P11 = 1.0 - gamma*d_J[b+4];
-    const sunrealtype P12 =      -gamma*d_J[b+5];
-    const sunrealtype P20 =      -gamma*d_J[b+6];
-    const sunrealtype P21 =      -gamma*d_J[b+7];
-    const sunrealtype P22 = 1.0 - gamma*d_J[b+8];
-
-    /* det(P) */
-    const sunrealtype det = P00*(P11*P22 - P12*P21)
-                          - P01*(P10*P22 - P12*P20)
-                          + P02*(P10*P21 - P11*P20);
-
-    const sunrealtype inv_det = (det != 0.0) ? (1.0 / det) : 1.0;
-
-    /* P^{-1} = (1/det) * adj(P) — stored row-major */
-    d_Pinv[b+0] =  inv_det * (P11*P22 - P12*P21);
-    d_Pinv[b+1] = -inv_det * (P01*P22 - P02*P21);
-    d_Pinv[b+2] =  inv_det * (P01*P12 - P02*P11);
-    d_Pinv[b+3] = -inv_det * (P10*P22 - P12*P20);
-    d_Pinv[b+4] =  inv_det * (P00*P22 - P02*P20);
-    d_Pinv[b+5] = -inv_det * (P00*P12 - P02*P10);
-    d_Pinv[b+6] =  inv_det * (P10*P21 - P11*P20);
-    d_Pinv[b+7] = -inv_det * (P00*P21 - P01*P20);
-    d_Pinv[b+8] =  inv_det * (P00*P11 - P01*P10);
-}
-
-/* Kernel 3: psolve_kernel — unchanged from v1 */
-__global__ static void psolve_kernel(
-    const sunrealtype* __restrict__ r,
-    sunrealtype*       __restrict__ z,
-    const sunrealtype* __restrict__ Pinv,
-    int ncell)
-{
-    const int cell = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (cell >= ncell) return;
-
-    const int i0 = pidx_mx(cell, ncell);
-    const int i1 = pidx_my(cell, ncell);
-    const int i2 = pidx_mz(cell, ncell);
-
-    const sunrealtype r0 = r[i0];
-    const sunrealtype r1 = r[i1];
-    const sunrealtype r2 = r[i2];
-
-    const int b = cell * 9;
-    z[i0] = Pinv[b+0]*r0 + Pinv[b+1]*r1 + Pinv[b+2]*r2;
-    z[i1] = Pinv[b+3]*r0 + Pinv[b+4]*r1 + Pinv[b+5]*r2;
-    z[i2] = Pinv[b+6]*r0 + Pinv[b+7]*r1 + Pinv[b+8]*r2;
-}
-
-/* Public API */
-PrecondData* Precond_Create(int ng, int ny, int ncell)
-{
-    PrecondData *pd = (PrecondData*)malloc(sizeof(PrecondData));
-    if (!pd) { fprintf(stderr, "precond: malloc failed\n"); return NULL; }
-
-    pd->ng         = ng;
-    pd->ny         = ny;
-    pd->ncell      = ncell;
-    pd->last_gamma = 0.0;
-    pd->d_J        = NULL;
-    pd->d_Pinv     = NULL;
-
-    const size_t sz = (size_t)ncell * 9 * sizeof(sunrealtype);
-
-    if (cudaMalloc((void**)&pd->d_J,    sz) != cudaSuccess ||
-        cudaMalloc((void**)&pd->d_Pinv, sz) != cudaSuccess) {
-        fprintf(stderr, "precond: cudaMalloc failed\n");
-        Precond_Destroy(pd);
-        return NULL;
+    if (h_dmag) {
+        h1 += h_dmag[mx];
+        h2 += h_dmag[my];
+        h3 += h_dmag[mz];
     }
 
-    printf("[Precond v2] 3x3 block-diagonal Jacobi preconditioner allocated.\n");
-    printf("[Precond v2] Storage: %zu MB (J) + %zu MB (Pinv) = %zu MB total\n",
-           sz/(1024*1024), sz/(1024*1024), 2*sz/(1024*1024));
-    printf("[Precond v2] Fix: gamma updated on EVERY psetup call (jok=TRUE included).\n");
+    /* Self-coupling diagonal:  ∂h_α/∂m_α at this cell.
+     * Easy axis z: only h3 has chk contribution. */
+    const sunrealtype k1 = nxx0;               /* demag only */
+    const sunrealtype k2 = nyy0;               /* demag only */
+    const sunrealtype k3 = pc_chk + nzz0;      /* anisotropy + demag-self */
 
+    const sunrealtype e1 = h1 + m1 * k1;       /* = ∂(m·h)/∂m_1 */
+    const sunrealtype e2 = h2 + m2 * k2;
+    const sunrealtype e3 = h3 + m3 * k3;
+    const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
+
+    /* Local 3×3 J (see comment block at top). */
+    const sunrealtype J00 = pc_alpha * (k1 - e1 * m1 - mh);
+    const sunrealtype J01 = pc_chg * (m3 * k2 - h3) - pc_alpha * e2 * m1;
+    const sunrealtype J02 = pc_chg * (h2 - m2 * k3) - pc_alpha * e3 * m1;
+
+    const sunrealtype J10 = pc_chg * (h3 - m3 * k1) - pc_alpha * e1 * m2;
+    const sunrealtype J11 = pc_alpha * (k2 - e2 * m2 - mh);
+    const sunrealtype J12 = pc_chg * (m1 * k3 - h1) - pc_alpha * e3 * m2;
+
+    const sunrealtype J20 = pc_chg * (m2 * k1 - h2) - pc_alpha * e1 * m3;
+    const sunrealtype J21 = pc_chg * (h1 - m1 * k2) - pc_alpha * e2 * m3;
+    const sunrealtype J22 = pc_alpha * (k3 - e3 * m3 - mh);
+
+    /* A = I − γ J */
+    const sunrealtype A00 = SUN_RCONST(1.0) - gamma * J00;
+    const sunrealtype A01 =                 - gamma * J01;
+    const sunrealtype A02 =                 - gamma * J02;
+    const sunrealtype A10 =                 - gamma * J10;
+    const sunrealtype A11 = SUN_RCONST(1.0) - gamma * J11;
+    const sunrealtype A12 =                 - gamma * J12;
+    const sunrealtype A20 =                 - gamma * J20;
+    const sunrealtype A21 =                 - gamma * J21;
+    const sunrealtype A22 = SUN_RCONST(1.0) - gamma * J22;
+
+    /* 3×3 inverse via adjugate / det. */
+    const sunrealtype c00 = A11 * A22 - A12 * A21;
+    const sunrealtype c10 = A12 * A20 - A10 * A22;
+    const sunrealtype c20 = A10 * A21 - A11 * A20;
+    const sunrealtype det = A00 * c00 + A01 * c10 + A02 * c20;
+
+    /* Fall back to identity if det is pathological. */
+    if (!(fabs((double)det) > 1e-30)) {
+        d_P[0*ncell + cell] = SUN_RCONST(1.0);
+        d_P[1*ncell + cell] = SUN_RCONST(0.0);
+        d_P[2*ncell + cell] = SUN_RCONST(0.0);
+        d_P[3*ncell + cell] = SUN_RCONST(0.0);
+        d_P[4*ncell + cell] = SUN_RCONST(1.0);
+        d_P[5*ncell + cell] = SUN_RCONST(0.0);
+        d_P[6*ncell + cell] = SUN_RCONST(0.0);
+        d_P[7*ncell + cell] = SUN_RCONST(0.0);
+        d_P[8*ncell + cell] = SUN_RCONST(1.0);
+        return;
+    }
+
+    const sunrealtype inv_det = SUN_RCONST(1.0) / det;
+
+    /* A⁻¹[i][j] = (adj A)[i][j] / det,  adj A = transpose(cofactors).
+     * Standard closed form for 3×3. */
+    const sunrealtype Pi00 = (A11 * A22 - A12 * A21) * inv_det;
+    const sunrealtype Pi01 = (A02 * A21 - A01 * A22) * inv_det;
+    const sunrealtype Pi02 = (A01 * A12 - A02 * A11) * inv_det;
+    const sunrealtype Pi10 = (A12 * A20 - A10 * A22) * inv_det;
+    const sunrealtype Pi11 = (A00 * A22 - A02 * A20) * inv_det;
+    const sunrealtype Pi12 = (A02 * A10 - A00 * A12) * inv_det;
+    const sunrealtype Pi20 = (A10 * A21 - A11 * A20) * inv_det;
+    const sunrealtype Pi21 = (A01 * A20 - A00 * A21) * inv_det;
+    const sunrealtype Pi22 = (A00 * A11 - A01 * A10) * inv_det;
+
+    d_P[0*ncell + cell] = Pi00;
+    d_P[1*ncell + cell] = Pi01;
+    d_P[2*ncell + cell] = Pi02;
+    d_P[3*ncell + cell] = Pi10;
+    d_P[4*ncell + cell] = Pi11;
+    d_P[5*ncell + cell] = Pi12;
+    d_P[6*ncell + cell] = Pi20;
+    d_P[7*ncell + cell] = Pi21;
+    d_P[8*ncell + cell] = Pi22;
+}
+
+/* ─── apply_P_kernel: z = P⁻¹ r (3×3 block per cell) ────────────────── */
+__global__ static void apply_P_kernel(
+    const sunrealtype* __restrict__ P,
+    const sunrealtype* __restrict__ r,
+    sunrealtype*       __restrict__ z,
+    int ncell)
+{
+    const int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cell >= ncell) return;
+
+    const sunrealtype r0 = r[cell];
+    const sunrealtype r1 = r[ncell + cell];
+    const sunrealtype r2 = r[2*ncell + cell];
+
+    z[cell] =
+        P[0*ncell + cell] * r0 +
+        P[1*ncell + cell] * r1 +
+        P[2*ncell + cell] * r2;
+    z[ncell + cell] =
+        P[3*ncell + cell] * r0 +
+        P[4*ncell + cell] * r1 +
+        P[5*ncell + cell] * r2;
+    z[2*ncell + cell] =
+        P[6*ncell + cell] * r0 +
+        P[7*ncell + cell] * r1 +
+        P[8*ncell + cell] * r2;
+}
+
+/* ─── Create/Destroy ────────────────────────────────────────────────── */
+PrecondData* Precond_Create(int ng, int ny, int ncell)
+{
+    PrecondData *pd = (PrecondData*)calloc(1, sizeof(PrecondData));
+    if (!pd) {
+        fprintf(stderr, "[Precond] calloc failed\n");
+        return NULL;
+    }
+    pd->ng    = ng;
+    pd->ny    = ny;
+    pd->ncell = ncell;
+    pd->d_P   = NULL;
+
+    const size_t bytes = (size_t)9 * ncell * sizeof(sunrealtype);
+    cudaError_t err = cudaMalloc((void**)&pd->d_P, bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[Precond] cudaMalloc failed: %s\n",
+                cudaGetErrorString(err));
+        free(pd);
+        return NULL;
+    }
+    cudaMemset(pd->d_P, 0, bytes);
+
+    printf("[Precond] Block-Jacobi 3x3: ncell=%d, device mem = %.2f MB\n",
+           ncell, (double)bytes / 1e6);
     return pd;
 }
 
 void Precond_Destroy(PrecondData *pd)
 {
     if (!pd) return;
-    if (pd->d_J)    cudaFree(pd->d_J);
-    if (pd->d_Pinv) cudaFree(pd->d_Pinv);
+    if (pd->d_P) cudaFree(pd->d_P);
     free(pd);
 }
 
-/* PrecondSetup — CVODE psetup callback
- *
- * Two-phase approach:
- *   Phase 1 (jok=SUNFALSE): rebuild J from y (expensive stencil read)
- *   Phase 2 (always):       rebuild P^{-1} from J and current gamma
- *
- * This ensures P^{-1} always matches the current gamma, which is
- * the key fix over v1. */
-int PrecondSetup(sunrealtype t,
-                 N_Vector y, N_Vector fy,
-                 sunbooleantype jok, sunbooleantype *jcurPtr,
-                 sunrealtype gamma, void *user_data)
+/* ─── PrecondSetup (rebuild A⁻¹ for given gamma and y) ──────────────── */
+int PrecondSetup(sunrealtype t, N_Vector y, N_Vector fy,
+                 sunbooleantype jok, sunbooleantype* jcurPtr,
+                 sunrealtype gamma, void* user_data)
 {
-    (void)t; (void)fy;
+    (void)t; (void)fy; (void)jok;
 
-    PrecondData *pd = *(PrecondData**)user_data;
+    PcUserData  *ud = (PcUserData*)user_data;
+    PrecondData *pd = (PrecondData*)ud->pd_opaque;
 
-    /* ---- Phase 1: rebuild J if y has changed significantly ---- */
-    if (!jok) {
-        /* Jacobian structure outdated — recompute from current y */
-        const sunrealtype *yd = N_VGetDeviceArrayPointer_Cuda(y);
+    /* Always rebuild: the Jacobian depends on both y AND gamma, and
+     * gamma changes across Newton failures / step-size adjustments.
+     * jcurPtr tells CVODE the Jacobian data is current. */
+    *jcurPtr = SUNTRUE;
 
-        const dim3 block2d(16, 8);
-        const dim3 grid2d((pd->ng + 15) / 16, (pd->ny + 7) / 8);
+    sunrealtype *ydata = N_VGetDeviceArrayPointer_Cuda(y);
 
-        build_J_kernel<<<grid2d, block2d>>>(yd, pd->d_J,
-                                            pd->ng, pd->ny, pd->ncell);
+    dim3 block(16, 8);
+    dim3 grid((ud->ng + block.x - 1) / block.x,
+              (ud->ny + block.y - 1) / block.y);
 
-        if (cudaPeekAtLastError() != cudaSuccess) {
-            fprintf(stderr, "precond: build_J_kernel failed\n");
-            return -1;
-        }
-        *jcurPtr = SUNTRUE;
-    } else {
-        /* J structure still valid — tell CVODE we didn't recompute J */
-        *jcurPtr = SUNFALSE;
-    }
+    build_J_kernel<<<grid, block>>>(
+        ydata,
+        ud->d_hdmag,                     /* may be non-null but zero-filled */
+        pd->d_P,
+        gamma,
+        (sunrealtype)ud->nxx0,
+        (sunrealtype)ud->nyy0,
+        (sunrealtype)ud->nzz0,
+        ud->ng, ud->ny, ud->ncell);
 
-    /* ---- Phase 2: ALWAYS rebuild P^{-1} = (I - gamma*J)^{-1} ----
-     *
-     * This is the critical fix: even when jok=SUNTRUE (J unchanged),
-     * gamma changes every Newton step, so P^{-1} must be updated.
-     * build_Pinv_kernel only reads d_J (9 doubles/cell, no y access)
-     * and is much cheaper than build_J_kernel.
-     */
-    const int block1d = 256;
-    const int grid1d  = (pd->ncell + block1d - 1) / block1d;
-
-    build_Pinv_kernel<<<grid1d, block1d>>>(pd->d_J, gamma, pd->d_Pinv,
-                                           pd->ncell);
-
-    if (cudaPeekAtLastError() != cudaSuccess) {
-        fprintf(stderr, "precond: build_Pinv_kernel failed\n");
+    cudaError_t cuerr = cudaPeekAtLastError();
+    if (cuerr != cudaSuccess) {
+        fprintf(stderr, "[PrecondSetup] kernel launch failed: %s\n",
+                cudaGetErrorString(cuerr));
         return -1;
     }
-
-    pd->last_gamma = gamma;
     return 0;
 }
 
-/* PrecondSolve */
-int PrecondSolve(sunrealtype t,
-                 N_Vector y, N_Vector fy,
+/* ─── PrecondSolve (apply cached A⁻¹ block per cell) ────────────────── */
+int PrecondSolve(sunrealtype t, N_Vector y, N_Vector fy,
                  N_Vector r, N_Vector z,
                  sunrealtype gamma, sunrealtype delta,
-                 int lr, void *user_data)
+                 int lr, void* user_data)
 {
     (void)t; (void)y; (void)fy; (void)gamma; (void)delta; (void)lr;
 
-    PrecondData *pd = *(PrecondData**)user_data;
+    PcUserData  *ud = (PcUserData*)user_data;
+    PrecondData *pd = (PrecondData*)ud->pd_opaque;
 
-    const sunrealtype *rd = N_VGetDeviceArrayPointer_Cuda(r);
-    sunrealtype       *zd = N_VGetDeviceArrayPointer_Cuda(z);
+    sunrealtype *rdata = N_VGetDeviceArrayPointer_Cuda(r);
+    sunrealtype *zdata = N_VGetDeviceArrayPointer_Cuda(z);
 
-    const int block = 256;
-    const int grid  = (pd->ncell + block - 1) / block;
+    const int b = 256;
+    const int g = (ud->ncell + b - 1) / b;
+    apply_P_kernel<<<g, b>>>(pd->d_P, rdata, zdata, ud->ncell);
 
-    psolve_kernel<<<grid, block>>>(rd, zd, pd->d_Pinv, pd->ncell);
-
-    if (cudaPeekAtLastError() != cudaSuccess) {
-        fprintf(stderr, "precond: psolve_kernel failed\n");
+    cudaError_t cuerr = cudaPeekAtLastError();
+    if (cuerr != cudaSuccess) {
+        fprintf(stderr, "[PrecondSolve] kernel launch failed: %s\n",
+                cudaGetErrorString(cuerr));
         return -1;
     }
-
     return 0;
 }

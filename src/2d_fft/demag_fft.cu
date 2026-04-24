@@ -1,36 +1,30 @@
 /*
- * demag_fft.cu
+ * demag_fft.cu  —  GPU-only FFT demag pipeline.
  *
- * Key optimization over v1:
- *   f̂ (tensor spectra dofaa..dofcc) computed ONCE at Demag_Init,
- *   stored permanently on device — never touched again.
+ * Replaces the old v2 that still did 4×D2H + 4×H2D per Apply (despite its
+ * comments).  Now truly GPU-resident:
  *
- *   Per-timestep Demag_Apply:
- *     OLD v1: FFT(M) on GPU → D2H → CPU multiply loop → H2D → IFFT on GPU
- *     NEW v2: FFT(M) on GPU → GPU multiply_kernel → IFFT on GPU
- *     Eliminates 9 D2H + 9 H2D transfers per f() call.
- *
- * Flow:
- *   Demag_Init (once):
- *   1. calt/ctt  → taa..tcc  (CPU)
- *   2. pack → complex hfaa..hfcc  (imag=0, CPU)
- *   3. H2D → difaa..difcc
- *   4. cufftExecZ2Z FORWARD → dofaa..dofcc  (GPU, PERMANENT)
- *   5. free difaa..difcc  (no longer needed)
+ *   Demag_Init (once, at startup):
+ *     1. calt/ctt          -> taa..tcc  (CPU, one-time cost)
+ *     2. pack real -> complex (imag=0) (CPU)
+ *     3. H2D tensor to temporary device buffers
+ *     4. cufftExecZ2Z FORWARD on each -> dofaa..dofcc (PERMANENT on device)
+ *     5. free tmp tensor, keep only the 9 spectra
+ *     6. read Nxx(0), Nyy(0), Nzz(0) for preconditioner use
  *
  *   Demag_Apply (every f() call):
- *   6. pack M from SoA → complex hma_c..hmc_c  (CPU)
- *   7. H2D → dima..dimc
- *   8. cufftExecZ2Z FORWARD → doma..domc  (GPU)
- *   9. multiply_kernel: dkha = dofaa*doma + dofab*domb + dofac*domc  (GPU)
- *  10. cufftExecZ2Z INVERSE → drha..drhc  (GPU)
- *  11. D2H → hrha..hrhc  (CPU)
- *  12. scatter hrha[idxnew].x/(nn*nn) into SoA h_out with index remap  (CPU)
+ *     7. pack_m_kernel:   y_dev (SoA) -> dima, dimb, dimc  (on device)
+ *     8. cufftExecZ2Z FORWARD on each -> doma, domb, domc
+ *     9. multiply_kernel: ĥ_α = Σ_β f̂_αβ · m̂_β
+ *    10. cufftExecZ2Z INVERSE          -> drha, drhb, drhc (complex)
+ *    11. unshift_h_kernel: real part + FFT-shift + (strength/N) scale
+ *                          -> h_out_dev (SoA, 3*ncell, OVERWRITTEN)
  *
- * index remapping (step 12) is identical to demag_test.cu:
- *   jy = (j < nn2) ? (nn2-j) : (ny-j+nn2-1)
- *   ix = (i < nn2) ? (nn2-i) : (nx-i+nn2-1)
- *   idxnew = jy*nx + ix
+ *   Index shift (step 11):
+ *     Tensor is stored centered at (nx/2, ny/2).  For properly-convolved
+ *     output we need the standard circular-shift:
+ *         h[i,j] = IFFT_result[((i+nx2) mod nx), ((j+ny2) mod ny)]
+ *     (NOT the reflection formula from the old code.)
  */
 
 #include "demag_fft.h"
@@ -42,7 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 
-/* ── ctt: EXACT copy from  pseudocode (1-indexed dm[]) ── */
+/* ── ctt: closed-form Newell integral (1-indexed dm[]) ──────────────── */
 static void ctt(double b, double a, double sx, double sy, double dm[])
 {
     double sz = 0.0;
@@ -79,27 +73,24 @@ static void ctt(double b, double a, double sx, double sy, double dm[])
            +std::atan(xn*yp/(zp*dnpp))-std::atan(xp*yp/(zp*dppp));
 }
 
-/* ── calt: EXACT copy from  pseudocode (1-indexed dm[]) ── */
-static int calt(double thik, int mdx, int mdy,
-                double taa[], double tab[], double tac[],
-                double tba[], double tbb[], double tbc[],
-                double tca[], double tcb[], double tcc[])
+/* ── calt: 81-point averaging of ctt over cell face ─────────────────── */
+static void calt(double thik, int mdx, int mdy,
+                 double taa[], double tab[], double tac[],
+                 double tba[], double tbb[], double tbc[],
+                 double tca[], double tcb[], double tcc[])
 {
-    int i, j, ix, jy, ikn;
     int mdx2=mdx/2, mdy2=mdy/2;
-    double sx, sy;
     double a=0.49999, b=0.5*thik;
     double dm[10];
-
-    for (j=0;j<mdy;j++) for (i=0;i<mdx;i++) {
-        ikn=j*mdx+i;
+    for (int j=0;j<mdy;j++) for (int i=0;i<mdx;i++) {
+        int ikn=j*mdx+i;
         taa[ikn]=tab[ikn]=tac[ikn]=0.0;
         tba[ikn]=tbb[ikn]=tbc[ikn]=0.0;
         tca[ikn]=tcb[ikn]=tcc[ikn]=0.0;
-        for (jy=-4;jy<=4;jy++) {
-            sy=double(j-mdy2)+0.1*double(jy);
-            for (ix=-4;ix<=4;ix++) {
-                sx=double(i-mdx2)+0.1*double(ix);
+        for (int jy=-4;jy<=4;jy++) {
+            double sy=double(j-mdy2)+0.1*double(jy);
+            for (int ix=-4;ix<=4;ix++) {
+                double sx=double(i-mdx2)+0.1*double(ix);
                 ctt(b,a,sx,sy,dm);
                 taa[ikn]+=dm[1]; tab[ikn]+=dm[2]; tac[ikn]+=dm[3];
                 tba[ikn]+=dm[4]; tbb[ikn]+=dm[5]; tbc[ikn]+=dm[6];
@@ -110,16 +101,27 @@ static int calt(double thik, int mdx, int mdy,
         tba[ikn]/=81.; tbb[ikn]/=81.; tbc[ikn]/=81.;
         tca[ikn]/=81.; tcb[ikn]/=81.; tcc[ikn]/=81.;
     }
-    return 1;
 }
 
-/* 
- * GPU kernel: pointwise multiply  ĥ = f̂ · m̂
- *
- * f̂ (dofaa..dofcc) lives permanently on device (computed once at Init).
- * m̂ (doma/domb/domc) is computed fresh each Apply call.
- * Both are already on device — no transfers needed.
- *  */
+/* ── Device kernels ────────────────────────────────────────────────── */
+
+/* pack_m_kernel: SoA real y -> 3 complex arrays (imag=0).
+ * y_dev layout:  [mx 0..ncell) | [my 0..ncell) | [mz 0..ncell)            */
+__global__ static void pack_m_kernel(
+    const double*            __restrict__ y_dev,
+    cufftDoubleComplex*      __restrict__ dima,
+    cufftDoubleComplex*      __restrict__ dimb,
+    cufftDoubleComplex*      __restrict__ dimc,
+    int ncell)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= ncell) return;
+    dima[idx].x = y_dev[idx];              dima[idx].y = 0.0;
+    dimb[idx].x = y_dev[ncell + idx];      dimb[idx].y = 0.0;
+    dimc[idx].x = y_dev[2*ncell + idx];    dimc[idx].y = 0.0;
+}
+
+/* multiply_kernel: ĥ_α(k) = Σ_β f̂_αβ(k) · m̂_β(k)                         */
 __global__ static void multiply_kernel(
     const cufftDoubleComplex* __restrict__ dofaa,
     const cufftDoubleComplex* __restrict__ dofab,
@@ -133,9 +135,9 @@ __global__ static void multiply_kernel(
     const cufftDoubleComplex* __restrict__ doma,
     const cufftDoubleComplex* __restrict__ domb,
     const cufftDoubleComplex* __restrict__ domc,
-    cufftDoubleComplex* __restrict__ dkha,
-    cufftDoubleComplex* __restrict__ dkhb,
-    cufftDoubleComplex* __restrict__ dkhc,
+    cufftDoubleComplex*       __restrict__ dkha,
+    cufftDoubleComplex*       __restrict__ dkhb,
+    cufftDoubleComplex*       __restrict__ dkhc,
     int N)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -157,41 +159,71 @@ __global__ static void multiply_kernel(
 #undef CMUL_I
 }
 
-/* 
- * DemagData
- *  */
+/* unshift_h_kernel:
+ *   src = (sj*nx + si) with  si = (i + nx2) mod nx,  sj = (j + ny2) mod ny
+ *   h_out[j*nx+i]              = Re(drha[src]) * scale
+ *   h_out[ncell + j*nx+i]      = Re(drhb[src]) * scale
+ *   h_out[2*ncell + j*nx+i]    = Re(drhc[src]) * scale
+ *
+ * scale = strength / (nx*ny)  (the 1/N is cuFFT's inverse normalization).
+ *
+ * This OVERWRITES h_out (no accumulation) — simpler and correct.  */
+__global__ static void unshift_h_kernel(
+    const cufftDoubleComplex* __restrict__ drha,
+    const cufftDoubleComplex* __restrict__ drhb,
+    const cufftDoubleComplex* __restrict__ drhc,
+    double*                   __restrict__ h_out,
+    double scale,
+    int nx, int ny, int ncell, int nx2, int ny2)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= nx || j >= ny) return;
+
+    int dst = j*nx + i;
+    int si  = (i + nx2) % nx;
+    int sj  = (j + ny2) % ny;
+    int src = sj*nx + si;
+
+    h_out[dst]           = drha[src].x * scale;
+    h_out[ncell + dst]   = drhb[src].x * scale;
+    h_out[2*ncell + dst] = drhc[src].x * scale;
+}
+
+/* ── DemagData ─────────────────────────────────────────────────────── */
 struct DemagData {
-    int nx, ny, ncell;
-    int nn2;
+    int    nx, ny, ncell;
+    int    nx2, ny2;
     double strength;
+
+    /* self-coupling (for preconditioner), already scaled by strength */
+    double Nxx0_scaled, Nyy0_scaled, Nzz0_scaled;
 
     cufftHandle plan;
 
-    /* Device: f̂ tensor spectra — computed once at Init, permanent */
+    /* permanent on device: tensor spectra */
     cufftDoubleComplex *dofaa, *dofab, *dofac;
     cufftDoubleComplex *dofba, *dofbb, *dofbc;
     cufftDoubleComplex *dofca, *dofcb, *dofcc;
 
-    /* Device: M FFT input/output */
-    cufftDoubleComplex *dima, *dimb, *dimc;
-    cufftDoubleComplex *doma, *domb, *domc;
+    /* scratch on device: M FFT input/output */
+    cufftDoubleComplex *dima, *doma;
+    cufftDoubleComplex *dimb, *domb;
+    cufftDoubleComplex *dimc, *domc;
 
-    /* Device: H̃ spectra and IFFT output */
-    cufftDoubleComplex *dkha, *dkhb, *dkhc;
-    cufftDoubleComplex *drha, *drhb, *drhc;
-
-    /* Host: IFFT result (for index-remapped scatter into h_out) */
-    cufftDoubleComplex *hrha, *hrhb, *hrhc;
+    /* scratch on device: H̃ and IFFT output */
+    cufftDoubleComplex *dkha, *drha;
+    cufftDoubleComplex *dkhb, *drhb;
+    cufftDoubleComplex *dkhc, *drhc;
 };
 
-/* 
- * Demag_Init
- *  */
+/* ── Demag_Init (run once) ─────────────────────────────────────────── */
 DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
 {
-    printf("[Demag v2] Init: nx=%d ny=%d thick=%.4f strength=%.4f\n",
+    printf("[Demag GPU] Init: nx=%d ny=%d thick=%.4f strength=%.4f\n",
            nx, ny, thick, demag_strength);
-    printf("[Demag v2] f̂ computed once at init, stays on device permanently.\n");
+    printf("[Demag GPU] Fully on-device pipeline: pack -> FFT -> mul -> IFFT -> unshift.\n");
+    printf("[Demag GPU] No per-step host transfers.\n");
 
     DemagData *d = (DemagData*)calloc(1, sizeof(DemagData));
     if (!d) { fprintf(stderr,"[demag] calloc failed\n"); return NULL; }
@@ -199,13 +231,14 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
     d->nx       = nx;
     d->ny       = ny;
     d->ncell    = nx * ny;
-    d->nn2      = ny / 2;
+    d->nx2      = nx / 2;
+    d->ny2      = ny / 2;
     d->strength = demag_strength;
 
     const size_t csz = (size_t)(nx * ny) * sizeof(cufftDoubleComplex);
 
-    /* step 1: calt on CPU */
-    printf("[Demag v2] Computing calt (81-pt averaging)...\n");
+    /* calt on CPU */
+    printf("[Demag GPU] Computing Newell tensor (calt/ctt, 81-pt avg)...\n");
 
     double *taa=(double*)calloc(nx*ny,sizeof(double));
     double *tab=(double*)calloc(nx*ny,sizeof(double));
@@ -224,9 +257,20 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
         return NULL;
     }
     calt(thick, nx, ny, taa,tab,tac, tba,tbb,tbc, tca,tcb,tcc);
-    printf("[Demag v2] calt done.\n");
 
-    /* step 2: pack tensor into complex (imag=0) */
+    /* extract N(0) — stored at index (ny2, nx2) in centered convention */
+    {
+        const int i0 = d->ny2 * nx + d->nx2;
+        d->Nxx0_scaled = taa[i0] * demag_strength;
+        d->Nyy0_scaled = tbb[i0] * demag_strength;
+        d->Nzz0_scaled = tcc[i0] * demag_strength;
+        printf("[Demag GPU] N(0) = diag(%.4e, %.4e, %.4e)  [unscaled]\n",
+               taa[i0], tbb[i0], tcc[i0]);
+        printf("[Demag GPU] N(0) off-diag at origin: tab=%.2e tac=%.2e tbc=%.2e\n",
+               tab[i0], tac[i0], tbc[i0]);
+    }
+
+    /* pack real tensor -> complex (imag=0) on host for H2D */
     cufftDoubleComplex *hfaa=(cufftDoubleComplex*)malloc(csz);
     cufftDoubleComplex *hfab=(cufftDoubleComplex*)malloc(csz);
     cufftDoubleComplex *hfac=(cufftDoubleComplex*)malloc(csz);
@@ -237,7 +281,7 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
     cufftDoubleComplex *hfcb=(cufftDoubleComplex*)malloc(csz);
     cufftDoubleComplex *hfcc=(cufftDoubleComplex*)malloc(csz);
 
-    for (int idx=0;idx<nx*ny;idx++) {
+    for (int idx=0; idx < nx*ny; idx++) {
         hfaa[idx].x=taa[idx]; hfaa[idx].y=0.0;
         hfab[idx].x=tab[idx]; hfab[idx].y=0.0;
         hfac[idx].x=tac[idx]; hfac[idx].y=0.0;
@@ -251,25 +295,22 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
     free(taa);free(tab);free(tac);free(tba);free(tbb);
     free(tbc);free(tca);free(tcb);free(tcc);
 
-    /* step 3: cuFFT Z2Z plan */
-    {
-        cufftResult r = cufftPlan2d(&d->plan, ny, nx, CUFFT_Z2Z);
-        if (r != CUFFT_SUCCESS) {
-            fprintf(stderr,"[demag] cufftPlan2d failed: %d\n",(int)r);
-            free(hfaa);free(hfab);free(hfac);free(hfba);free(hfbb);
-            free(hfbc);free(hfca);free(hfcb);free(hfcc);free(d);
-            return NULL;
-        }
+    /* cuFFT plan */
+    if (cufftPlan2d(&d->plan, ny, nx, CUFFT_Z2Z) != CUFFT_SUCCESS) {
+        fprintf(stderr,"[demag] cufftPlan2d failed\n");
+        free(hfaa);free(hfab);free(hfac);free(hfba);free(hfbb);
+        free(hfbc);free(hfca);free(hfcb);free(hfcc);free(d);
+        return NULL;
     }
 
-    /* step 4: allocate permanent f̂ device arrays */
+    /* allocate permanent f̂ device arrays */
     cudaMalloc((void**)&d->dofaa,csz); cudaMalloc((void**)&d->dofab,csz);
     cudaMalloc((void**)&d->dofac,csz); cudaMalloc((void**)&d->dofba,csz);
     cudaMalloc((void**)&d->dofbb,csz); cudaMalloc((void**)&d->dofbc,csz);
     cudaMalloc((void**)&d->dofca,csz); cudaMalloc((void**)&d->dofcb,csz);
     cudaMalloc((void**)&d->dofcc,csz);
 
-    /* temporary input buffers for H2D (freed after FFT) */
+    /* temporary input buffers */
     cufftDoubleComplex *difaa,*difab,*difac,*difba,*difbb,*difbc,*difca,*difcb,*difcc;
     cudaMalloc((void**)&difaa,csz); cudaMalloc((void**)&difab,csz);
     cudaMalloc((void**)&difac,csz); cudaMalloc((void**)&difba,csz);
@@ -290,7 +331,7 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
     free(hfaa);free(hfab);free(hfac);free(hfba);free(hfbb);
     free(hfbc);free(hfca);free(hfcb);free(hfcc);
 
-    /* FFT → dofXX are now permanently on device */
+    /* FFT forward -> dofXX permanent on device */
     cufftExecZ2Z(d->plan,difaa,d->dofaa,CUFFT_FORWARD);
     cufftExecZ2Z(d->plan,difab,d->dofab,CUFFT_FORWARD);
     cufftExecZ2Z(d->plan,difac,d->dofac,CUFFT_FORWARD);
@@ -302,12 +343,11 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
     cufftExecZ2Z(d->plan,difcc,d->dofcc,CUFFT_FORWARD);
     cudaDeviceSynchronize();
 
-    /* step 5: free temporary input buffers */
     cudaFree(difaa);cudaFree(difab);cudaFree(difac);
     cudaFree(difba);cudaFree(difbb);cudaFree(difbc);
     cudaFree(difca);cudaFree(difcb);cudaFree(difcc);
 
-    /* allocate persistent per-timestep device buffers */
+    /* persistent per-timestep scratch on device */
     cudaMalloc((void**)&d->dima,csz); cudaMalloc((void**)&d->doma,csz);
     cudaMalloc((void**)&d->dimb,csz); cudaMalloc((void**)&d->domb,csz);
     cudaMalloc((void**)&d->dimc,csz); cudaMalloc((void**)&d->domc,csz);
@@ -315,65 +355,39 @@ DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength)
     cudaMalloc((void**)&d->dkhb,csz); cudaMalloc((void**)&d->drhb,csz);
     cudaMalloc((void**)&d->dkhc,csz); cudaMalloc((void**)&d->drhc,csz);
 
-    /* host buffers for IFFT result */
-    d->hrha=(cufftDoubleComplex*)malloc(csz);
-    d->hrhb=(cufftDoubleComplex*)malloc(csz);
-    d->hrhc=(cufftDoubleComplex*)malloc(csz);
-
-    printf("[Demag v2] Device: %.1f MB  Host: %.1f MB\n",
-           (double)(9+6+6)*csz/1e6, (double)(3)*csz/1e6);
-    printf("[Demag v2] Ready.\n");
+    printf("[Demag GPU] Device: %.1f MB (tensor spectra) + %.1f MB (scratch)\n",
+           (double)9 * csz / 1e6, (double)12 * csz / 1e6);
+    printf("[Demag GPU] Ready.\n");
     return d;
 }
 
-/* 
- * Demag_Apply  (per-timestep, steps 6-12)
- *  */
-void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
+/* ── Demag_Apply (per RHS call, fully GPU) ─────────────────────────── */
+void Demag_Apply(DemagData *d, const double *y_dev, double *h_out_dev)
 {
     if (!d) return;
 
     const int nx    = d->nx;
     const int ny    = d->ny;
     const int ncell = d->ncell;
-    const int nn2   = d->nn2;
     const double scale = d->strength / (double)(nx * ny);
-    const size_t csz = (size_t)ncell * sizeof(cufftDoubleComplex);
 
-    /* step 6: D2H y, pack M → complex hma_c..hmc_c */
+    /* step 7: pack y (SoA real) -> complex on device */
     {
-        double *h_y=(double*)malloc((size_t)3*ncell*sizeof(double));
-        if (!h_y) { fprintf(stderr,"[demag] h_y alloc failed\n"); return; }
-        cudaMemcpy(h_y, y_dev, (size_t)3*ncell*sizeof(double),
-                   cudaMemcpyDeviceToHost);
-
-        cufftDoubleComplex *hma_c=(cufftDoubleComplex*)malloc(csz);
-        cufftDoubleComplex *hmb_c=(cufftDoubleComplex*)malloc(csz);
-        cufftDoubleComplex *hmc_c=(cufftDoubleComplex*)malloc(csz);
-
-        for (int idx=0;idx<ncell;idx++) {
-            hma_c[idx].x=h_y[idx];           hma_c[idx].y=0.0;
-            hmb_c[idx].x=h_y[ncell+idx];     hmb_c[idx].y=0.0;
-            hmc_c[idx].x=h_y[2*ncell+idx];   hmc_c[idx].y=0.0;
-        }
-        free(h_y);
-
-        /* step 7: H2D */
-        cudaMemcpy(d->dima, hma_c, csz, cudaMemcpyHostToDevice);
-        cudaMemcpy(d->dimb, hmb_c, csz, cudaMemcpyHostToDevice);
-        cudaMemcpy(d->dimc, hmc_c, csz, cudaMemcpyHostToDevice);
-        free(hma_c); free(hmb_c); free(hmc_c);
+        const int b = 256;
+        const int g = (ncell + b - 1) / b;
+        pack_m_kernel<<<g, b>>>(y_dev, d->dima, d->dimb, d->dimc, ncell);
     }
 
-    /* step 8: FFT FORWARD M → m̂ (stays on device) */
+    /* step 8: FFT forward (device-to-device) */
     cufftExecZ2Z(d->plan, d->dima, d->doma, CUFFT_FORWARD);
     cufftExecZ2Z(d->plan, d->dimb, d->domb, CUFFT_FORWARD);
     cufftExecZ2Z(d->plan, d->dimc, d->domc, CUFFT_FORWARD);
 
-    /* step 9: GPU multiply  ĥ = f̂ · m̂  (all on device, no transfers) */
+    /* step 9: ĥ = f̂ · m̂ (all on device) */
     {
-        int block=256, grid=(ncell+block-1)/block;
-        multiply_kernel<<<grid,block>>>(
+        const int b = 256;
+        const int g = (ncell + b - 1) / b;
+        multiply_kernel<<<g, b>>>(
             d->dofaa, d->dofab, d->dofac,
             d->dofba, d->dofbb, d->dofbc,
             d->dofca, d->dofcb, d->dofcc,
@@ -382,44 +396,40 @@ void Demag_Apply(DemagData *d, const double *y_dev, double *h_out)
             ncell);
     }
 
-    /* step 10: FFT INVERSE ĥ → h */
+    /* step 10: FFT inverse */
     cufftExecZ2Z(d->plan, d->dkha, d->drha, CUFFT_INVERSE);
     cufftExecZ2Z(d->plan, d->dkhb, d->drhb, CUFFT_INVERSE);
     cufftExecZ2Z(d->plan, d->dkhc, d->drhc, CUFFT_INVERSE);
 
-    /* step 11: D2H result */
-    cudaMemcpy(d->hrha, d->drha, csz, cudaMemcpyDeviceToHost);
-    cudaMemcpy(d->hrhb, d->drhb, csz, cudaMemcpyDeviceToHost);
-    cudaMemcpy(d->hrhc, d->drhc, csz, cudaMemcpyDeviceToHost);
-
-    /* step 12: scatter with  index remapping → h_out */
-    double *h_hout=(double*)malloc((size_t)3*ncell*sizeof(double));
-    if (!h_hout) { fprintf(stderr,"[demag] h_hout alloc failed\n"); return; }
-    cudaMemcpy(h_hout, h_out, (size_t)3*ncell*sizeof(double),
-               cudaMemcpyDeviceToHost);
-
-    for (int j=0;j<ny;j++) {
-        int jy = (j<nn2) ? (nn2-j) : (ny-j+nn2-1);
-        for (int i=0;i<nx;i++) {
-            int ix     = (i<nn2) ? (nn2-i) : (nx-i+nn2-1);
-            int idx    = j*nx + i;
-            int idxnew = jy*nx + ix;
-            if (idxnew<0 || idxnew>=ncell) continue;
-
-            h_hout[idx]          += d->hrha[idxnew].x * scale;
-            h_hout[ncell+idx]    += d->hrhb[idxnew].x * scale;
-            h_hout[2*ncell+idx]  += d->hrhc[idxnew].x * scale;
-        }
+    /* step 11: real-part + FFT-shift + scale (1/N included) -> SoA h_out */
+    {
+        dim3 block(16, 16);
+        dim3 grid((nx + block.x - 1) / block.x,
+                  (ny + block.y - 1) / block.y);
+        unshift_h_kernel<<<grid, block>>>(
+            d->drha, d->drhb, d->drhc,
+            h_out_dev,
+            scale,
+            nx, ny, ncell, d->nx2, d->ny2);
     }
-
-    cudaMemcpy(h_out, h_hout, (size_t)3*ncell*sizeof(double),
-               cudaMemcpyHostToDevice);
-    free(h_hout);
 }
 
-/* 
- * Demag_Destroy
- *  */
+/* ── Demag_GetSelfCoupling ─────────────────────────────────────────── */
+void Demag_GetSelfCoupling(DemagData *d,
+                           double *nxx0, double *nyy0, double *nzz0)
+{
+    if (!d) {
+        if (nxx0) *nxx0 = 0.0;
+        if (nyy0) *nyy0 = 0.0;
+        if (nzz0) *nzz0 = 0.0;
+        return;
+    }
+    if (nxx0) *nxx0 = d->Nxx0_scaled;
+    if (nyy0) *nyy0 = d->Nyy0_scaled;
+    if (nzz0) *nzz0 = d->Nzz0_scaled;
+}
+
+/* ── Demag_Destroy ─────────────────────────────────────────────────── */
 void Demag_Destroy(DemagData *d)
 {
     if (!d) return;
@@ -436,6 +446,5 @@ void Demag_Destroy(DemagData *d)
     cudaFree(d->dkhb); cudaFree(d->drhb);
     cudaFree(d->dkhc); cudaFree(d->drhc);
 
-    free(d->hrha); free(d->hrhb); free(d->hrhc);
     free(d);
 }
