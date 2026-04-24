@@ -387,7 +387,7 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
    * ensures the simplified LLG (which assumes |m|=1) is evaluated
    * on the unit sphere.  Cost: ~2 µs per call at ncell=65536. */
   {
-    const int nb = 256;
+    const int nb = 256; // 8 warps
     const int ng_norm = (udata->ncell + nb - 1) / nb;
     normalize_m_kernel<<<ng_norm, nb>>>(ydata, udata->ncell);
   }
@@ -505,8 +505,8 @@ int main(int argc, char* argv[]) {
   float elapsedTime = 0.0f;
 
   /* problem size */
-  const int nx = 768;
-  const int ny = 256;
+  const int nx = 1536;
+  const int ny = 512;
 
   if (nx % GROUPSIZE != 0) {
     fprintf(stderr, "nx must be a multiple of GROUPSIZE=%d\n", GROUPSIZE);
@@ -662,7 +662,6 @@ int main(int argc, char* argv[]) {
   }
 
   CHECK_SUNDIALS(CVodeInit(cvode_mem, f, T0, y));
-  CVodeSetMaxNumSteps(cvode_mem, 20000);
   CHECK_SUNDIALS(CVodeSetUserData(cvode_mem, &udata));
   CHECK_SUNDIALS(CVodeSVtolerances(cvode_mem, RTOL, abstol));
 
@@ -702,7 +701,7 @@ int main(int argc, char* argv[]) {
          (double)INIT_RANDOM_EPS);
   printf("DEMAG_STRENGTH=%.4f  DEMAG_THICK=%.4f  (%s)\n",
          dstr, dthk,
-         dstr > 0.0 ? "h_dmag = IFFT[f_hat * m_hat] via cuFFT Z2Z, fused into RHS"
+         dstr > 0.0 ? "h_dmag = IFFT[f_hat * m_hat] via cuFFT real-to-complex (D2Z/Z2D), fused into RHS"
                     : "disabled (h_dmag buffer stays zero)");
   printf("T_TOTAL=%.2f  RTOL/ATOL=%.1e\n",
          (double)T_TOTAL, (double)RTOL_VAL);
