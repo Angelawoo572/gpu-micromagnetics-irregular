@@ -27,16 +27,6 @@ RTOL_VAL ?= 1.0e-4
 ATOL_VAL ?= 1.0e-4
 T_TOTAL  ?= 1000.0
 
-# ====== Periodic smooth-texture params ======
-CIRCLE_CENTER_X_FRAC ?= 0.50
-CIRCLE_CENTER_Y_FRAC ?= 0.50
-CIRCLE_RADIUS_FRAC_Y ?= 0.22
-
-TEXTURE_CORE_MZ    ?= -0.998
-TEXTURE_OUTER_MZ   ?= 0.998
-TEXTURE_WIDTH_FRAC ?= 0.35
-TEXTURE_EPS        ?= 1.0e-12
-
 # ====== FFT Demagnetization (professor's Newell calt/ctt) ======
 # DEMAG_STRENGTH = 0.0  → disabled (exchange-only, original behaviour)
 # DEMAG_STRENGTH = 1.0  → full dipolar demag via cuFFT Z2Z
@@ -62,13 +52,6 @@ NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) \
               -DRTOL_VAL=$(RTOL_VAL) -DATOL_VAL=$(ATOL_VAL) \
               -DT_TOTAL=$(T_TOTAL) \
-              -DCIRCLE_CENTER_X_FRAC=$(CIRCLE_CENTER_X_FRAC) \
-              -DCIRCLE_CENTER_Y_FRAC=$(CIRCLE_CENTER_Y_FRAC) \
-              -DCIRCLE_RADIUS_FRAC_Y=$(CIRCLE_RADIUS_FRAC_Y) \
-              -DTEXTURE_CORE_MZ=$(TEXTURE_CORE_MZ) \
-              -DTEXTURE_OUTER_MZ=$(TEXTURE_OUTER_MZ) \
-              -DTEXTURE_WIDTH_FRAC=$(TEXTURE_WIDTH_FRAC) \
-              -DTEXTURE_EPS=$(TEXTURE_EPS) \
               -DEARLY_SAVE_UNTIL=$(EARLY_SAVE_UNTIL) \
               -DEARLY_SAVE_EVERY=$(EARLY_SAVE_EVERY) \
               -DLATE_SAVE_EVERY=$(LATE_SAVE_EVERY) \
@@ -107,7 +90,7 @@ NCU_FLAGS ?= --set roofline -o ncu_$(TARGET)
 
 .PHONY: all run run-debug build-debug build-release \
         run-print run-noprint run-demag run-no-demag \
-        sweep-block sweep-tol sweep-circle sweep-demag \
+        sweep-block sweep-tol sweep-demag \
         profile profile-light profile-ext stats \
         export-csv export-sqlite ui compute \
         show-config clean reallyclean reports
@@ -193,16 +176,6 @@ sweep-tol:
 	  $(MAKE) clean >/dev/null 2>&1; \
 	  $(MAKE) BUILD=release PRINT=0 RTOL_VAL=$$tol ATOL_VAL=$$tol >/dev/null && \
 	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_tol_$${tol}.txt; \
-	done
-
-sweep-circle:
-	@for r in 0.12 0.18 0.22 0.28 0.34; do \
-	  echo "========================================"; \
-	  echo "Testing CIRCLE_RADIUS_FRAC_Y=$$r"; \
-	  $(MAKE) clean >/dev/null 2>&1; \
-	  $(MAKE) BUILD=release PRINT=0 \
-	    CIRCLE_RADIUS_FRAC_Y=$$r >/dev/null && \
-	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_circle_r_$${r}.txt; \
 	done
 
 sweep-demag:
