@@ -9,38 +9,39 @@
  * then store A⁻¹ in device memory.  PrecondSolve is one dense 3×3
  * mat-vec per cell.
  *
+ * ─── LLG form matched here ──────────────────────────────────────────
+ *   dm/dt = chg (m × h) + alpha (|m|² h − (m·h) m)
+ *
+ * This is the strictly |m|-preserving form used by f_kernel_unified_soa_periodic
+ * in 2d_fft.cu and by jtv_kernel in jtv.cu. Its Jacobian differs from the
+ * simplified "damping = α(h − (m·h)m)" form OFF the |m|=1 manifold, so keeping
+ * them consistent is critical for Newton convergence once BDF drifts slightly.
+ *
  * ─── What contributes to J_local ─────────────────────────────────────
  *   h_cell = h_exchange(neighbors) + h_DMI(neighbors)
  *          + h_anisotropy(m1) + h_demag(convolution)
  *
  *   Only terms that depend on THIS cell's m appear in ∂h/∂m_self:
- *     ∂h1/∂m1  = c_chk          (anisotropy, c_msk = {1,0,0})
- *             + Nxx(0)·strength (demag self-term)
- *     ∂h2/∂m2 =                   Nyy(0)·strength
- *     ∂h3/∂m3 =                   Nzz(0)·strength
- *     off-diagonals are zero (c_msk components off, N(0) diagonal by
- *     4-fold cell-face symmetry).
+ *     ∂h1/∂m1 = c_chk  + Nxx(0)·strength
+ *     ∂h2/∂m2 = Nyy(0)·strength
+ *     ∂h3/∂m3 = Nzz(0)·strength
+ *     off-diagonals zero (c_msk components off, N(0) diagonal by symmetry).
  *
  *   Shorthand:  k1 = c_chk + Nxx0,  k2 = Nyy0,  k3 = Nzz0.
  *
- * ─── LLG Jacobian (closed form) ──────────────────────────────────────
- *   yd_1 = chg (m3 h2 − m2 h3) + α (h1 − (m·h) m1)              (etc.)
+ * ─── Derivatives (closed form) ───────────────────────────────────────
+ *   Let mm = |m|², mh = m·h, e_β = h_β + m_β k_β = ∂(m·h)/∂m_β.
  *
- *   Let e_β = h_β + m_β k_β = ∂(m·h)/∂m_β, mh = m·h.  Then:
+ *   Precession part d/dm_β [chg (m×h)_α]:
+ *     d (m3 h2 − m2 h3)/dm  for α=1   (matches 2d_fft.cu's sign convention)
+ *     d (m1 h3 − m3 h1)/dm  for α=2
+ *     d (m2 h1 − m1 h2)/dm  for α=3
  *
- *     J[0][0] = α (k1 − e1 m1 − mh)
- *     J[0][1] = chg (m3 k2 − h3) − α e2 m1
- *     J[0][2] = chg (h2 − m2 k3) − α e3 m1
- *     J[1][0] = chg (h3 − m3 k1) − α e1 m2
- *     J[1][1] = α (k2 − e2 m2 − mh)
- *     J[1][2] = chg (m1 k3 − h1) − α e3 m2
- *     J[2][0] = chg (m2 k1 − h2) − α e1 m3
- *     J[2][1] = chg (h1 − m1 k2) − α e2 m3
- *     J[2][2] = α (k3 − e3 m3 − mh)
+ *   Damping part d/dm_β [alpha (mm h_α − mh m_α)]:
+ *     = alpha (2 m_β h_α + mm k_α δ_{αβ} − e_β m_α − mh δ_{αβ})
  *
- * h in the formulas is evaluated at the current state, using the
- * cached h_dmag from the most recent f() call. CVODE calls f() right
- * before PrecondSetup, so this is consistent with the y passed here.
+ *   The NEW contribution vs the old simplified form is the `2 m_β h_α`
+ *   term from d|m|²/dm; this is what removes the m·h-driven feedback.
  */
 
 #include "precond.h"
@@ -100,9 +101,10 @@ typedef struct {
 
 /* ─── build_J_kernel ────────────────────────────────────────────────── */
 /*
- * One thread per cell. Reads self + 4 neighbors (for h only — derivatives
- * only need self quantities) plus h_dmag[mx/my/mz] for this cell, assembles
- * the 3×3 local J, forms A = I − γJ, stores A⁻¹.
+ * One thread per cell. Reads self + 4 neighbors (for h — derivatives
+ * only need self quantities) plus h_dmag[mx/my/mz] for this cell,
+ * assembles the 3×3 local J (|m|-preserving form), forms A = I − γJ,
+ * stores A⁻¹.
  */
 __global__ static void build_J_kernel(
     const sunrealtype* __restrict__ y,
@@ -167,19 +169,39 @@ __global__ static void build_J_kernel(
     const sunrealtype e2 = h2 + m2 * k2;
     const sunrealtype e3 = h3 + m3 * k3;
     const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
+    const sunrealtype mm = m1 * m1 + m2 * m2 + m3 * m3;
 
-    /* Local 3×3 J (see comment block at top). */
-    const sunrealtype J00 = pc_alpha * (k1 - e1 * m1 - mh);
-    const sunrealtype J01 = pc_chg * (m3 * k2 - h3) - pc_alpha * e2 * m1;
-    const sunrealtype J02 = pc_chg * (h2 - m2 * k3) - pc_alpha * e3 * m1;
+    /* Local 3×3 J (|m|-preserving LL)
+     * Diagonal:
+     *   J[α][α] = alpha * (m_α h_α + (mm − m_α²) k_α − mh)
+     *
+     * Off-diagonal:
+     *   J[α][β] = chg * (prec_αβ) + alpha * (2 m_β h_α − e_β m_α)
+     *
+     * Precession sign convention matches 2d_fft.cu:
+     *   yd[mx] = chg (m3 h2 − m2 h3) + ...
+     * so prec_αβ is obtained by direct differentiation of those three
+     * bilinear expressions (see file header for all nine entries).
+     */
+    const sunrealtype two = SUN_RCONST(2.0);
 
-    const sunrealtype J10 = pc_chg * (h3 - m3 * k1) - pc_alpha * e1 * m2;
-    const sunrealtype J11 = pc_alpha * (k2 - e2 * m2 - mh);
-    const sunrealtype J12 = pc_chg * (m1 * k3 - h1) - pc_alpha * e3 * m2;
+    const sunrealtype J00 = pc_alpha * (m1*h1 + (mm - m1*m1)*k1 - mh);
+    const sunrealtype J01 = pc_chg * (m3*k2 - h3)
+                          + pc_alpha * (two*m2*h1 - e2*m1);
+    const sunrealtype J02 = pc_chg * (h2 - m2*k3)
+                          + pc_alpha * (two*m3*h1 - e3*m1);
 
-    const sunrealtype J20 = pc_chg * (m2 * k1 - h2) - pc_alpha * e1 * m3;
-    const sunrealtype J21 = pc_chg * (h1 - m1 * k2) - pc_alpha * e2 * m3;
-    const sunrealtype J22 = pc_alpha * (k3 - e3 * m3 - mh);
+    const sunrealtype J10 = pc_chg * (h3 - m3*k1)
+                          + pc_alpha * (two*m1*h2 - e1*m2);
+    const sunrealtype J11 = pc_alpha * (m2*h2 + (mm - m2*m2)*k2 - mh);
+    const sunrealtype J12 = pc_chg * (m1*k3 - h1)
+                          + pc_alpha * (two*m3*h2 - e3*m2);
+
+    const sunrealtype J20 = pc_chg * (m2*k1 - h2)
+                          + pc_alpha * (two*m1*h3 - e1*m3);
+    const sunrealtype J21 = pc_chg * (h1 - m1*k2)
+                          + pc_alpha * (two*m2*h3 - e2*m3);
+    const sunrealtype J22 = pc_alpha * (m3*h3 + (mm - m3*m3)*k3 - mh);
 
     /* A = I − γ J */
     const sunrealtype A00 = SUN_RCONST(1.0) - gamma * J00;
@@ -288,7 +310,8 @@ PrecondData* Precond_Create(int ng, int ny, int ncell)
     }
     cudaMemset(pd->d_P, 0, bytes);
 
-    printf("[Precond] Block-Jacobi 3x3: ncell=%d, device mem = %.2f MB\n",
+    printf("[Precond] Block-Jacobi 3x3 (|m|-preserving LL): ncell=%d, "
+           "device mem = %.2f MB\n",
            ncell, (double)bytes / 1e6);
     return pd;
 }

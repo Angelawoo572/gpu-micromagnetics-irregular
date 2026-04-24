@@ -145,7 +145,7 @@ run-noprint:
 # Full demag (professor's Newell tensor)
 run-demag:
 	$(MAKE) clean
-	$(MAKE) DEMAG_STRENGTH=1.0 DEMAG_THICK=1.0
+	$(MAKE) DEMAG_STRENGTH=2.0 DEMAG_THICK=1.0
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
 # Exchange-only baseline (demag disabled, recovers original behaviour)

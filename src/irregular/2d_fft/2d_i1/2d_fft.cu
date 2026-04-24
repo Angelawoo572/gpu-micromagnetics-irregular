@@ -21,6 +21,22 @@
  *
  * and then read inside the unified kernel just like any other SoA field.
  *
+ * ─── LLG form (|m|-preserving) ──────────────────────────────────────
+ * We use the generalized Landau-Lifshitz form that preserves |m| EXACTLY
+ * regardless of whether |m|=1 on the integration manifold:
+ *
+ *   dm/dt = γ (m × h) + α ( |m|² h − (m·h) m )
+ *
+ * Here m·(dm/dt) = α(|m|²(m·h) − (m·h)|m|²) = 0 IDENTICALLY — no feedback
+ * on |m|−1 drift. The simplified form α(h − (m·h)m) assumes |m|=1 strictly
+ * and has the feedback term α(m·h)(1−|m|²) on m·(dm/dt), which becomes
+ * UNSTABLE whenever m·h < 0 (common in head-on domain walls with demag).
+ * That instability is what caused CVODE to stall near t≈13 at
+ * DEMAG_STRENGTH=2.0 — strong negative demag field created large regions
+ * with m·h < 0 and BDF's O(h^p) drift in |m| was amplified exponentially.
+ * The |m|² factor removes the instability entirely (on the |m|=1 manifold
+ * both forms give identical dynamics).
+ *
  * ─── Build knobs ────────────────────────────────────────────────────
  * Enable:  make DEMAG_STRENGTH=1.0 DEMAG_THICK=1.0
  * Disable: make DEMAG_STRENGTH=0.0   (h_dmag buffer stays zero)
@@ -207,7 +223,7 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
   return (y < 0) ? (y + ny) : ((y >= ny) ? (y - ny) : y);
 }
 
-/* 
+/*
  * UNIFIED RHS kernel
  *
  * Reads y (self + 4 neighbors) and h_dmag (self only) from global memory,
@@ -218,10 +234,15 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
  *           + h_DMI(x-neighbors)
  *           + h_demag(self)         ← precomputed via FFT outside
  *
- * then writes the single LLG update for this cell.
+ * then writes the single LLG update for this cell using the strictly
+ * |m|-preserving generalized Landau-Lifshitz form:
  *
- * No separate demag_correction_kernel anywhere.
- *  */
+ *   dm/dt = γ (m × h) + α ( |m|² h − (m·h) m )
+ *
+ * Note the |m|² multiplying h in the damping term — this is what keeps
+ * d|m|²/dt identically zero regardless of drift on the unit-sphere
+ * manifold. See the header comment at the top of this file.
+ */
 __global__ static void f_kernel_unified_soa_periodic(
     const sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ h_dmag,
@@ -288,15 +309,19 @@ __global__ static void f_kernel_unified_soa_periodic(
       c_chb * c_nsk[2] * (y[lz] + y[rz]) +
       h_dmag[mz];
 
-  /* Single LLG evaluation with the combined h. */
+  /* |m|-preserving Landau-Lifshitz: damping term is α(|m|² h − (m·h) m).
+   * On the |m|=1 manifold this equals α(h − (m·h)m) — same physics —
+   * but it has ZERO d|m|²/dt regardless of drift, unlike the simplified
+   * form which amplifies |m|-drift whenever m·h < 0. */
   const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
+  const sunrealtype mm = m1 * m1 + m2 * m2 + m3 * m3;
 
-  yd[mx] = c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1);
-  yd[my] = c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2);
-  yd[mz] = c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3);
+  yd[mx] = c_chg * (m3 * h2 - m2 * h3) + c_alpha * (mm * h1 - mh * m1);
+  yd[my] = c_chg * (m1 * h3 - m3 * h1) + c_alpha * (mm * h2 - mh * m2);
+  yd[mz] = c_chg * (m2 * h1 - m1 * h2) + c_alpha * (mm * h3 - mh * m3);
 }
 
-/* 
+/*
  * RHS wrapper for CVODE
  *
  * Step 1: compute h_dmag = IFFT[ f̂ · FFT(y) ]
@@ -305,7 +330,7 @@ __global__ static void f_kernel_unified_soa_periodic(
  *
  * Step 2: single unified kernel sums all fields (exchange + anisotropy
  *         + DMI + demag) and writes ydot.
- *  */
+ */
 static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   (void)t;
 
@@ -535,7 +560,7 @@ int main(int argc, char* argv[]) {
    * to break the y-z symmetry; after normalization |m| = 1. Under LLG
    * relaxation these perturbations are what allow the chevron/zigzag
    * domain-wall structure (Fig. 5.7) to emerge from the sharp step.
-   * ─────────────────────────────────────────────────────────────────── */
+   */
   {
     const double eps = (double)INIT_RANDOM_EPS;
     srand((unsigned int)INIT_RANDOM_SEED);
@@ -614,7 +639,8 @@ int main(int argc, char* argv[]) {
   CHECK_SUNDIALS(CVodeSetMaxOrd(cvode_mem, MAX_BDF_ORDER));
   printf("Max BDF order: %d   Krylov dim: %d\n", MAX_BDF_ORDER, KRYLOV_DIM);
 
-  printf("\n2D periodic LLG — head-on transition + unified-field RHS\n\n");
+  printf("\n2D periodic LLG — head-on transition + unified-field RHS\n");
+  printf("LLG form: |m|-preserving Landau-Lifshitz (damping = alpha*(|m|^2 h - (m.h) m))\n\n");
   printf("nx=%d  ny=%d  ng=%d  ncell=%d  neq=%d\n", nx, ny, ng, ncell, neq);
   printf("periodic BC: x and y\n");
   printf("Init: head-on stripes   q1=%d (x=%.2f*ng)   q3=%d (x=%.2f*ng)\n",
