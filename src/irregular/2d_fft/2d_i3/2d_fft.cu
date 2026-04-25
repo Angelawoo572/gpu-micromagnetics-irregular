@@ -106,16 +106,22 @@
 
 /* ─── Polycrystal knobs ──────────────────────────────────────────── */
 #ifndef NUM_GRAINS
-#define NUM_GRAINS 48
+#define NUM_GRAINS 72                /* was 48 — finer mesh */
 #endif
 #ifndef DEAD_GRAIN_FRAC
-#define DEAD_GRAIN_FRAC 0.18
+#define DEAD_GRAIN_FRAC 0.16         /* was 0.18 */
 #endif
 #ifndef HOLE_SEED
-#define HOLE_SEED 20251101
+#define HOLE_SEED 20251104
 #endif
 #ifndef MASK_EPS_CELLS
-#define MASK_EPS_CELLS 1.5
+#define MASK_EPS_CELLS 2.2           /* was 1.5 — softer boundaries */
+#endif
+#ifndef GRAIN_Z_BIAS
+#define GRAIN_Z_BIAS 1.6             /* >1 = bias easy-axes toward ±z */
+#endif
+#ifndef IC_CORE_MZ
+#define IC_CORE_MZ 0.95              /* grain-core out-of-plane amplitude */
 #endif
 
 #ifndef GRID_NX
@@ -129,12 +135,13 @@
 /* c_msk_default kept for reference; the kernel actually reads per-cell d_msk.
  * c_nsk (DMI direction) stays uniform along x. */
 __constant__ sunrealtype c_nsk[3] = {SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
-__constant__ sunrealtype c_chk   = SUN_RCONST(4.0);
+__constant__ sunrealtype c_chk   = SUN_RCONST(1.0);   /* was 4.0 */
 __constant__ sunrealtype c_che   = SUN_RCONST(4.0);
 __constant__ sunrealtype c_alpha = SUN_RCONST(0.2);
 __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
 __constant__ sunrealtype c_cha   = SUN_RCONST(0.0);
-__constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
+__constant__ sunrealtype c_chb   = SUN_RCONST(0.6);   /* was 0.3 */
+/* c_nsk removed — DMI direction is now per-cell, see d_nsk */
 
 /* ─── Error checking ─────────────────────────────────────────────── */
 #define CHECK_CUDA(call)                                                     \
@@ -170,8 +177,10 @@ typedef struct {
   sunrealtype  *d_w;         /* per-cell soft weight */
   sunrealtype  *d_y_eff;     /* scratch w·y, 3*ncell */
   sunrealtype  *d_msk;       /* per-cell easy axis, SoA 3*ncell */
+  sunrealtype  *d_nsk;       /* per-cell DMI direction */
   double       *h_w;
   double       *h_msk;       /* host SoA copy */
+  double       *h_nsk;       /* host SoA copy */
   int          *h_grain_id;  /* host: which grain each cell belongs to */
   int           num_dead;
 } UserData;
@@ -189,19 +198,19 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
 
 /* ─── Polycrystal: host-side generation ──────────────────────────── */
 typedef struct {
-  double sx, sy;          /* seed center (cell coords) */
-  double ax, ay, az;      /* easy axis (unit vector)   */
-  int    dead;            /* 1 → grain becomes hole    */
+  double sx, sy;          /* seed center */
+  double ax, ay, az;      /* easy axis (unit) */
+  double nx_, ny_, nz_;   /* DMI direction (unit, in-plane preferred) */
+  int    dead;
 } GrainSpec;
 
 static GrainSpec g_grains[NUM_GRAINS];
-
 static double rand_unit(void) { return (double)rand() / (double)RAND_MAX; }
 
 static void generate_grains(int ng, int ny) {
   srand((unsigned)HOLE_SEED);
 
-  /* Stratified-jitter seed placement → no clustering, still random-feel. */
+  /* stratified-jitter seed placement */
   int gx = (int)ceil(sqrt((double)NUM_GRAINS * (double)ng / (double)ny));
   if (gx < 1) gx = 1;
   int gy = (NUM_GRAINS + gx - 1) / gx;
@@ -209,31 +218,40 @@ static void generate_grains(int ng, int ny) {
   const double dys = (double)ny / (double)gy;
 
   int idx = 0;
-  for (int j = 0; j < gy && idx < NUM_GRAINS; j++) {
+  for (int j = 0; j < gy && idx < NUM_GRAINS; j++)
     for (int i = 0; i < gx && idx < NUM_GRAINS; i++) {
       g_grains[idx].sx = ((double)i + 0.15 + 0.7 * rand_unit()) * dxs;
       g_grains[idx].sy = ((double)j + 0.15 + 0.7 * rand_unit()) * dys;
-      while (g_grains[idx].sx <  0.0)         g_grains[idx].sx += (double)ng;
-      while (g_grains[idx].sx >= (double)ng)  g_grains[idx].sx -= (double)ng;
-      while (g_grains[idx].sy <  0.0)         g_grains[idx].sy += (double)ny;
-      while (g_grains[idx].sy >= (double)ny)  g_grains[idx].sy -= (double)ny;
+      while (g_grains[idx].sx <  0.0)        g_grains[idx].sx += (double)ng;
+      while (g_grains[idx].sx >= (double)ng) g_grains[idx].sx -= (double)ng;
+      while (g_grains[idx].sy <  0.0)        g_grains[idx].sy += (double)ny;
+      while (g_grains[idx].sy >= (double)ny) g_grains[idx].sy -= (double)ny;
       idx++;
     }
-  }
   while (idx < NUM_GRAINS) {
     g_grains[idx].sx = rand_unit() * (double)ng;
     g_grains[idx].sy = rand_unit() * (double)ny;
     idx++;
   }
 
-  /* Per-grain random easy axis (uniform on unit sphere) and dead flag. */
   for (int g = 0; g < NUM_GRAINS; g++) {
-    const double z   = 2.0 * rand_unit() - 1.0;
+    /* easy axis: power-bias toward ±z so mz patches stand out
+     *   z = sign · |u|^(1/bias),    bias>1 pushes |z|→1 */
+    const double u = rand_unit();
+    const double sign = (rand_unit() < 0.5) ? -1.0 : 1.0;
+    const double z = sign * pow(u, 1.0 / (double)GRAIN_Z_BIAS);
     const double phi = 2.0 * M_PI * rand_unit();
     const double rxy = sqrt(fmax(0.0, 1.0 - z*z));
     g_grains[g].ax = rxy * cos(phi);
     g_grains[g].ay = rxy * sin(phi);
     g_grains[g].az = z;
+
+    /* DMI direction: random unit in xy-plane (Néel-like wall direction) */
+    const double psi = 2.0 * M_PI * rand_unit();
+    g_grains[g].nx_ = cos(psi);
+    g_grains[g].ny_ = sin(psi);
+    g_grains[g].nz_ = 0.0;
+
     g_grains[g].dead = (rand_unit() < (double)DEAD_GRAIN_FRAC) ? 1 : 0;
   }
 }
@@ -325,6 +343,14 @@ static void build_polycrystal(int ng, int ny, UserData *udata) {
     udata->h_msk[idx_my(k, ncell)] = g_grains[g].ay;
     udata->h_msk[idx_mz(k, ncell)] = g_grains[g].az;
   }
+
+  /* Pass 4: per-cell DMI direction (SoA) */
+  for (int k = 0; k < ncell; k++) {
+    const int g = udata->h_grain_id[k];
+    udata->h_nsk[idx_mx(k, ncell)] = g_grains[g].nx_;
+    udata->h_nsk[idx_my(k, ncell)] = g_grains[g].ny_;
+    udata->h_nsk[idx_mz(k, ncell)] = g_grains[g].nz_;
+  }
 }
 
 /* ─── Output helpers ─────────────────────────────────────────────── */
@@ -389,7 +415,8 @@ __global__ static void f_kernel_unified_polycrystal(
     const sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ y_eff,
     const sunrealtype* __restrict__ w,
-    const sunrealtype* __restrict__ msk,    /* SoA, same layout as y */
+    const sunrealtype* __restrict__ msk,     /* SoA */
+    const sunrealtype* __restrict__ nsk,     /* SoA, per-cell DMI dir */
     const sunrealtype* __restrict__ h_dmag,
     sunrealtype*       __restrict__ yd,
     int ng, int ny, int ncell)
@@ -412,18 +439,12 @@ __global__ static void f_kernel_unified_polycrystal(
   const int uc = yu  * ng + gx;
   const int dc = ydn * ng + gx;
 
-  /* self */
-  const sunrealtype m1 = y[mx_i];
-  const sunrealtype m2 = y[my_i];
-  const sunrealtype m3 = y[mz_i];
+  const sunrealtype m1 = y[mx_i], m2 = y[my_i], m3 = y[mz_i];
   const sunrealtype w_self = w[cell];
 
-  /* per-cell easy axis (3 coalesced reads, same layout as y) */
-  const sunrealtype mskx = msk[mx_i];
-  const sunrealtype msky = msk[my_i];
-  const sunrealtype mskz = msk[mz_i];
+  const sunrealtype mskx = msk[mx_i], msky = msk[my_i], mskz = msk[mz_i];
+  const sunrealtype nskx = nsk[mx_i], nsky = nsk[my_i], nskz = nsk[mz_i];
 
-  /* weighted neighbors (already w·n̂) */
   const sunrealtype lx1 = y_eff[idx_mx(lc, ncell)];
   const sunrealtype lx2 = y_eff[idx_my(lc, ncell)];
   const sunrealtype lx3 = y_eff[idx_mz(lc, ncell)];
@@ -437,28 +458,31 @@ __global__ static void f_kernel_unified_polycrystal(
   const sunrealtype dx2 = y_eff[idx_my(dc, ncell)];
   const sunrealtype dx3 = y_eff[idx_mz(dc, ncell)];
 
-  /* proper uniaxial anisotropy: h_α += msk_α · (chk · m·msk + cha) */
-  const sunrealtype mdotmsk     = m1*mskx + m2*msky + m3*mskz;
+  /* DMI uses x-neighbors projected on per-cell DMI direction */
+  const sunrealtype dmi_x = lx1 + rx1;
+  const sunrealtype dmi_y = lx2 + rx2;
+  const sunrealtype dmi_z = lx3 + rx3;
+
+  const sunrealtype mdotmsk      = m1*mskx + m2*msky + m3*mskz;
   const sunrealtype aniso_factor = c_chk * mdotmsk + c_cha;
 
   const sunrealtype h1 =
       c_che * (lx1 + rx1 + ux1 + dx1)
     + mskx * aniso_factor
-    + c_chb * c_nsk[0] * (lx1 + rx1)
+    + c_chb * nskx * dmi_x
     + h_dmag[mx_i];
   const sunrealtype h2 =
       c_che * (lx2 + rx2 + ux2 + dx2)
     + msky * aniso_factor
-    + c_chb * c_nsk[1] * (lx2 + rx2)
+    + c_chb * nsky * dmi_y
     + h_dmag[my_i];
   const sunrealtype h3 =
       c_che * (lx3 + rx3 + ux3 + dx3)
     + mskz * aniso_factor
-    + c_chb * c_nsk[2] * (lx3 + rx3)
+    + c_chb * nskz * dmi_z
     + h_dmag[mz_i];
 
   const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
-
   yd[mx_i] = w_self * (c_chg * (m3*h2 - m2*h3) + c_alpha * (h1 - mh*m1));
   yd[my_i] = w_self * (c_chg * (m1*h3 - m3*h1) + c_alpha * (h2 - mh*m2));
   yd[mz_i] = w_self * (c_chg * (m2*h1 - m1*h2) + c_alpha * (h3 - mh*m3));
@@ -502,7 +526,8 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   dim3 grid((udata->ng + block.x - 1)/block.x,
             (udata->ny + block.y - 1)/block.y);
   f_kernel_unified_polycrystal<<<grid, block>>>(
-      ydata, udata->d_y_eff, udata->d_w, udata->d_msk,
+      ydata, udata->d_y_eff, udata->d_w,
+      udata->d_msk, udata->d_nsk,
       udata->d_hdmag, ydotdata,
       udata->ng, udata->ny, udata->ncell);
 
@@ -610,8 +635,9 @@ int main(int argc, char* argv[]) {
   /* ── Polycrystal: grain ids, soft weight, per-cell easy axis ──── */
   udata.h_w        = (double*)malloc((size_t)ncell * sizeof(double));
   udata.h_msk      = (double*)malloc((size_t)3 * ncell * sizeof(double));
+  udata.h_nsk      = (double*)malloc((size_t)3 * ncell * sizeof(double));
   udata.h_grain_id = (int*)   malloc((size_t)ncell * sizeof(int));
-  if (!udata.h_w || !udata.h_msk || !udata.h_grain_id) {
+  if (!udata.h_w || !udata.h_msk || !udata.h_nsk || !udata.h_grain_id) {
     fprintf(stderr, "host alloc failed\n"); return 1;
   }
   build_polycrystal(ng, ny, &udata);
@@ -638,16 +664,25 @@ int main(int argc, char* argv[]) {
   }
 
   /* upload weight + msk + alloc y_eff scratch */
+  /* upload weight + msk + nsk + alloc y_eff scratch */
   CHECK_CUDA(cudaMalloc((void**)&udata.d_w,
                         (size_t)ncell * sizeof(sunrealtype)));
   CHECK_CUDA(cudaMemcpy(udata.d_w, udata.h_w,
                         (size_t)ncell * sizeof(sunrealtype),
                         cudaMemcpyHostToDevice));
+
   CHECK_CUDA(cudaMalloc((void**)&udata.d_msk,
                         (size_t)3 * ncell * sizeof(sunrealtype)));
   CHECK_CUDA(cudaMemcpy(udata.d_msk, udata.h_msk,
                         (size_t)3 * ncell * sizeof(sunrealtype),
                         cudaMemcpyHostToDevice));
+
+  CHECK_CUDA(cudaMalloc((void**)&udata.d_nsk,
+                        (size_t)3 * ncell * sizeof(sunrealtype)));
+  CHECK_CUDA(cudaMemcpy(udata.d_nsk, udata.h_nsk,
+                        (size_t)3 * ncell * sizeof(sunrealtype),
+                        cudaMemcpyHostToDevice));
+
   CHECK_CUDA(cudaMalloc((void**)&udata.d_y_eff,
                         (size_t)3 * ncell * sizeof(sunrealtype)));
   CHECK_CUDA(cudaMemset(udata.d_y_eff, 0,
@@ -671,7 +706,8 @@ int main(int argc, char* argv[]) {
       fprintf(stderr, "Demag_Init failed\n");
       Precond_Destroy(udata.pd);
       cudaFree(udata.d_hdmag);
-      cudaFree(udata.d_w); cudaFree(udata.d_y_eff); cudaFree(udata.d_msk);
+      cudaFree(udata.d_w); cudaFree(udata.d_y_eff);
+      cudaFree(udata.d_msk); cudaFree(udata.d_nsk);
       return 1;
     }
     Demag_GetSelfCoupling(udata.demag,
@@ -689,30 +725,83 @@ int main(int argc, char* argv[]) {
   ydata       = N_VGetHostArrayPointer_Cuda(y);
   abstol_data = N_VGetHostArrayPointer_Cuda(abstol);
 
-  /* ── IC: each cell aligned with its grain's easy axis + small noise ── */
+  /* IC: grain core has out-of-plane mz; smoothly tilt to in-plane near
+   * grain boundaries.  This produces a polycrystal "bumpy" mz landscape
+   * before LLG even starts.  Cells inside dead grains stay zero. */
   {
-    const double eps = (double)INIT_RANDOM_EPS;
+    /* per-grain effective radius — distance from cell to its seed */
     srand((unsigned)INIT_RANDOM_SEED);
-    for (int k = 0; k < ncell; k++) {
-      const int mx_i = idx_mx(k, ncell);
-      const int my_i = idx_my(k, ncell);
-      const int mz_i = idx_mz(k, ncell);
-      if (udata.h_w[k] > 1.0e-3) {
-        double mx0 = udata.h_msk[mx_i] + eps * (2.0*rand_unit() - 1.0);
-        double my0 = udata.h_msk[my_i] + eps * (2.0*rand_unit() - 1.0);
-        double mz0 = udata.h_msk[mz_i] + eps * (2.0*rand_unit() - 1.0);
+    const double core = (double)IC_CORE_MZ;
+    const double eps_n = 0.05;
+
+    /* compute, for every cell, distance to its grain seed (PBC) */
+    for (int j = 0; j < ny; j++) {
+      for (int i = 0; i < ng; i++) {
+        const int k = j * ng + i;
+        const int g = udata.h_grain_id[k];
+        const int mx_i = idx_mx(k, ncell);
+        const int my_i = idx_my(k, ncell);
+        const int mz_i = idx_mz(k, ncell);
+
+        if (udata.h_w[k] <= 1.0e-3) {
+          ydata[mx_i] = ZERO; ydata[my_i] = ZERO; ydata[mz_i] = ZERO;
+          abstol_data[mx_i] = ATOL1;
+          abstol_data[my_i] = ATOL2;
+          abstol_data[mz_i] = ATOL3;
+          continue;
+        }
+
+        /* signed-PBC distance to seed */
+        double ddx = (double)i + 0.5 - g_grains[g].sx;
+        double ddy = (double)j + 0.5 - g_grains[g].sy;
+        if (ddx >  ng/2.0) ddx -= ng;
+        if (ddx < -ng/2.0) ddx += ng;
+        if (ddy >  ny/2.0) ddy -= ny;
+        if (ddy < -ny/2.0) ddy += ny;
+        const double r = sqrt(ddx*ddx + ddy*ddy);
+
+        /* normalized radius (saturate at ~1 grain radius ≈ 12 cells) */
+        double s = r / 14.0;
+        if (s > 1.0) s = 1.0;
+
+        /* mz: full at core (sign of grain easy-axis z), → 0 at edge */
+        double sign_z = (g_grains[g].az >= 0.0) ? 1.0 : -1.0;
+        if (fabs(g_grains[g].az) < 0.05) sign_z = 0.0;  /* in-plane grain */
+
+        double mz0 = sign_z * core * (1.0 - s*s);
+        /* in-plane part: tangent to "vortex" + grain easy-axis xy bias */
+        double mperp = sqrt(fmax(0.0, 1.0 - mz0*mz0));
+        double tx = -ddy, ty = ddx;
+        const double tn = sqrt(tx*tx + ty*ty);
+        if (tn > 1.0e-12) { tx /= tn; ty /= tn; }
+        else { tx = 1.0; ty = 0.0; }
+        /* blend tangent with grain easy axis xy */
+        const double bx = g_grains[g].ax;
+        const double by = g_grains[g].ay;
+        const double bn = sqrt(bx*bx + by*by);
+        double ex, ey;
+        if (bn > 1.0e-6) { ex = bx/bn; ey = by/bn; }
+        else             { ex = 1.0;   ey = 0.0;   }
+        const double blend = s;     /* core = vortex, edge = easy axis */
+        double pxx = (1.0-blend)*tx + blend*ex;
+        double pyy = (1.0-blend)*ty + blend*ey;
+        const double pn = sqrt(pxx*pxx + pyy*pyy);
+        if (pn > 1.0e-12) { pxx /= pn; pyy /= pn; }
+
+        double mx0 = mperp * pxx + eps_n * (2.0*rand_unit() - 1.0);
+        double my0 = mperp * pyy + eps_n * (2.0*rand_unit() - 1.0);
+        mz0 += eps_n * (2.0*rand_unit() - 1.0);
+
         const double n = sqrt(mx0*mx0 + my0*my0 + mz0*mz0);
         if (n > 1.0e-12) { mx0/=n; my0/=n; mz0/=n; }
-        else { mx0 = 1.0; my0 = 0.0; mz0 = 0.0; }
+
         ydata[mx_i] = SUN_RCONST(mx0);
         ydata[my_i] = SUN_RCONST(my0);
         ydata[mz_i] = SUN_RCONST(mz0);
-      } else {
-        ydata[mx_i] = ZERO; ydata[my_i] = ZERO; ydata[mz_i] = ZERO;
+        abstol_data[mx_i] = ATOL1;
+        abstol_data[my_i] = ATOL2;
+        abstol_data[mz_i] = ATOL3;
       }
-      abstol_data[mx_i] = ATOL1;
-      abstol_data[my_i] = ATOL2;
-      abstol_data[mz_i] = ATOL3;
     }
   }
   N_VCopyToDevice_Cuda(y);
@@ -792,8 +881,10 @@ cleanup:
   if (udata.d_w)        cudaFree(udata.d_w);
   if (udata.d_y_eff)    cudaFree(udata.d_y_eff);
   if (udata.d_msk)      cudaFree(udata.d_msk);
+  if (udata.d_nsk)      cudaFree(udata.d_nsk);
   if (udata.h_w)        free(udata.h_w);
   if (udata.h_msk)      free(udata.h_msk);
+  if (udata.h_nsk)      free(udata.h_nsk);
   if (udata.h_grain_id) free(udata.h_grain_id);
   FusedNVec_FreePool();
 #if ENABLE_OUTPUT

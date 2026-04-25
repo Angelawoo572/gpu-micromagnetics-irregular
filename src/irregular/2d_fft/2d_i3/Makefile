@@ -26,7 +26,7 @@ T_TOTAL  ?= 1000.0
 KRYLOV_DIM ?= 5
 
 # Demag
-DEMAG_STRENGTH ?= 2.0
+DEMAG_STRENGTH ?= 1.0
 DEMAG_THICK    ?= 1.0
 
 # Grid
@@ -37,15 +37,17 @@ GRID_NY ?= 256
 N_HOLES_X ?= 4
 N_HOLES_Y ?= 4
 HOLE_SEED ?= 20251101
-MASK_EPS_CELLS ?= 1.5
+MASK_EPS_CELLS ?= 2.2
 
 # Output schedule — set EARLY_SAVE_UNTIL=80 if you want fine early frames
 EARLY_SAVE_UNTIL ?= 0.0
 EARLY_SAVE_EVERY ?= 100
 LATE_SAVE_EVERY  ?= 100
 
-NUM_GRAINS      ?= 48
-DEAD_GRAIN_FRAC ?= 0.18
+NUM_GRAINS      ?= 72
+DEAD_GRAIN_FRAC ?= 0.16
+GRAIN_Z_BIAS    ?= 1.6
+IC_CORE_MZ      ?= 0.95
 
 ifeq ($(BUILD),debug)
   NVCC_FLAGS := $(CUDA_ARCH) -G -g -lineinfo -Xcompiler -O0
@@ -53,9 +55,11 @@ else
   NVCC_FLAGS := $(CUDA_ARCH) -O3 -lineinfo --use_fast_math
 endif
 
-NVCC_FLAGS += -DNUM_GRAINS=$(NUM_GRAINS) \
+NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
+			  -DNUM_GRAINS=$(NUM_GRAINS) \
               -DDEAD_GRAIN_FRAC=$(DEAD_GRAIN_FRAC) \
-			  -DENABLE_OUTPUT=$(PRINT) \
+              -DGRAIN_Z_BIAS=$(GRAIN_Z_BIAS) \
+              -DIC_CORE_MZ=$(IC_CORE_MZ) \
               -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) \
               -DRTOL_VAL=$(RTOL_VAL) -DATOL_VAL=$(ATOL_VAL) \
               -DT_TOTAL=$(T_TOTAL) \
@@ -126,7 +130,7 @@ run-noprint:
 
 run-demag:
 	$(MAKE) clean
-	$(MAKE) DEMAG_STRENGTH=2.0 DEMAG_THICK=1.0 PRINT=$(PRINT) EARLY_SAVE_UNTIL=80.0
+	$(MAKE) DEMAG_STRENGTH=1.0 DEMAG_THICK=1.0 PRINT=$(PRINT)
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
 run-no-demag:
