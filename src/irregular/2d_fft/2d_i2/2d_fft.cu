@@ -172,7 +172,7 @@ __constant__ sunrealtype c_nsk[3] = {
     SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
 
 __constant__ sunrealtype c_chk   = SUN_RCONST(1.0);
-__constant__ sunrealtype c_che   = SUN_RCONST(10.0);
+__constant__ sunrealtype c_che   = SUN_RCONST(100.0);
 __constant__ sunrealtype c_alpha = SUN_RCONST(0.2);
 __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
 

@@ -151,7 +151,7 @@ run-noprint:
 
 run-demag:
 	$(MAKE) clean
-	$(MAKE) DEMAG_STRENGTH=10.0 DEMAG_THICK=1.0
+	$(MAKE) DEMAG_STRENGTH=100.0 DEMAG_THICK=1.0
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
 run-no-demag:
@@ -304,8 +304,6 @@ reallyclean: clean
 	rm -f ncu_$(TARGET).ncu-rep ncu_$(DIRECT_TARGET).ncu-rep
 	rm -rf csv_out
 	rm -f output.txt
-	rm -f run_bx*.txt run_tol_*.txt run_demag_*.txt run_krylov_*.txt run_hole_*.txt
-	rm -f nsys_report.txt
 
 reports:
 	$(NSYS) stats --help-reports || true
