@@ -1,0 +1,1 @@
+SPEEDUP nx=192 ny=64 FFT=64x64: 0.274 x

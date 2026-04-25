@@ -1,0 +1,1 @@
+SPEEDUP nx=96 ny=32 FFT=32x32: 0.057 x

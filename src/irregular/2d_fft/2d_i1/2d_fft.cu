@@ -142,6 +142,14 @@
 #define LATE_SAVE_EVERY 100
 #endif
 
+#ifndef NX_VAL
+#define NX_VAL 1536
+#endif
+
+#ifndef NY_VAL
+#define NY_VAL 512
+#endif
+
 /* ─── Material constants (device constant memory) ─────────────────── */
 /* Easy axis along x: only c_msk[0] is non-zero, and anisotropy feeds off m1.
  * DMI direction (c_nsk) stays along x. */
@@ -505,8 +513,8 @@ int main(int argc, char* argv[]) {
   float elapsedTime = 0.0f;
 
   /* problem size */
-  const int nx = 1536;
-  const int ny = 512;
+  const int nx = NX_VAL;
+  const int ny = NY_VAL;
 
   if (nx % GROUPSIZE != 0) {
     fprintf(stderr, "nx must be a multiple of GROUPSIZE=%d\n", GROUPSIZE);

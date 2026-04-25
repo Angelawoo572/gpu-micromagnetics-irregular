@@ -1,0 +1,1 @@
+SPEEDUP nx=576 ny=192 FFT=192x192: 1.949 x

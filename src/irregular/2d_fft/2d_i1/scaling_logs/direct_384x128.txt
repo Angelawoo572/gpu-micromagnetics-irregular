@@ -1,0 +1,32 @@
+[DIRECT] nx=384 ny=128 ng=128 ncell=16384 FFT=128x128
+[Precond] Block-Jacobi 3x3: ncell=16384, device mem = 1.18 MB
+[Demag DIRECT] Init: nx=128 ny=128 thick=1.0000 strength=2.0000
+[Demag DIRECT] O(N²) direct convolution — no FFT
+[Demag DIRECT] N=16384  N²=268435456
+[Demag DIRECT] Computing calt (81-pt averaging)...
+[Demag DIRECT] calt done.
+[Demag DIRECT] N(0) = diag(-4.5733e+00, -4.5733e+00, -3.4198e+00)  [unscaled]
+[Demag DIRECT] N(0) off-diag at origin: tab=-1.10e-17 tac=0.00e+00 tbc=0.00e+00
+[Demag DIRECT] Ready. Device memory: 2.0 MB
+[main] Demag self-coupling (strength-scaled): nxx0=-9.1465e+00  nyy0=-9.1465e+00  nzz0=-6.8397e+00
+[FusedNVec v4] neq=49152: multi_dot override active.
+              linear_comb DISABLED (profile: L2 thrashing at K>=5).
+              N_VLinearCombination -> sequential N_VLinearSum fallback.
+              Use Classical GS for multi_dot benefit.
+GS type: Classical (overhead-limited, neq=49152)
+Max BDF order: 5   Krylov dim: 5
+
+2D periodic LLG — head-on transition + unified-field RHS
+LLG form: standard (damping = alpha*(h - (m.h)*m)), |m|=1 enforced by normalize-in-f
+
+nx=384  ny=128  ng=128  ncell=16384  neq=49152
+periodic BC: x and y
+Init: head-on stripes   q1=32 (x=0.25*ng)   q3=96 (x=0.75*ng)
+      mx = -1 | +1 | -1       random my,mz amplitude = 0.010
+DEMAG_STRENGTH=2.0000  DEMAG_THICK=1.0000  (h_dmag = IFFT[f_hat * m_hat] via cuFFT real-to-complex (D2Z/Z2D), fused into RHS)
+T_TOTAL=1000.00  RTOL/ATOL=1.0e-04
+GPU simulation took 8105.529 ms
+
+Final Statistics:
+nst = 500    nfe  = 684    nsetups = 67     nni = 681    ncfn = 17     netf = 7      nge = 0
+nli = 1240   nlcf = 0      njvevals = 1240

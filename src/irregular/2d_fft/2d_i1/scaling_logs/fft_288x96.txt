@@ -1,0 +1,34 @@
+[FFT] nx=288 ny=96 ng=96 ncell=9216 FFT=96x96
+[Precond] Block-Jacobi 3x3: ncell=9216, device mem = 0.66 MB
+[Demag GPU v3] Init: nx=96 ny=96 thick=1.0000 strength=2.0000
+[Demag GPU v3] Real-to-complex FFT (D2Z/Z2D): half-spectrum layout.
+[Demag GPU v3] Batched (batch=3): forward and inverse in 2 calls/Apply.
+[Demag GPU v3] ncell=9216, ncell_half=4704 (51.0% of full spectrum)
+[Demag GPU v3] Computing Newell tensor (calt/ctt, 81-pt avg)...
+[Demag GPU v3] N(0) = diag(-4.5733e+00, -4.5733e+00, -3.4198e+00)  [unscaled]
+[Demag GPU v3] N(0) off-diag at origin: tab=-1.10e-17 tac=0.00e+00 tbc=0.00e+00
+[Demag GPU v3] Device: 0.7 MB (tensor spectra) + 0.9 MB (scratch)
+[Demag GPU v3] Memory saving vs Z2Z: tensor 49.0%, total scratch similar.
+[Demag GPU v3] Ready.
+[main] Demag self-coupling (strength-scaled): nxx0=-9.1465e+00  nyy0=-9.1465e+00  nzz0=-6.8397e+00
+[FusedNVec v4] neq=27648: multi_dot override active.
+              linear_comb DISABLED (profile: L2 thrashing at K>=5).
+              N_VLinearCombination -> sequential N_VLinearSum fallback.
+              Use Classical GS for multi_dot benefit.
+GS type: Classical (overhead-limited, neq=27648)
+Max BDF order: 5   Krylov dim: 5
+
+2D periodic LLG — head-on transition + unified-field RHS
+LLG form: standard (damping = alpha*(h - (m.h)*m)), |m|=1 enforced by normalize-in-f
+
+nx=288  ny=96  ng=96  ncell=9216  neq=27648
+periodic BC: x and y
+Init: head-on stripes   q1=24 (x=0.25*ng)   q3=72 (x=0.75*ng)
+      mx = -1 | +1 | -1       random my,mz amplitude = 0.010
+DEMAG_STRENGTH=2.0000  DEMAG_THICK=1.0000  (h_dmag = IFFT[f_hat * m_hat] via cuFFT real-to-complex (D2Z/Z2D), fused into RHS)
+T_TOTAL=1000.00  RTOL/ATOL=1.0e-04
+GPU simulation took 9457.688 ms
+
+Final Statistics:
+nst = 20990  nfe  = 27541  nsetups = 2089   nni = 27538  ncfn = 480    netf = 11     nge = 0
+nli = 73354  nlcf = 16     njvevals = 73354

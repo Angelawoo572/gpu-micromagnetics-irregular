@@ -23,6 +23,9 @@ PRINT ?= 0
 BLOCK_X ?= 16
 BLOCK_Y ?= 8
 
+NX_VAL ?= 1536
+NY_VAL ?= 512
+
 RTOL_VAL ?= 1.0e-4
 ATOL_VAL ?= 1.0e-4
 T_TOTAL  ?= 1000.0
@@ -57,12 +60,14 @@ NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) \
               -DRTOL_VAL=$(RTOL_VAL) -DATOL_VAL=$(ATOL_VAL) \
               -DT_TOTAL=$(T_TOTAL) \
+			  -DNX_VAL=$(NX_VAL) \
+              -DNY_VAL=$(NY_VAL) \
               -DKRYLOV_DIM=$(KRYLOV_DIM) \
               -DEARLY_SAVE_UNTIL=$(EARLY_SAVE_UNTIL) \
               -DEARLY_SAVE_EVERY=$(EARLY_SAVE_EVERY) \
               -DLATE_SAVE_EVERY=$(LATE_SAVE_EVERY) \
               -DDEMAG_STRENGTH=$(DEMAG_STRENGTH) \
-              -DDEMAG_THICK=$(DEMAG_THICK)
+              -DDEMAG_THICK=$(DEMAG_THICK) \
 
 # ====== Sources & objects ======
 TARGET      := 2d_fft
@@ -283,7 +288,48 @@ bench: $(TARGET) $(DIRECT_TARGET)
 	@echo "========================================================"
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(DIRECT_TARGET) $(ARGS)
 
-.PHONY: run-direct bench
+.PHONY: run-direct bench sweep-direct-fft-size sweep-direct-fft-size-big
+
+sweep-direct-fft-size-big:
+	@mkdir -p scaling_logs
+	@echo "size,nx,ny,ng,ncell,fft_grid,method,time_ms,nst,nfe,nli,ncfn,netf,speedup_vs_fft" > scaling_logs/summary.csv
+	@for ny in 32 64 96 128 192 256 384 512 768 1024; do \
+	  nx=`expr $$ny \* 3`; \
+	  ng=$$ny; \
+	  ncell=`expr $$ng \* $$ny`; \
+	  echo "========================================================"; \
+	  echo "Testing nx=$$nx ny=$$ny ng=$$ng ncell=$$ncell FFT=$${ny}x$${ny}"; \
+	  echo "========================================================"; \
+	  $(MAKE) clean >/dev/null 2>&1; \
+	  $(MAKE) BUILD=release PRINT=0 NX_VAL=$$nx NY_VAL=$$ny DEMAG_STRENGTH=2.0 DEMAG_THICK=1.0 $(TARGET) >/dev/null; \
+	  echo "[FFT] nx=$$nx ny=$$ny ng=$$ng ncell=$$ncell FFT=$${ny}x$${ny}" | tee scaling_logs/fft_$${nx}x$${ny}.txt; \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee -a scaling_logs/fft_$${nx}x$${ny}.txt; \
+	  fft_time=`grep "GPU simulation took" scaling_logs/fft_$${nx}x$${ny}.txt | awk '{print $$4}'`; \
+	  fft_stats1=`grep "nst =" scaling_logs/fft_$${nx}x$${ny}.txt | tail -1`; \
+	  fft_stats2=`grep "nli =" scaling_logs/fft_$${nx}x$${ny}.txt | tail -1`; \
+	  fft_nst=`echo $$fft_stats1 | awk '{print $$3}'`; \
+	  fft_nfe=`echo $$fft_stats1 | awk '{print $$6}'`; \
+	  fft_ncfn=`echo $$fft_stats1 | awk '{print $$15}'`; \
+	  fft_netf=`echo $$fft_stats1 | awk '{print $$18}'`; \
+	  fft_nli=`echo $$fft_stats2 | awk '{print $$3}'`; \
+	  echo "$${nx}x$${ny},$$nx,$$ny,$$ng,$$ncell,$${ny}x$${ny},FFT,$$fft_time,$$fft_nst,$$fft_nfe,$$fft_nli,$$fft_ncfn,$$fft_netf,1.000" >> scaling_logs/summary.csv; \
+	  echo ""; \
+	  $(MAKE) $(DIRECT_TARGET) BUILD=release PRINT=0 NX_VAL=$$nx NY_VAL=$$ny DEMAG_STRENGTH=2.0 DEMAG_THICK=1.0 >/dev/null; \
+	  echo "[DIRECT] nx=$$nx ny=$$ny ng=$$ng ncell=$$ncell FFT=$${ny}x$${ny}" | tee scaling_logs/direct_$${nx}x$${ny}.txt; \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(DIRECT_TARGET) $(ARGS) | tee -a scaling_logs/direct_$${nx}x$${ny}.txt; \
+	  direct_time=`grep "GPU simulation took" scaling_logs/direct_$${nx}x$${ny}.txt | awk '{print $$4}'`; \
+	  direct_stats1=`grep "nst =" scaling_logs/direct_$${nx}x$${ny}.txt | tail -1`; \
+	  direct_stats2=`grep "nli =" scaling_logs/direct_$${nx}x$${ny}.txt | tail -1`; \
+	  direct_nst=`echo $$direct_stats1 | awk '{print $$3}'`; \
+	  direct_nfe=`echo $$direct_stats1 | awk '{print $$6}'`; \
+	  direct_ncfn=`echo $$direct_stats1 | awk '{print $$15}'`; \
+	  direct_netf=`echo $$direct_stats1 | awk '{print $$18}'`; \
+	  direct_nli=`echo $$direct_stats2 | awk '{print $$3}'`; \
+	  speedup=`awk -v d=$$direct_time -v f=$$fft_time 'BEGIN { if (f > 0) printf "%.3f", d/f; else print "nan" }'`; \
+	  echo "$${nx}x$${ny},$$nx,$$ny,$$ng,$$ncell,$${ny}x$${ny},Direct,$$direct_time,$$direct_nst,$$direct_nfe,$$direct_nli,$$direct_ncfn,$$direct_netf,$$speedup" >> scaling_logs/summary.csv; \
+	  echo "SPEEDUP nx=$$nx ny=$$ny FFT=$${ny}x$${ny}: $$speedup x" | tee scaling_logs/speedup_$${nx}x$${ny}.txt; \
+	done
+	@echo "Wrote scaling_logs/summary.csv"
 
 # ====== Clean ======
 clean:
