@@ -151,7 +151,7 @@ run-noprint:
 
 run-demag:
 	$(MAKE) clean
-	$(MAKE) DEMAG_STRENGTH=4.0 DEMAG_THICK=1.0
+	$(MAKE) DEMAG_STRENGTH=10.0 DEMAG_THICK=1.0
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
 run-no-demag:
