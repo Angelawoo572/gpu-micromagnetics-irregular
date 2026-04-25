@@ -1,5 +1,5 @@
 /**
- * 2D irregular LLG solver — circular-hole geometry + FFT demag, ymsk version.
+ * 2D irregular LLG solver — square-hole geometry + FFT demag, ymsk version.
  * CVODE + CUDA, SoA layout.
  *
  * ─── Physics ────────────────────────────────────────────────────────
@@ -149,7 +149,12 @@
 #define LATE_SAVE_EVERY 100
 #endif
 
-/* ─── Irregular circular-hole geometry ───────────────────────────── */
+/* ─── Irregular square-hole geometry ─────────────────────────────────
+ * The hole is a square centered at (HOLE_CENTER_X_FRAC, HOLE_CENTER_Y_FRAC)
+ * (in fractions of the ng×ny grid).  HOLE_RADIUS_FRAC_Y keeps its old
+ * macro name for Makefile compatibility; here it means the HALF-SIDE of
+ * the square in units of ny (so the full side length is 2·HOLE_RADIUS_FRAC_Y·ny).
+ * ──────────────────────────────────────────────────────────────────── */
 #ifndef HOLE_CENTER_X_FRAC
 #define HOLE_CENTER_X_FRAC 0.50
 #endif
@@ -501,8 +506,8 @@ int main(int argc, char* argv[]) {
   float elapsedTime = 0.0f;
 
   /* problem size */
-  const int nx = 384;
-  const int ny = 128;
+  const int nx = 1536;
+  const int ny = 512;
 
   if (nx % GROUPSIZE != 0) {
     fprintf(stderr, "nx must be a multiple of GROUPSIZE=%d\n", GROUPSIZE);
@@ -553,17 +558,17 @@ int main(int argc, char* argv[]) {
   sunrealtype *h_ymsk = (sunrealtype*)malloc((size_t)3 * ncell * sizeof(sunrealtype));
   if (!h_ymsk) { fprintf(stderr, "h_ymsk malloc failed\n"); return 1; }
   {
-    const double cx = HOLE_CENTER_X_FRAC * (double)(ng - 1);
-    const double cy = HOLE_CENTER_Y_FRAC * (double)(ny - 1);
-    const double radius = HOLE_RADIUS_FRAC_Y * (double)ny;
-    const double r2 = radius * radius;
+    const double cx       = HOLE_CENTER_X_FRAC * (double)(ng - 1);
+    const double cy       = HOLE_CENTER_Y_FRAC * (double)(ny - 1);
+    const double halfside = HOLE_RADIUS_FRAC_Y * (double)ny;  /* square half-side */
 
     for (int j = 0; j < ny; ++j) {
       for (int i = 0; i < ng; ++i) {
         const int cell = j * ng + i;
-        const double ddx = (double)i - cx;
-        const double ddy = (double)j - cy;
-        const sunrealtype m = (ddx*ddx + ddy*ddy <= r2)
+        const double ddx = fabs((double)i - cx);
+        const double ddy = fabs((double)j - cy);
+        /* Square hole: cell is in the hole iff both |dx| and |dy| ≤ halfside. */
+        const sunrealtype m = (ddx <= halfside && ddy <= halfside)
                                 ? SUN_RCONST(0.0) : SUN_RCONST(1.0);
         if (m == SUN_RCONST(0.0)) n_hole_count++; else n_active_count++;
         h_ymsk[idx_mx(cell, ncell)] = m;
@@ -575,7 +580,7 @@ int main(int argc, char* argv[]) {
   CHECK_CUDA(cudaMemcpy(udata.d_ymsk, h_ymsk,
                         (size_t)3 * ncell * sizeof(sunrealtype),
                         cudaMemcpyHostToDevice));
-  printf("[geometry] circular hole: active=%ld  hole=%ld  (total %d cells)\n",
+  printf("[geometry] square hole: active=%ld  hole=%ld  (total %d cells)\n",
          n_active_count, n_hole_count, ncell);
 
   /* FFT demag (Newell tensor f̂, computed once here). */
@@ -692,7 +697,7 @@ int main(int argc, char* argv[]) {
   CHECK_SUNDIALS(CVodeSetMaxOrd(cvode_mem, MAX_BDF_ORDER));
   printf("Max BDF order: %d   Krylov dim: %d\n", MAX_BDF_ORDER, KRYLOV_DIM);
 
-  printf("\n2D irregular LLG + FFT demag — circular hole + ymsk geometry\n");
+  printf("\n2D irregular LLG + FFT demag — square hole + ymsk geometry\n");
   printf("LLG form: standard simplified, |m|≈1 enforced by normalize-in-f (regularized)\n\n");
   printf("nx=%d  ny=%d  ng=%d  ncell=%d  neq=%d\n", nx, ny, ng, ncell, neq);
   printf("periodic BC: x and y\n");

@@ -30,18 +30,20 @@ T_TOTAL  ?= 1000.0
 KRYLOV_DIM ?= 5
 
 # ====== FFT Demagnetization ======
-DEMAG_STRENGTH ?= 2.0
+DEMAG_STRENGTH ?= 5.0
 DEMAG_THICK    ?= 1.0
 
-# ====== Irregular geometry: circular interior hole ======
+# ====== Irregular geometry: square interior hole ======
+# HOLE_RADIUS_FRAC_Y is the half-side of the square (in units of ny).
+# Macro name kept for backward compatibility with sweep targets / scripts.
 HOLE_CENTER_X_FRAC ?= 0.50
 HOLE_CENTER_Y_FRAC ?= 0.50
-HOLE_RADIUS_FRAC_Y ?= 0.22
+HOLE_RADIUS_FRAC_Y ?= 0.05
 
 # ====== Output schedule ======
-EARLY_SAVE_UNTIL ?= 0.0
-EARLY_SAVE_EVERY ?= 100
-LATE_SAVE_EVERY  ?= 100
+EARLY_SAVE_UNTIL ?= 0
+EARLY_SAVE_EVERY ?= 10000
+LATE_SAVE_EVERY  ?= 10000
 
 ifeq ($(BUILD),debug)
   NVCC_FLAGS := $(CUDA_ARCH) -G -g -lineinfo -Xcompiler -O0
