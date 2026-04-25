@@ -157,9 +157,7 @@
 /* Easy axis along x: only c_msk[0] is non-zero, and anisotropy feeds off m1.
  * DMI direction (c_nsk) stays along x. */
 __constant__ sunrealtype c_msk[3] = {
-    SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
-__constant__ sunrealtype c_nsk[3] = {
-    SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
+    SUN_RCONST(1.0), SUN_RCONST(1.0), SUN_RCONST(1.0)};
 
 __constant__ sunrealtype c_chk   = SUN_RCONST(4.0);
 __constant__ sunrealtype c_che   = SUN_RCONST(4.0);
@@ -374,15 +372,15 @@ __global__ static void f_kernel_unified_soa_irregular_compact(
     sy1 += y[idx_mx(down_cell, ncell)]; sy2 += y[idx_my(down_cell, ncell)]; sy3 += y[idx_mz(down_cell, ncell)];
   }
 
-  const sunrealtype h1 = c_che * (sx1 + sy1) + c_msk[0] * (c_chk * m1 + c_cha) + c_chb * c_nsk[0] * lr1 + h_dmag[mx];
-  const sunrealtype h2 = c_che * (sx2 + sy2) + c_msk[1] * (c_chk * m1 + c_cha) + c_chb * c_nsk[1] * lr2 + h_dmag[my];
-  const sunrealtype h3 = c_che * (sx3 + sy3) + c_msk[2] * (c_chk * m1 + c_cha) + c_chb * c_nsk[2] * lr3 + h_dmag[mz];
+  const sunrealtype h1 = c_che * (sx1 + sy1) + c_msk[0] * (c_chk * m1*(m1*m1-m1)+ h_dmag[mx];
+  const sunrealtype h2 = c_che * (sx2 + sy2) + c_msk[1] * (c_chk * m2*(m2*m2-m2)+ h_dmag[my];
+  const sunrealtype h3 = c_che * (sx3 + sy3) + c_msk[2] * (c_chk * m3*(m3*m3-m3)+ h_dmag[mz];
 
   const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
 
-  yd[mx] = c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1);
-  yd[my] = c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2);
-  yd[mz] = c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3);
+  yd[mx] = ymsk[mx]*(c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1));
+  yd[my] = ymsk[my]*(c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2));
+  yd[mz] = ymsk[mz]*(c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3));
 }
 
 /*
