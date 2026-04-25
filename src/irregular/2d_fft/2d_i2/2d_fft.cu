@@ -42,10 +42,10 @@
  * normalize_m_kernel runs at the top of every f():
  *
  *   ymp = sqrt(m1² + m2² + m3²)
- *   m_new = m / (ymp + 0.01)
+ *   m_new = m / (ymp + 0.001)
  *
- * The +0.01 in the denominator regularizes m=0 (hole cells) to stay
- * exactly at 0 without any branching:  0 / 0.01 = 0.  Active cells
+ * The +0.001 in the denominator regularizes m=0 (hole cells) to stay
+ * exactly at 0 without any branching:  0 / 0.001 = 0.  Active cells
  * with |m|≈1 are nudged toward |m|≈1/1.01 ≈ 0.99, a stable fixed
  * point of the regularized normalization.  The simplified LLG form
  * (which assumes |m|=1) is then evaluated on this slightly-shrunken
@@ -172,7 +172,7 @@ __constant__ sunrealtype c_nsk[3] = {
     SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
 
 __constant__ sunrealtype c_chk   = SUN_RCONST(1.0);
-__constant__ sunrealtype c_che   = SUN_RCONST(4.0);
+__constant__ sunrealtype c_che   = SUN_RCONST(10.0);
 __constant__ sunrealtype c_alpha = SUN_RCONST(0.2);
 __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
 
@@ -244,14 +244,14 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
  * normalize_m_kernel — regularized projection onto the (near-)unit sphere.
  *
  *   ymp     = sqrt(m1² + m2² + m3²)
- *   y[mx]   = m1 / (ymp + 0.01)
- *   y[my]   = m2 / (ymp + 0.01)
- *   y[mz]   = m3 / (ymp + 0.01)
+ *   y[mx]   = m1 / (ymp + 0.001)
+ *   y[my]   = m2 / (ymp + 0.001)
+ *   y[mz]   = m3 / (ymp + 0.001)
  *
- * The +0.01 in the denominator is the entire mechanism for handling
+ * The +0.001 in the denominator is the entire mechanism for handling
  * hole cells:
- *   hole cell (m = 0):   0 / (0   + 0.01) = 0   ← stays 0, no branching
- *   active cell (|m|=1): m / (1   + 0.01) ≈ 0.99 m  ← stable fixed pt
+ *   hole cell (m = 0):   0 / (0   + 0.001) = 0   ← stays 0, no branching
+ *   active cell (|m|=1): m / (1   + 0.001) ≈ 0.99 m  ← stable fixed pt
  *
  * The kernel runs over ALL cells with no `if (active[…])` check.
  *
@@ -274,7 +274,7 @@ __global__ static void normalize_m_kernel(
   const sunrealtype m3 = y[mz];
 
   const sunrealtype ymp     = sqrt(m1*m1 + m2*m2 + m3*m3);
-  const sunrealtype inv_ymp = SUN_RCONST(1.0) / (ymp + SUN_RCONST(0.01));
+  const sunrealtype inv_ymp = SUN_RCONST(1.0) / (ymp + SUN_RCONST(0.001));
 
   y[mx] = m1 * inv_ymp;
   y[my] = m2 * inv_ymp;
@@ -295,7 +295,7 @@ __global__ static void normalize_m_kernel(
  * Hole-neighbor reads: y[hole]=0 → contributes 0 to neighbor sums
  * automatically.  No `if (active[neighbor])` branches anywhere.
  *
- * |m|=1 is enforced (modulo +0.01 regularization) by normalize_m_kernel.
+ * |m|=1 is enforced (modulo +0.001 regularization) by normalize_m_kernel.
  */
 __global__ static void f_kernel_unified_soa_periodic(
     const sunrealtype* __restrict__ y,
@@ -730,32 +730,32 @@ int main(int argc, char* argv[]) {
 
   PrintFinalStats(cvode_mem, LS);
   /* ====== FINAL STATE OUTPUT ====== */
-// {
-//   FILE* fp_final = fopen("output.txt", "w");
-//   if (!fp_final) {
-//     fprintf(stderr, "Failed to open output.txt\n");
-//   } else {
-//     N_VCopyFromDevice_Cuda(y);
-//     sunrealtype* yhost = N_VGetHostArrayPointer_Cuda(y);
+{
+  FILE* fp_final = fopen("output.txt", "w");
+  if (!fp_final) {
+    fprintf(stderr, "Failed to open output.txt\n");
+  } else {
+    N_VCopyFromDevice_Cuda(y);
+    sunrealtype* yhost = N_VGetHostArrayPointer_Cuda(y);
 
-//     fprintf(fp_final, "%f %d %d\n", (double)t, nx, ny);
+    fprintf(fp_final, "%f %d %d\n", (double)t, nx, ny);
 
-//     for (int j = 0; j < ny; j++) {
-//       for (int i = 0; i < ng; i++) {
-//         int cell = j * ng + i;
+    for (int j = 0; j < ny; j++) {
+      for (int i = 0; i < ng; i++) {
+        int cell = j * ng + i;
 
-//         fprintf(fp_final, "%e %e %e\n",
-//           (double)yhost[idx_mx(cell, ncell)],
-//           (double)yhost[idx_my(cell, ncell)],
-//           (double)yhost[idx_mz(cell, ncell)]
-//         );
-//       }
-//     }
+        fprintf(fp_final, "%e %e %e\n",
+          (double)yhost[idx_mx(cell, ncell)],
+          (double)yhost[idx_my(cell, ncell)],
+          (double)yhost[idx_mz(cell, ncell)]
+        );
+      }
+    }
 
-//     fclose(fp_final);
-//     printf("[output] final state written to output.txt\n");
-//   }
-// }
+    fclose(fp_final);
+    printf("[output] final state written to output.txt\n");
+  }
+}
 
 cleanup:
   if (LS) SUNLinSolFree(LS);

@@ -34,7 +34,7 @@
 #include <stdio.h>
 
 __constant__ sunrealtype jc_chk   = 4.0;
-__constant__ sunrealtype jc_che   = 4.0;
+__constant__ sunrealtype jc_che   = 10.0;
 __constant__ sunrealtype jc_alpha = 0.2;
 __constant__ sunrealtype jc_chg   = 1.0;
 __constant__ sunrealtype jc_cha   = 0.0;
@@ -84,19 +84,35 @@ __global__ static void jtv_kernel(
 
   /* DMI is along x: L/R neighbors of mx get coeff (che + chb).
    * Anisotropy is along x: only h1 picks up jc_chk * m1. */
-  const sunrealtype che_chb = jc_che + jc_chb;
+  const sunrealtype h1 =
+    jc_che * (y1L + y1R + y1U + y1D)
+  + jc_chk * m1 * (m1 * m1 - m1);
 
-  const sunrealtype h1 = che_chb*(y1L+y1R) + jc_che*(y1U+y1D)
-                       + jc_chk*m1 + jc_cha;
-  const sunrealtype h2 = jc_che*(y2L+y2R+y2U+y2D);
-  const sunrealtype h3 = jc_che*(y3L+y3R+y3U+y3D);
+  const sunrealtype h2 =
+      jc_che * (y2L + y2R + y2U + y2D)
+    + jc_chk * m2 * (m2 * m2 - m2);
 
-  const sunrealtype mh = m1*h1+m2*h2+m3*h3;
+  const sunrealtype h3 =
+      jc_che * (y3L + y3R + y3U + y3D)
+    + jc_chk * m3 * (m3 * m3 - m3);
 
-  /* ∂h/∂v: DMI contributes to dh1; anisotropy adds jc_chk*v1 to dh1. */
-  const sunrealtype dh1 = che_chb*(v1L+v1R) + jc_che*(v1U+v1D) + jc_chk*v1;
-  const sunrealtype dh2 = jc_che*(v2L+v2R+v2U+v2D);
-  const sunrealtype dh3 = jc_che*(v3L+v3R+v3U+v3D);
+  const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
+
+  const sunrealtype k1 = jc_chk * (SUN_RCONST(3.0) * m1 * m1 - SUN_RCONST(2.0) * m1);
+  const sunrealtype k2 = jc_chk * (SUN_RCONST(3.0) * m2 * m2 - SUN_RCONST(2.0) * m2);
+  const sunrealtype k3 = jc_chk * (SUN_RCONST(3.0) * m3 * m3 - SUN_RCONST(2.0) * m3);
+
+  const sunrealtype dh1 =
+      jc_che * (v1L + v1R + v1U + v1D)
+    + k1 * v1;
+
+  const sunrealtype dh2 =
+      jc_che * (v2L + v2R + v2U + v2D)
+    + k2 * v2;
+
+  const sunrealtype dh3 =
+      jc_che * (v3L + v3R + v3U + v3D)
+    + k3 * v3;
 
   const sunrealtype dmh = (v1*h1+v2*h2+v3*h3)+(m1*dh1+m2*dh2+m3*dh3);
 

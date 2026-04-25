@@ -150,18 +150,19 @@ __global__ static void build_J_kernel(
     /* Total h at this cell — anisotropy on h1 only (c_msk={1,0,0}),
      * DMI on h1 only (c_nsk={1,0,0}). */
     sunrealtype h1 =
-        pc_che * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)] +
-                  y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)])
-      + (pc_chk * m1 + pc_cha)
-      + pc_chb * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)]);
+    pc_che * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)] +
+              y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)])
+  + pc_chk * m1 * (m1 * m1 - m1);
 
     sunrealtype h2 =
         pc_che * (y[pidx_my(lc,ncell)] + y[pidx_my(rc,ncell)] +
-                  y[pidx_my(uc,ncell)] + y[pidx_my(dc,ncell)]);
+                y[pidx_my(uc,ncell)] + y[pidx_my(dc,ncell)])
+    + pc_chk * m2 * (m2 * m2 - m2);
 
     sunrealtype h3 =
         pc_che * (y[pidx_mz(lc,ncell)] + y[pidx_mz(rc,ncell)] +
-                  y[pidx_mz(uc,ncell)] + y[pidx_mz(dc,ncell)]);
+                y[pidx_mz(uc,ncell)] + y[pidx_mz(dc,ncell)])
+    + pc_chk * m3 * (m3 * m3 - m3);
 
     if (h_dmag) {
         h1 += h_dmag[mx];
@@ -170,9 +171,17 @@ __global__ static void build_J_kernel(
     }
 
     /* Self-coupling diagonal:  ∂h_α/∂m_α at this cell. */
-    const sunrealtype k1 = pc_chk + nxx0;     /* anisotropy + demag-self */
-    const sunrealtype k2 = nyy0;
-    const sunrealtype k3 = nzz0;
+    // const sunrealtype k1 = pc_chk + nxx0;     /* anisotropy + demag-self */
+    // const sunrealtype k2 = nyy0;
+    // const sunrealtype k3 = nzz0;
+    const sunrealtype k1 =
+    pc_chk * (SUN_RCONST(3.0) * m1 * m1 - SUN_RCONST(2.0) * m1) + nxx0;
+
+    const sunrealtype k2 =
+        pc_chk * (SUN_RCONST(3.0) * m2 * m2 - SUN_RCONST(2.0) * m2) + nyy0;
+
+    const sunrealtype k3 =
+        pc_chk * (SUN_RCONST(3.0) * m3 * m3 - SUN_RCONST(2.0) * m3) + nzz0;
 
     const sunrealtype e1 = h1 + m1 * k1;
     const sunrealtype e2 = h2 + m2 * k2;
