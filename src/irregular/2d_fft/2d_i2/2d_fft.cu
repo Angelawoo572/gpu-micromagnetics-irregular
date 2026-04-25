@@ -1,41 +1,55 @@
 /**
- * 2D irregular LLG solver — circular-hole 2d_i1 geometry + FFT demag
- * CVODE + CUDA, SoA layout
+ * 2D irregular LLG solver — circular-hole geometry + FFT demag, ymsk version.
+ * CVODE + CUDA, SoA layout.
  *
  * ─── Physics ────────────────────────────────────────────────────────
- * Easy axis along x (c_msk = {1,0,0}); DMI direction along x (c_nsk = {1,0,0}).
- * Initial condition: three-stripe head-on transition along x
- *   i ∈ [0,       ng/4):  mx = -1
- *   i ∈ [ng/4,   3ng/4):  mx = +1
- *   i ∈ [3ng/4,   ng  ):  mx = -1
- * Small random (my, mz) to break symmetry.
+ * Easy axis along x  (c_msk = {1,0,0});
+ * DMI direction along x (c_nsk = {1,0,0});
+ * Initial condition: ALL active cells in ONE uniform direction
+ *   (slight tilt off the hard axis to break ±x symmetry; demag + hole
+ *    geometry then drive the non-uniform dynamics).
+ * Hole cells: m = 0, frozen (yd = 0 forever) via the mask.
+ *
+ * ─── ymsk approach (replaces active/inactive lists) ────────────────
+ * Geometry is encoded as a single SoA mask  ymsk[3*ncell]:
+ *
+ *   ymsk = 1   on active cells
+ *   ymsk = 0   on hole cells (and stays so for the whole run)
+ *
+ * Every kernel runs over ALL cells, no compact index lists, no byte
+ * mask, no neighbor-side branching.  The kernel computes the LLG RHS
+ * naively, reading neighbor m values directly — for hole neighbors
+ * those reads return 0 (initial condition + frozen by mask) and so
+ * contribute 0 to the exchange/DMI/demag sums automatically.
+ *
+ * The "inactive" handling boils down to ONE multiplication at the very
+ * end of f / Jv / P-solve:
+ *
+ *   yd[mx] = ymsk[mx] * (LLG formula);    // 0 in hole, formula in body
+ *
+ * That's it.  No `if (active[neighbor])` checks, no zero_inactive_kernel.
  *
  * ─── Effective-field structure ──────────────────────────────────────
- * Every RHS cell sees ONE total field assembled inside a single kernel:
+ * Single unified RHS kernel sums:
  *
  *   h_total = h_exchange + h_anisotropy + h_DMI + h_demag
  *
- * Demag is NOT a post-processing step. It is precomputed per f() as
+ * Demag is precomputed once per f() via cuFFT D2Z/Z2D and stored in
+ * d_hdmag (SoA, 3*ncell).  The unified kernel just reads h_dmag[mx/my/mz]
+ * like any other field.
  *
- *   h_dmag = IFFT[ f̂(k) · ŷ(k) ]        ← f̂ constant, computed once
+ * ─── Unit-sphere regularization ─────────────────────────────────────
+ * normalize_m_kernel runs at the top of every f():
  *
- * and then read inside the unified kernel just like any other SoA field.
+ *   ymp = sqrt(m1² + m2² + m3²)
+ *   m_new = m / (ymp + 0.01)
  *
- * ─── Unit-sphere constraint (normalize-in-f) ────────────────────────
- * The standard LLG form  dm/dt = γ(m×h) + α(h − (m·h)m)  assumes
- * |m|=1.  BDF interpolation can drift |m| away from 1, and if m·h < 0
- * (common in domain walls with strong demag) the drift is amplified
- * exponentially, causing CVODE to stall.
- *
- * Solution (per professor): at the top of every f() call, normalize y
- * in-place so |m|=1 at every cell:
- *
- *   ymp = sqrt(y[mx]² + y[my]² + y[mz]²)
- *   y[mx] /= ymp;  y[my] /= ymp;  y[mz] /= ymp
- *
- * This is a lightweight GPU kernel (~2 µs) that projects onto the unit
- * sphere before the RHS kernel sees y.  The simplified LLG form is then
- * always evaluated exactly on the manifold — no modified formulas needed.
+ * The +0.01 in the denominator regularizes m=0 (hole cells) to stay
+ * exactly at 0 without any branching:  0 / 0.01 = 0.  Active cells
+ * with |m|≈1 are nudged toward |m|≈1/1.01 ≈ 0.99, a stable fixed
+ * point of the regularized normalization.  The simplified LLG form
+ * (which assumes |m|=1) is then evaluated on this slightly-shrunken
+ * sphere with no measurable physical impact.
  *
  * ─── Build knobs ────────────────────────────────────────────────────
  * Enable:  make DEMAG_STRENGTH=1.0 DEMAG_THICK=1.0
@@ -113,31 +127,24 @@
 #define BLOCK_Y 8
 #endif
 
-/* ─── Initial-condition knobs (head-on three-stripe) ──────────────── */
-#ifndef STRIPE_LEFT_FRAC
-#define STRIPE_LEFT_FRAC 0.25     /* first wall at ng * STRIPE_LEFT_FRAC  */
+/* ─── Initial-condition knobs (uniform) ──────────────────────────── */
+#ifndef INIT_MX
+#define INIT_MX 0.0
+#endif
+#ifndef INIT_MY
+#define INIT_MY 0.0175
+#endif
+#ifndef INIT_MZ
+#define INIT_MZ 0.998
 #endif
 
-#ifndef STRIPE_RIGHT_FRAC
-#define STRIPE_RIGHT_FRAC 0.75    /* second wall at ng * STRIPE_RIGHT_FRAC */
-#endif
-
-#ifndef INIT_RANDOM_EPS
-#define INIT_RANDOM_EPS 0.01      /* amplitude of my/mz perturbation     */
-#endif
-
-#ifndef INIT_RANDOM_SEED
-#define INIT_RANDOM_SEED 12345    /* reproducibility                     */
-#endif
-
+/* ─── Output schedule ─────────────────────────────────────────────── */
 #ifndef EARLY_SAVE_UNTIL
 #define EARLY_SAVE_UNTIL 80.0
 #endif
-
 #ifndef EARLY_SAVE_EVERY
 #define EARLY_SAVE_EVERY 5
 #endif
-
 #ifndef LATE_SAVE_EVERY
 #define LATE_SAVE_EVERY 100
 #endif
@@ -154,10 +161,10 @@
 #endif
 
 /* ─── Material constants (device constant memory) ─────────────────── */
-/* Easy axis along x: only c_msk[0] is non-zero, and anisotropy feeds off m1.
- * DMI direction (c_nsk) stays along x. */
 __constant__ sunrealtype c_msk[3] = {
     SUN_RCONST(1.0), SUN_RCONST(1.0), SUN_RCONST(1.0)};
+__constant__ sunrealtype c_nsk[3] = {
+    SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
 
 __constant__ sunrealtype c_chk   = SUN_RCONST(4.0);
 __constant__ sunrealtype c_che   = SUN_RCONST(4.0);
@@ -190,50 +197,39 @@ __constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
 /*
  * UserData
  *
- * IMPORTANT: field ORDER IS CRITICAL.
- *   - PrecondData *pd       at offset 0  (PrecondSetup/Solve cast rule)
- *   - DemagData   *demag    at offset 8
- *   - sunrealtype *d_hdmag  at offset 16 — always allocated, zero if demag off
- *   - ints follow at offset 24+
- *   - doubles (self-coupling Nαα(0)*strength) at the tail
+ * IMPORTANT: field ORDER IS CRITICAL — jtv.cu's JtvUserData and
+ * precond.cu's PcUserData mirror this layout byte-for-byte.
  *
- * jtv.cu's JtvUserData and precond.cu's PcUserData mirror this layout
- * byte-for-byte. When adding/reordering fields, update both mirrors.
+ *   offset 0  : PrecondData  *pd
+ *   offset 8  : DemagData    *demag
+ *   offset 16 : sunrealtype  *d_hdmag    (3*ncell)
+ *   offset 24 : sunrealtype  *d_ymsk     (3*ncell, 1 on active, 0 in hole)
+ *   offset 32 : int nx, ny, ng, ncell, neq    (5*4 = 20 B)
+ *   offset 52 : 4 B padding before double alignment
+ *   offset 56 : double nxx0, nyy0, nzz0
+ *
+ * Total size: 80 bytes.
  */
 typedef struct {
-  PrecondData  *pd;        /* offset 0  — must be first */
+  PrecondData  *pd;        /* offset 0  */
   DemagData    *demag;     /* offset 8  */
-  sunrealtype  *d_hdmag;   /* offset 16 — device buffer, 3*ncell */
-  int nx;                  /* offset 24 */
-  int ny;                  /* offset 28 */
-  int ng;                  /* offset 32 */
-  int ncell;               /* offset 36 */
-  int neq;                 /* offset 40 */
-  /* 4 bytes padding before double alignment */
-  double nxx0;             /* offset 48 — Nxx(0) * demag_strength */
-  double nyy0;             /* offset 56 — Nyy(0) * demag_strength */
-  double nzz0;             /* offset 64 — Nzz(0) * demag_strength */
-
-  unsigned char* h_active;
-  unsigned char* d_active;
-  int* h_active_ids;
-  int* d_active_ids;
-  int  n_active;
-  int* h_inactive_ids;
-  int* d_inactive_ids;
-  int  n_inactive;
+  sunrealtype  *d_hdmag;   /* offset 16 */
+  sunrealtype  *d_ymsk;    /* offset 24 — geometry mask, SoA 3*ncell */
+  int nx;                  /* offset 32 */
+  int ny;                  /* offset 36 */
+  int ng;                  /* offset 40 */
+  int ncell;               /* offset 44 */
+  int neq;                 /* offset 48 */
+  /* 4 B pad */
+  double nxx0;             /* offset 56 */
+  double nyy0;             /* offset 64 */
+  double nzz0;             /* offset 72 */
 } UserData;
 
 /* ─── SoA indexing helpers ────────────────────────────────────────── */
-__host__ __device__ static inline int idx_mx(int cell, int ncell) {
-  return cell;
-}
-__host__ __device__ static inline int idx_my(int cell, int ncell) {
-  return ncell + cell;
-}
-__host__ __device__ static inline int idx_mz(int cell, int ncell) {
-  return 2 * ncell + cell;
-}
+__host__ __device__ static inline int idx_mx(int cell, int ncell) { return cell; }
+__host__ __device__ static inline int idx_my(int cell, int ncell) { return ncell + cell; }
+__host__ __device__ static inline int idx_mz(int cell, int ncell) { return 2*ncell + cell; }
 __host__ __device__ static inline int wrap_x(int x, int ng) {
   return (x < 0) ? (x + ng) : ((x >= ng) ? (x - ng) : x);
 }
@@ -242,31 +238,29 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
 }
 
 /*
- * normalize_m_kernel
+ * normalize_m_kernel — regularized projection onto the (near-)unit sphere.
  *
- * Per-cell in-place normalization of y so that |m| = 1 exactly:
+ *   ymp     = sqrt(m1² + m2² + m3²)
+ *   y[mx]   = m1 / (ymp + 0.01)
+ *   y[my]   = m2 / (ymp + 0.01)
+ *   y[mz]   = m3 / (ymp + 0.01)
  *
- *   ymp = sqrt(y[mx]² + y[my]² + y[mz]²)
- *   y[mx] /= ymp
- *   y[my] /= ymp
- *   y[mz] /= ymp
+ * The +0.01 in the denominator is the entire mechanism for handling
+ * hole cells:
+ *   hole cell (m = 0):   0 / (0   + 0.01) = 0   ← stays 0, no branching
+ *   active cell (|m|=1): m / (1   + 0.01) ≈ 0.99 m  ← stable fixed pt
  *
- * Called at the top of every f() evaluation, BEFORE the RHS kernel.
- * This ensures the simplified LLG form (which assumes |m|=1) is always
- * evaluated on the unit sphere, regardless of BDF interpolation drift.
+ * The kernel runs over ALL cells with no `if (active[…])` check.
  *
- * Cost: one lightweight kernel launch (~2 µs at ncell=65536) per f() call.
- * The normalize is applied to the CVODE-owned y vector in-place; CVODE
- * passes y as non-const to f(), so this is legal.  The BDF interpolant
- * itself is not modified — only the evaluation point seen by f().
+ * Cost: ~2 µs at ncell ≈ 65 K.  Called once per f() before the RHS
+ * kernel sees y, so the simplified LLG (which assumes |m|=const) is
+ * always evaluated on a near-unit sphere regardless of BDF drift.
  */
 __global__ static void normalize_m_kernel(
     sunrealtype* __restrict__ y,
-    const unsigned char* __restrict__ active,
     int ncell) {
   const int cell = blockIdx.x * blockDim.x + threadIdx.x;
   if (cell >= ncell) return;
-  if (active && !active[cell]) return;
 
   const int mx = idx_mx(cell, ncell);
   const int my = idx_my(cell, ncell);
@@ -276,65 +270,42 @@ __global__ static void normalize_m_kernel(
   const sunrealtype m2 = y[my];
   const sunrealtype m3 = y[mz];
 
-  const sunrealtype ymp = sqrt(m1 * m1 + m2 * m2 + m3 * m3);
+  const sunrealtype ymp     = sqrt(m1*m1 + m2*m2 + m3*m3);
+  const sunrealtype inv_ymp = SUN_RCONST(1.0) / (ymp + SUN_RCONST(0.01));
 
-  if (ymp > SUN_RCONST(1.0e-30)) {
-    const sunrealtype inv_ymp = SUN_RCONST(1.0) / ymp;
-    y[mx] = m1 * inv_ymp;
-    y[my] = m2 * inv_ymp;
-    y[mz] = m3 * inv_ymp;
-  }
-}
-
-
-__global__ static void zero_inactive_kernel(
-    sunrealtype* __restrict__ yd,
-    const int* __restrict__ inactive_ids,
-    int n_inactive,
-    int ncell) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= n_inactive) return;
-  const int cell = inactive_ids[tid];
-  yd[idx_mx(cell, ncell)] = ZERO;
-  yd[idx_my(cell, ncell)] = ZERO;
-  yd[idx_mz(cell, ncell)] = ZERO;
+  y[mx] = m1 * inv_ymp;
+  y[my] = m2 * inv_ymp;
+  y[mz] = m3 * inv_ymp;
 }
 
 /*
- * UNIFIED RHS kernel
- *
- * Reads y (self + 4 neighbors) and h_dmag (self only) from global memory,
- * assembles the TOTAL effective field in one pass:
+ * UNIFIED RHS kernel — runs over EVERY cell, no compact lists.
  *
  *   h_total = h_exchange(neighbors)
- *           + h_anisotropy(m1)
- *           + h_DMI(x-neighbors)
- *           + h_demag(self)         ← precomputed via FFT outside
+ *           + h_anisotropy(m1)            ← c_msk = {1,0,0}, only h1
+ *           + h_DMI(x-neighbors of mx)    ← c_nsk = {1,0,0}, only h1
+ *           + h_demag(self)               ← from precomputed h_dmag
  *
- * then writes the standard LLG update for this cell:
+ *   yd[mα] = ymsk[mα] * (chg*(m × h)_α + α*(h_α − (m·h) m_α))
  *
- *   dm/dt = γ (m × h) + α ( h − (m·h) m )
+ * Hole cells: ymsk=0 → yd=0 → y stays at its initial value (0).
+ * Hole-neighbor reads: y[hole]=0 → contributes 0 to neighbor sums
+ * automatically.  No `if (active[neighbor])` branches anywhere.
  *
- * This is the original simplified form that assumes |m|=1.  The assumption
- * is enforced by normalize_m_kernel which runs at the top of every f() call,
- * projecting y back to the unit sphere before the RHS is evaluated.
+ * |m|=1 is enforced (modulo +0.01 regularization) by normalize_m_kernel.
  */
-__global__ static void f_kernel_unified_soa_irregular_compact(
+__global__ static void f_kernel_unified_soa_periodic(
     const sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ h_dmag,
+    const sunrealtype* __restrict__ ymsk,
     sunrealtype*       __restrict__ yd,
-    const unsigned char* __restrict__ active,
-    const int* __restrict__ active_ids,
-    int n_active,
     int ng, int ny, int ncell) {
 
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= n_active) return;
+  const int gx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int gy = blockIdx.y * blockDim.y + threadIdx.y;
+  if (gx >= ng || gy >= ny) return;
 
-  const int cell = active_ids[tid];
-  const int gx = cell % ng;
-  const int gy = cell / ng;
-
+  const int cell = gy * ng + gx;
   const int mx = idx_mx(cell, ncell);
   const int my = idx_my(cell, ncell);
   const int mz = idx_mz(cell, ncell);
@@ -344,54 +315,64 @@ __global__ static void f_kernel_unified_soa_irregular_compact(
   const int yu   = wrap_y(gy - 1, ny);
   const int ydwn = wrap_y(gy + 1, ny);
 
-  const int left_cell  = gy   * ng + xl;
-  const int right_cell = gy   * ng + xr;
-  const int up_cell    = yu   * ng + gx;
-  const int down_cell  = ydwn * ng + gx;
+  const int lc = gy   * ng + xl;
+  const int rc = gy   * ng + xr;
+  const int uc = yu   * ng + gx;
+  const int dc = ydwn * ng + gx;
 
   const sunrealtype m1 = y[mx];
   const sunrealtype m2 = y[my];
   const sunrealtype m3 = y[mz];
 
-  sunrealtype sx1 = ZERO, sx2 = ZERO, sx3 = ZERO;
-  sunrealtype sy1 = ZERO, sy2 = ZERO, sy3 = ZERO;
-  sunrealtype lr1 = ZERO, lr2 = ZERO, lr3 = ZERO;
+  /* Neighbor reads — no branching.  In-hole neighbors return 0 (frozen). */
+  const sunrealtype y1L = y[idx_mx(lc, ncell)];
+  const sunrealtype y1R = y[idx_mx(rc, ncell)];
+  const sunrealtype y1U = y[idx_mx(uc, ncell)];
+  const sunrealtype y1D = y[idx_mx(dc, ncell)];
 
-  if (active[left_cell]) {
-    sx1 += y[idx_mx(left_cell, ncell)]; sx2 += y[idx_my(left_cell, ncell)]; sx3 += y[idx_mz(left_cell, ncell)];
-    lr1 += y[idx_mx(left_cell, ncell)]; lr2 += y[idx_my(left_cell, ncell)]; lr3 += y[idx_mz(left_cell, ncell)];
-  }
-  if (active[right_cell]) {
-    sx1 += y[idx_mx(right_cell, ncell)]; sx2 += y[idx_my(right_cell, ncell)]; sx3 += y[idx_mz(right_cell, ncell)];
-    lr1 += y[idx_mx(right_cell, ncell)]; lr2 += y[idx_my(right_cell, ncell)]; lr3 += y[idx_mz(right_cell, ncell)];
-  }
-  if (active[up_cell]) {
-    sy1 += y[idx_mx(up_cell, ncell)]; sy2 += y[idx_my(up_cell, ncell)]; sy3 += y[idx_mz(up_cell, ncell)];
-  }
-  if (active[down_cell]) {
-    sy1 += y[idx_mx(down_cell, ncell)]; sy2 += y[idx_my(down_cell, ncell)]; sy3 += y[idx_mz(down_cell, ncell)];
-  }
+  const sunrealtype y2L = y[idx_my(lc, ncell)];
+  const sunrealtype y2R = y[idx_my(rc, ncell)];
+  const sunrealtype y2U = y[idx_my(uc, ncell)];
+  const sunrealtype y2D = y[idx_my(dc, ncell)];
 
-  const sunrealtype h1 = c_che * (sx1 + sy1) + c_msk[0] * (c_chk * m1*(m1*m1-m1)+ h_dmag[mx];
-  const sunrealtype h2 = c_che * (sx2 + sy2) + c_msk[1] * (c_chk * m2*(m2*m2-m2)+ h_dmag[my];
-  const sunrealtype h3 = c_che * (sx3 + sy3) + c_msk[2] * (c_chk * m3*(m3*m3-m3)+ h_dmag[mz];
+  const sunrealtype y3L = y[idx_mz(lc, ncell)];
+  const sunrealtype y3R = y[idx_mz(rc, ncell)];
+  const sunrealtype y3U = y[idx_mz(uc, ncell)];
+  const sunrealtype y3D = y[idx_mz(dc, ncell)];
+
+  /* Total field.  Anisotropy {1,0,0} → only h1.  DMI {1,0,0} → only h1. */
+  const sunrealtype h1 =
+      c_che * (y1L + y1R + y1U + y1D) +
+      c_msk[0] * (c_chk * m1 + c_cha) +
+      c_chb * c_nsk[0] * (y1L + y1R) +
+      h_dmag[mx];
+
+  const sunrealtype h2 =
+      c_che * (y2L + y2R + y2U + y2D) +
+      c_msk[1] * (c_chk * m2 + c_cha) +
+      c_chb * c_nsk[1] * (y2L + y2R) +
+      h_dmag[my];
+
+  const sunrealtype h3 =
+      c_che * (y3L + y3R + y3U + y3D) +
+      c_msk[2] * (c_chk * m3 + c_cha) +
+      c_chb * c_nsk[2] * (y3L + y3R) +
+      h_dmag[mz];
 
   const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
 
-  yd[mx] = ymsk[mx]*(c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1));
-  yd[my] = ymsk[my]*(c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2));
-  yd[mz] = ymsk[mz]*(c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3));
+  /* Mask the output — that's the entire "inactive cell" handling. */
+  yd[mx] = ymsk[mx] * (c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1));
+  yd[my] = ymsk[my] * (c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2));
+  yd[mz] = ymsk[mz] * (c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3));
 }
 
 /*
  * RHS wrapper for CVODE
  *
- * Step 1: compute h_dmag = IFFT[ f̂ · FFT(y) ]
- *         f̂ is precomputed once in Demag_Init, never recomputed.
- *         If demag is disabled, h_dmag stays zero → contributes nothing.
- *
- * Step 2: single unified kernel sums all fields (exchange + anisotropy
- *         + DMI + demag) and writes ydot.
+ * Step 0: normalize y in-place (regularized; hole cells stay at 0).
+ * Step 1: compute h_dmag = IFFT[ f̂ · FFT(y) ]; if demag off, zero buffer.
+ * Step 2: unified kernel sums all fields and writes yd, masked by ymsk.
  */
 static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   (void)t;
@@ -406,22 +387,14 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
     return -1;
   }
 
-  /* Step 0: normalize y in-place so |m| = 1 at every cell.
-   * BDF interpolation can drift |m| away from 1; this projection
-   * ensures the simplified LLG (which assumes |m|=1) is evaluated
-   * on the unit sphere.  Cost: ~2 µs per call at ncell=65536. */
+  /* Step 0: regularized normalize, runs on every cell, no branching. */
   {
-    const int nb = 256; // 8 warps
-    const int ng_norm = (udata->ncell + nb - 1) / nb;
-    normalize_m_kernel<<<ng_norm, nb>>>(ydata, udata->d_active, udata->ncell);
+    const int b = 256;
+    const int g = (udata->ncell + b - 1) / b;
+    normalize_m_kernel<<<g, b>>>(ydata, udata->ncell);
   }
 
-  /* Step 1: demag field (constant f̂ × current m̂, inverse FFT).
-   *
-   * When demag is active, Demag_Apply's unshift_h_kernel OVERWRITES
-   * h_out (not +=), so the memset is redundant — skip it.
-   * When demag is off, zero the buffer once so the unified kernel
-   * reads zeros from h_dmag[mx/my/mz] and demag contributes nothing. */
+  /* Step 1: demag (overwrites h_dmag if active; zero-fills if off). */
   if (udata->demag && DEMAG_STRENGTH > 0.0) {
     Demag_Apply(udata->demag,
                 (const double*)ydata,
@@ -431,20 +404,12 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
                     (size_t)3 * udata->ncell * sizeof(sunrealtype), 0);
   }
 
-  /* Step 2a: zero inactive derivatives. */
-  if (udata->n_inactive > 0) {
-    const int nb0 = 256;
-    const int grid0 = (udata->n_inactive + nb0 - 1) / nb0;
-    zero_inactive_kernel<<<grid0, nb0>>>(
-        ydotdata, udata->d_inactive_ids, udata->n_inactive, udata->ncell);
-  }
-
-  /* Step 2b: unified compact active-cell kernel. */
-  const int nb1 = 256;
-  const int grid1 = (udata->n_active + nb1 - 1) / nb1;
-  f_kernel_unified_soa_irregular_compact<<<grid1, nb1>>>(
-      ydata, udata->d_hdmag, ydotdata,
-      udata->d_active, udata->d_active_ids, udata->n_active,
+  /* Step 2: unified RHS kernel. */
+  dim3 block(BLOCK_X, BLOCK_Y);
+  dim3 grid((udata->ng + block.x - 1) / block.x,
+            (udata->ny + block.y - 1) / block.y);
+  f_kernel_unified_soa_periodic<<<grid, block>>>(
+      ydata, udata->d_hdmag, udata->d_ymsk, ydotdata,
       udata->ng, udata->ny, udata->ncell);
 
   cudaError_t cuerr = cudaPeekAtLastError();
@@ -453,11 +418,10 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
             cudaGetErrorString(cuerr));
     return -1;
   }
-
   return 0;
 }
 
-/* ─── Final-stats reporter (unchanged) ────────────────────────────── */
+/* ─── Final-stats reporter ────────────────────────────────────────── */
 static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
   (void)LS;
 
@@ -511,48 +475,6 @@ static int ShouldWriteFrame(long int iout, sunrealtype t) {
 }
 #endif
 
-/* Build circular-hole mask plus compact active/inactive index lists on host. */
-static void BuildCircularHoleMaskAndLists(UserData* udata) {
-  const int ng = udata->ng;
-  const int ny = udata->ny;
-  const double cx = HOLE_CENTER_X_FRAC * (double)(ng - 1);
-  const double cy = HOLE_CENTER_Y_FRAC * (double)(ny - 1);
-  const double radius = HOLE_RADIUS_FRAC_Y * (double)ny;
-  const double r2 = radius * radius;
-
-  int n_active = 0, n_inactive = 0;
-  for (int j = 0; j < ny; ++j) {
-    for (int i = 0; i < ng; ++i) {
-      const int cell = j * ng + i;
-      const double dx = (double)i - cx;
-      const double dy = (double)j - cy;
-      if (dx * dx + dy * dy <= r2) {
-        udata->h_active[cell] = 0;
-        n_inactive++;
-      } else {
-        udata->h_active[cell] = 1;
-        n_active++;
-      }
-    }
-  }
-
-  udata->n_active = n_active;
-  udata->n_inactive = n_inactive;
-  udata->h_active_ids = (int*)malloc((size_t)n_active * sizeof(int));
-  udata->h_inactive_ids = (int*)malloc((size_t)n_inactive * sizeof(int));
-  if ((n_active > 0 && !udata->h_active_ids) ||
-      (n_inactive > 0 && !udata->h_inactive_ids)) {
-    fprintf(stderr, "Failed to allocate compact index arrays.\n");
-    exit(EXIT_FAILURE);
-  }
-
-  int ia = 0, ii = 0;
-  for (int cell = 0; cell < udata->ncell; ++cell) {
-    if (udata->h_active[cell]) udata->h_active_ids[ia++] = cell;
-    else                      udata->h_inactive_ids[ii++] = cell;
-  }
-}
-
 int main(int argc, char* argv[]) {
   (void)argc;
   (void)argv;
@@ -572,18 +494,15 @@ int main(int argc, char* argv[]) {
   UserData udata;
   memset(&udata, 0, sizeof(udata));
 
-  int cell;
-  int q1 = 0;
-  int q3 = 0;
-  double dstr = 0.0;
-  double dthk = 0.0;
+  double dstr = 0.0, dthk = 0.0;
+  long  n_active_count = 0, n_hole_count = 0;
 
   cudaEvent_t start, stop;
   float elapsedTime = 0.0f;
 
   /* problem size */
-  const int nx = 768;
-  const int ny = 256;
+  const int nx = 384;
+  const int ny = 128;
 
   if (nx % GROUPSIZE != 0) {
     fprintf(stderr, "nx must be a multiple of GROUPSIZE=%d\n", GROUPSIZE);
@@ -605,69 +524,73 @@ int main(int argc, char* argv[]) {
   FILE* fp = NULL; (void)fp;
 #endif
 
-  /* ─── Stripe geometry for head-on initial condition ─── */
-  q1 = (int)(STRIPE_LEFT_FRAC  * (double)ng + 0.5);
-  q3 = (int)(STRIPE_RIGHT_FRAC * (double)ng + 0.5);
-
   /* fill user data */
   udata.nx    = nx;
   udata.ny    = ny;
   udata.ng    = ng;
   udata.ncell = ncell;
   udata.neq   = neq;
-  udata.pd      = NULL;
-  udata.demag   = NULL;
-  udata.d_hdmag = NULL;
-  udata.nxx0    = 0.0;
-  udata.nyy0    = 0.0;
-  udata.nzz0    = 0.0;
 
   CHECK_SUNDIALS(SUNContext_Create(SUN_COMM_NULL, &sunctx));
-
-  udata.h_active = (unsigned char*)malloc((size_t)ncell * sizeof(unsigned char));
-  if (!udata.h_active) { fprintf(stderr, "Failed to allocate host active mask.\n"); goto cleanup; }
-  BuildCircularHoleMaskAndLists(&udata);
-  CHECK_CUDA(cudaMalloc((void**)&udata.d_active, (size_t)ncell * sizeof(unsigned char)));
-  CHECK_CUDA(cudaMemcpy(udata.d_active, udata.h_active, (size_t)ncell * sizeof(unsigned char), cudaMemcpyHostToDevice));
-  if (udata.n_active > 0) {
-    CHECK_CUDA(cudaMalloc((void**)&udata.d_active_ids, (size_t)udata.n_active * sizeof(int)));
-    CHECK_CUDA(cudaMemcpy(udata.d_active_ids, udata.h_active_ids, (size_t)udata.n_active * sizeof(int), cudaMemcpyHostToDevice));
-  }
-  if (udata.n_inactive > 0) {
-    CHECK_CUDA(cudaMalloc((void**)&udata.d_inactive_ids, (size_t)udata.n_inactive * sizeof(int)));
-    CHECK_CUDA(cudaMemcpy(udata.d_inactive_ids, udata.h_inactive_ids, (size_t)udata.n_inactive * sizeof(int), cudaMemcpyHostToDevice));
-  }
 
   /* 3x3 block Jacobi preconditioner */
   udata.pd = Precond_Create(ng, ny, ncell);
   if (!udata.pd) { fprintf(stderr, "Precond_Create failed\n"); return 1; }
 
-  /* ─── Always allocate d_hdmag ──────────────────────────────────────
-   * The unified kernel always reads h_dmag[mx/my/mz]. If demag is
-   * disabled, the buffer is simply zeroed every f() call and contributes
-   * nothing to h_total. This is simpler than having two kernel paths.
-   * ─────────────────────────────────────────────────────────────────── */
+  /* d_hdmag: always allocated (zero-filled when demag off). */
   CHECK_CUDA(cudaMalloc((void**)&udata.d_hdmag,
                         (size_t)3 * ncell * sizeof(sunrealtype)));
   CHECK_CUDA(cudaMemset(udata.d_hdmag, 0,
                         (size_t)3 * ncell * sizeof(sunrealtype)));
 
+  /* d_ymsk: SoA mask (3*ncell), 1 on active cells, 0 in hole.  This
+   * is the entire geometry encoding — every kernel multiplies its
+   * output by this, no other branching exists in the device code. */
+  CHECK_CUDA(cudaMalloc((void**)&udata.d_ymsk,
+                        (size_t)3 * ncell * sizeof(sunrealtype)));
+
+  /* Build mask on host, then upload. */
+  sunrealtype *h_ymsk = (sunrealtype*)malloc((size_t)3 * ncell * sizeof(sunrealtype));
+  if (!h_ymsk) { fprintf(stderr, "h_ymsk malloc failed\n"); return 1; }
+  {
+    const double cx = HOLE_CENTER_X_FRAC * (double)(ng - 1);
+    const double cy = HOLE_CENTER_Y_FRAC * (double)(ny - 1);
+    const double radius = HOLE_RADIUS_FRAC_Y * (double)ny;
+    const double r2 = radius * radius;
+
+    for (int j = 0; j < ny; ++j) {
+      for (int i = 0; i < ng; ++i) {
+        const int cell = j * ng + i;
+        const double ddx = (double)i - cx;
+        const double ddy = (double)j - cy;
+        const sunrealtype m = (ddx*ddx + ddy*ddy <= r2)
+                                ? SUN_RCONST(0.0) : SUN_RCONST(1.0);
+        if (m == SUN_RCONST(0.0)) n_hole_count++; else n_active_count++;
+        h_ymsk[idx_mx(cell, ncell)] = m;
+        h_ymsk[idx_my(cell, ncell)] = m;
+        h_ymsk[idx_mz(cell, ncell)] = m;
+      }
+    }
+  }
+  CHECK_CUDA(cudaMemcpy(udata.d_ymsk, h_ymsk,
+                        (size_t)3 * ncell * sizeof(sunrealtype),
+                        cudaMemcpyHostToDevice));
+  printf("[geometry] circular hole: active=%ld  hole=%ld  (total %d cells)\n",
+         n_active_count, n_hole_count, ncell);
+
   /* FFT demag (Newell tensor f̂, computed once here). */
   dstr = (double)DEMAG_STRENGTH;
   dthk = (double)DEMAG_THICK;
   if (dstr > 0.0) {
-    /* Demag_Init takes (nx, ny) where nx is number of columns. Here
-     * ng = nx/GROUPSIZE is the number of physical columns in the grid. */
     udata.demag = Demag_Init(ng, ny, dthk, dstr);
     if (!udata.demag) {
       fprintf(stderr, "Demag_Init failed\n");
       Precond_Destroy(udata.pd);
       cudaFree(udata.d_hdmag);
+      cudaFree(udata.d_ymsk);
+      free(h_ymsk);
       return 1;
     }
-    /* Pull N(0)·strength into UserData so the preconditioner can include
-     * the demag self-coupling in its local 3x3 Jacobian block. Off-diagonals
-     * of N at r=0 vanish by 4-fold symmetry of the cell face integral. */
     Demag_GetSelfCoupling(udata.demag,
                           &udata.nxx0, &udata.nyy0, &udata.nzz0);
     printf("[main] Demag self-coupling (strength-scaled): "
@@ -691,32 +614,38 @@ int main(int argc, char* argv[]) {
     goto cleanup;
   }
 
-  /* ─── Initial condition: 2d_i1 head-on state with circular hole ─── */
-  for (int j = 0; j < ny; j++) {
-    for (int i = 0; i < ng; i++) {
-      cell = j * ng + i;
-      const int mx_i = idx_mx(cell, ncell);
-      const int my_i = idx_my(cell, ncell);
-      const int mz_i = idx_mz(cell, ncell);
+  /* ─── Initial condition ───────────────────────────────────────────
+   * UNIFORM direction across ALL active cells (per professor):
+   *     m = (INIT_MX, INIT_MY, INIT_MZ) / |...|
+   * Hole cells: m = 0 exactly.  Frozen there forever via ymsk. */
+  {
+    double mx0 = (double)INIT_MX;
+    double my0 = (double)INIT_MY;
+    double mz0 = (double)INIT_MZ;
+    const double n0 = sqrt(mx0*mx0 + my0*my0 + mz0*mz0);
+    if (n0 > 1.0e-30) { mx0 /= n0; my0 /= n0; mz0 /= n0; }
 
-      if (udata.h_active[cell]) {
-        double mx0 = 0.0;
-        double my0 = 0.0175;
-        double mz0 = (i < ng / 2) ? 0.998 : -0.998;
-        const double norm = sqrt(mx0 * mx0 + my0 * my0 + mz0 * mz0);
-        mx0 /= norm; my0 /= norm; mz0 /= norm;
-        ydata[mx_i] = SUN_RCONST(mx0);
-        ydata[my_i] = SUN_RCONST(my0);
-        ydata[mz_i] = SUN_RCONST(mz0);
-      } else {
-        ydata[mx_i] = ZERO;
-        ydata[my_i] = ZERO;
-        ydata[mz_i] = ZERO;
+    for (int j = 0; j < ny; j++) {
+      for (int i = 0; i < ng; i++) {
+        const int cell = j * ng + i;
+        const int mx_i = idx_mx(cell, ncell);
+        const int my_i = idx_my(cell, ncell);
+        const int mz_i = idx_mz(cell, ncell);
+
+        if (h_ymsk[mx_i] != SUN_RCONST(0.0)) {
+          ydata[mx_i] = SUN_RCONST(mx0);
+          ydata[my_i] = SUN_RCONST(my0);
+          ydata[mz_i] = SUN_RCONST(mz0);
+        } else {
+          ydata[mx_i] = ZERO;
+          ydata[my_i] = ZERO;
+          ydata[mz_i] = ZERO;
+        }
+
+        abstol_data[mx_i] = ATOL1;
+        abstol_data[my_i] = ATOL2;
+        abstol_data[mz_i] = ATOL3;
       }
-
-      abstol_data[mx_i] = ATOL1;
-      abstol_data[my_i] = ATOL2;
-      abstol_data[mz_i] = ATOL3;
     }
   }
 
@@ -763,17 +692,15 @@ int main(int argc, char* argv[]) {
   CHECK_SUNDIALS(CVodeSetMaxOrd(cvode_mem, MAX_BDF_ORDER));
   printf("Max BDF order: %d   Krylov dim: %d\n", MAX_BDF_ORDER, KRYLOV_DIM);
 
-  printf("\n2D irregular LLG + FFT demag — circular hole + compact active-cell RHS\n");
-  printf("LLG form: standard (damping = alpha*(h - (m.h)*m)), |m|=1 enforced by normalize-in-f\n\n");
+  printf("\n2D irregular LLG + FFT demag — circular hole + ymsk geometry\n");
+  printf("LLG form: standard simplified, |m|≈1 enforced by normalize-in-f (regularized)\n\n");
   printf("nx=%d  ny=%d  ng=%d  ncell=%d  neq=%d\n", nx, ny, ng, ncell, neq);
   printf("periodic BC: x and y\n");
-  printf("Init: head-on stripes   q1=%d (x=%.2f*ng)   q3=%d (x=%.2f*ng)\n",
-         q1, (double)STRIPE_LEFT_FRAC, q3, (double)STRIPE_RIGHT_FRAC);
-  printf("      mx = -1 | +1 | -1       random my,mz amplitude = %.3f\n",
-         (double)INIT_RANDOM_EPS);
+  printf("Init: UNIFORM  m = (%.4f, %.4f, %.4f) (normalized)\n",
+         (double)INIT_MX, (double)INIT_MY, (double)INIT_MZ);
   printf("DEMAG_STRENGTH=%.4f  DEMAG_THICK=%.4f  (%s)\n",
          dstr, dthk,
-         dstr > 0.0 ? "h_dmag = IFFT[f_hat * m_hat] via cuFFT real-to-complex (D2Z/Z2D), fused into RHS"
+         dstr > 0.0 ? "h_dmag = IFFT[f_hat * m_hat] via cuFFT D2Z/Z2D, fused into RHS"
                     : "disabled (h_dmag buffer stays zero)");
   printf("T_TOTAL=%.2f  RTOL/ATOL=%.1e\n",
          (double)T_TOTAL, (double)RTOL_VAL);
@@ -824,12 +751,8 @@ cleanup:
   Precond_Destroy(udata.pd);
   Demag_Destroy(udata.demag);
   if (udata.d_hdmag) cudaFree(udata.d_hdmag);
-  if (udata.d_active) cudaFree(udata.d_active);
-  if (udata.d_active_ids) cudaFree(udata.d_active_ids);
-  if (udata.d_inactive_ids) cudaFree(udata.d_inactive_ids);
-  if (udata.h_active) free(udata.h_active);
-  if (udata.h_active_ids) free(udata.h_active_ids);
-  if (udata.h_inactive_ids) free(udata.h_inactive_ids);
+  if (udata.d_ymsk)  cudaFree(udata.d_ymsk);
+  if (h_ymsk) free(h_ymsk);
   FusedNVec_FreePool();
 
 #if ENABLE_OUTPUT

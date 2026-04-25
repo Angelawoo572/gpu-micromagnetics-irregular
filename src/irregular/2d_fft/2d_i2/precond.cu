@@ -1,5 +1,5 @@
 /*
- * precond.cu — Block-Jacobi 3×3 preconditioner for CVODE Newton/GMRES.
+ * precond.cu — Block-Jacobi 3×3 preconditioner, ymsk version.
  *
  * Per cell we approximate the local Jacobian J_local = ∂f_cell/∂m_cell
  * (neighbors held fixed) and form
@@ -9,38 +9,45 @@
  * then store A⁻¹ in device memory.  PrecondSolve is one dense 3×3
  * mat-vec per cell.
  *
- * ─── LLG form matched here ──────────────────────────────────────────
- *   dm/dt = chg (m × h) + alpha ( h − (m·h) m )
+ * ─── ymsk handling ──────────────────────────────────────────────────
+ *   apply_P_kernel:  z[mα] = ymsk[mα] * (P · r)[mα]
  *
- * This is the standard simplified form assuming |m|=1.  The assumption is
- * enforced by normalize_m_kernel in 2d_fft.cu's f(), which projects y onto
- * the unit sphere at the top of every RHS evaluation.
+ * That's it.  No `if (active[…])` branches in build_J_kernel; it just
+ * computes the local J for every cell.  Hole cells get garbage J / P⁻¹
+ * blocks, but the apply_P mask drops their z to 0 — so any noise in
+ * the GMRES Krylov subspace at hole cells stays at 0 throughout the
+ * iteration.  Build is unconditional, simple, fast.
+ *
+ * ─── LLG form ───────────────────────────────────────────────────────
+ *   dm/dt = chg (m × h) + α ( h − (m·h) m )
+ *
+ * Standard simplified form; |m|≈1 is enforced by normalize_m_kernel
+ * in 2d_fft.cu's f() with +0.01 regularization.
  *
  * ─── What contributes to J_local ─────────────────────────────────────
  *   h_cell = h_exchange(neighbors) + h_DMI(neighbors)
  *          + h_anisotropy(m1) + h_demag(convolution)
  *
- *   Only terms that depend on THIS cell's m appear in ∂h/∂m_self:
- *     ∂h1/∂m1 = c_chk  + Nxx(0)·strength
- *     ∂h2/∂m2 =           Nyy(0)·strength
- *     ∂h3/∂m3 =           Nzz(0)·strength
- *     off-diagonals zero (c_msk components off, N(0) diagonal by symmetry).
+ *   Self derivatives (only terms depending on this cell's m):
+ *     ∂h1/∂m1 = c_chk + Nxx(0)·strength      ← anisotropy + demag-self
+ *     ∂h2/∂m2 =          Nyy(0)·strength
+ *     ∂h3/∂m3 =          Nzz(0)·strength
+ *     off-diagonals zero (c_msk diag, N(0) diag by 4-fold symmetry).
  *
  *   Shorthand:  k1 = c_chk + Nxx0,  k2 = Nyy0,  k3 = Nzz0.
  *
- * ─── Derivatives (closed form) ───────────────────────────────────────
- *   Let mm = |m|², mh = m·h, e_β = h_β + m_β k_β = ∂(m·h)/∂m_β.
+ * ─── Closed-form J ──────────────────────────────────────────────────
+ *   Let mh = m·h, e_β = h_β + m_β k_β = ∂(m·h)/∂m_β.
  *
- *   Precession part d/dm_β [chg (m×h)_α]:
- *     d (m3 h2 − m2 h3)/dm  for α=1   (matches 2d_fft.cu's sign convention)
- *     d (m1 h3 − m3 h1)/dm  for α=2
- *     d (m2 h1 − m1 h2)/dm  for α=3
- *
- *   Damping part d/dm_β [alpha (mm h_α − mh m_α)]:
- *     = alpha (2 m_β h_α + mm k_α δ_{αβ} − e_β m_α − mh δ_{αβ})
- *
- *   The NEW contribution vs the old simplified form is the `2 m_β h_α`
- *   term from d|m|²/dm; this is what removes the m·h-driven feedback.
+ *     J[0][0] = α (k1 − e1 m1 − mh)
+ *     J[0][1] = chg (m3 k2 − h3) − α e2 m1
+ *     J[0][2] = chg (h2 − m2 k3) − α e3 m1
+ *     J[1][0] = chg (h3 − m3 k1) − α e1 m2
+ *     J[1][1] = α (k2 − e2 m2 − mh)
+ *     J[1][2] = chg (m1 k3 − h1) − α e3 m2
+ *     J[2][0] = chg (m2 k1 − h2) − α e1 m3
+ *     J[2][1] = chg (h1 − m1 k2) − α e2 m3
+ *     J[2][2] = α (k3 − e3 m3 − mh)
  */
 
 #include "precond.h"
@@ -61,7 +68,7 @@ __constant__ static sunrealtype pc_alpha = SUN_RCONST(0.2);
 __constant__ static sunrealtype pc_chg   = SUN_RCONST(1.0);
 __constant__ static sunrealtype pc_cha   = SUN_RCONST(0.0);
 __constant__ static sunrealtype pc_chb   = SUN_RCONST(0.3);
-/* Anisotropy mask fixed at {1,0,0}; DMI mask fixed at {1,0,0}.
+/* Anisotropy axis fixed at {1,0,0} (x); DMI direction fixed at {1,0,0}.
  * These are baked into the kernel rather than loaded from constant mem
  * to save some fetches — change here if the axes ever change. */
 
@@ -83,35 +90,31 @@ struct PrecondData {
 };
 
 /*
- * PcUserData: mirror of UserData in 2d_fft.cu (byte-compatible layout).
- *   offset 0  : PrecondData*
- *   offset 8  : DemagData*
+ * PcUserData: byte-compatible mirror of UserData in 2d_fft.cu.
+ *   offset 0  : void* pd_opaque
+ *   offset 8  : void* demag_opaque
  *   offset 16 : sunrealtype *d_hdmag
- *   offset 24 : int nx, ny, ng, ncell, neq   (5*4 = 20 bytes)
- *   offset 48 : double nxx0, nyy0, nzz0      (after 4-byte pad)
+ *   offset 24 : sunrealtype *d_ymsk
+ *   offset 32 : int nx, ny, ng, ncell, neq   (5*4 = 20 bytes)
+ *   offset 56 : double nxx0, nyy0, nzz0
  */
 typedef struct {
     void        *pd_opaque;
     void        *demag_opaque;
     sunrealtype *d_hdmag;
+    sunrealtype *d_ymsk;
     int nx, ny, ng, ncell, neq;
     double nxx0, nyy0, nzz0;
-    unsigned char* h_active;
-    unsigned char* d_active;
-    int* h_active_ids;
-    int* d_active_ids;
-    int  n_active;
-    int* h_inactive_ids;
-    int* d_inactive_ids;
-    int  n_inactive;
 } PcUserData;
 
 /* ─── build_J_kernel ────────────────────────────────────────────────── */
 /*
- * One thread per cell. Reads self + 4 neighbors (for h — derivatives
- * only need self quantities) plus h_dmag[mx/my/mz] for this cell,
- * assembles the 3×3 local J (|m|-preserving form), forms A = I − γJ,
- * stores A⁻¹.
+ * One thread per cell.  Computes the 3×3 local J unconditionally and
+ * stores its inverse.  Hole-cell results are junk but irrelevant —
+ * apply_P_kernel drops them to 0 via the ymsk multiply.
+ *
+ * Hole-cell neighbor reads return 0 (m frozen there), so for active
+ * cells the h calculation is correct without any branching.
  */
 __global__ static void build_J_kernel(
     const sunrealtype* __restrict__ y,
@@ -119,7 +122,6 @@ __global__ static void build_J_kernel(
     sunrealtype*       __restrict__ d_P,
     sunrealtype gamma,
     sunrealtype nxx0, sunrealtype nyy0, sunrealtype nzz0,
-    const unsigned char* __restrict__ active,
     int ng, int ny, int ncell)
 {
     const int gx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -131,53 +133,35 @@ __global__ static void build_J_kernel(
     const int my = pidx_my(cell, ncell);
     const int mz = pidx_mz(cell, ncell);
 
-    if (active && !active[cell]) {
-        d_P[0*ncell + cell] = SUN_RCONST(1.0);
-        d_P[1*ncell + cell] = SUN_RCONST(0.0);
-        d_P[2*ncell + cell] = SUN_RCONST(0.0);
-        d_P[3*ncell + cell] = SUN_RCONST(0.0);
-        d_P[4*ncell + cell] = SUN_RCONST(1.0);
-        d_P[5*ncell + cell] = SUN_RCONST(0.0);
-        d_P[6*ncell + cell] = SUN_RCONST(0.0);
-        d_P[7*ncell + cell] = SUN_RCONST(0.0);
-        d_P[8*ncell + cell] = SUN_RCONST(1.0);
-        return;
-    }
-
     const int xl = pwrap_x(gx - 1, ng);
     const int xr = pwrap_x(gx + 1, ng);
     const int yu = pwrap_y(gy - 1, ny);
-    const int yd = pwrap_y(gy + 1, ny);
+    const int ydn= pwrap_y(gy + 1, ny);
 
-    const int lc = gy * ng + xl;
-    const int rc = gy * ng + xr;
-    const int uc = yu * ng + gx;
-    const int dc = yd * ng + gx;
+    const int lc = gy  * ng + xl;
+    const int rc = gy  * ng + xr;
+    const int uc = yu  * ng + gx;
+    const int dc = ydn * ng + gx;
 
     const sunrealtype m1 = y[mx];
     const sunrealtype m2 = y[my];
     const sunrealtype m3 = y[mz];
 
-    /* Total h at this cell (matches 2d_fft.cu's f_kernel_unified exactly).
-     * Anisotropy: c_msk = {1,0,0} → only h1 gets (c_chk*m1 + c_cha).
-     * DMI:        c_nsk = {1,0,0} → only h1 gets c_chb*(lx + rx). */
-    const sunrealtype y1L = (!active || active[lc]) ? y[pidx_mx(lc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y1R = (!active || active[rc]) ? y[pidx_mx(rc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y1U = (!active || active[uc]) ? y[pidx_mx(uc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y1D = (!active || active[dc]) ? y[pidx_mx(dc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y2L = (!active || active[lc]) ? y[pidx_my(lc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y2R = (!active || active[rc]) ? y[pidx_my(rc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y2U = (!active || active[uc]) ? y[pidx_my(uc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y2D = (!active || active[dc]) ? y[pidx_my(dc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y3L = (!active || active[lc]) ? y[pidx_mz(lc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y3R = (!active || active[rc]) ? y[pidx_mz(rc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y3U = (!active || active[uc]) ? y[pidx_mz(uc,ncell)] : SUN_RCONST(0.0);
-    const sunrealtype y3D = (!active || active[dc]) ? y[pidx_mz(dc,ncell)] : SUN_RCONST(0.0);
+    /* Total h at this cell — anisotropy on h1 only (c_msk={1,0,0}),
+     * DMI on h1 only (c_nsk={1,0,0}). */
+    sunrealtype h1 =
+        pc_che * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)] +
+                  y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)])
+      + (pc_chk * m1 + pc_cha)
+      + pc_chb * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)]);
 
-    sunrealtype h1 = pc_che * (y1L + y1R + y1U + y1D)
-      + (pc_chk * m1 + pc_cha) + pc_chb * (y1L + y1R);
-    sunrealtype h2 = pc_che * (y2L + y2R + y2U + y2D);
-    sunrealtype h3 = pc_che * (y3L + y3R + y3U + y3D);
+    sunrealtype h2 =
+        pc_che * (y[pidx_my(lc,ncell)] + y[pidx_my(rc,ncell)] +
+                  y[pidx_my(uc,ncell)] + y[pidx_my(dc,ncell)]);
+
+    sunrealtype h3 =
+        pc_che * (y[pidx_mz(lc,ncell)] + y[pidx_mz(rc,ncell)] +
+                  y[pidx_mz(uc,ncell)] + y[pidx_mz(dc,ncell)]);
 
     if (h_dmag) {
         h1 += h_dmag[mx];
@@ -190,14 +174,11 @@ __global__ static void build_J_kernel(
     const sunrealtype k2 = nyy0;
     const sunrealtype k3 = nzz0;
 
-    const sunrealtype e1 = h1 + m1 * k1;      /* = ∂(m·h)/∂m_1 */
+    const sunrealtype e1 = h1 + m1 * k1;
     const sunrealtype e2 = h2 + m2 * k2;
     const sunrealtype e3 = h3 + m3 * k3;
     const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
 
-    /* Local 3×3 J for standard LLG: dm/dt = chg(m×h) + α(h − (m·h)m).
-     * |m|=1 is enforced by normalize_m_kernel in f(), so we can use the
-     * simplified Jacobian (no |m|² terms needed). */
     const sunrealtype J00 = pc_alpha * (k1 - e1 * m1 - mh);
     const sunrealtype J01 = pc_chg * (m3 * k2 - h3) - pc_alpha * e2 * m1;
     const sunrealtype J02 = pc_chg * (h2 - m2 * k3) - pc_alpha * e3 * m1;
@@ -243,8 +224,7 @@ __global__ static void build_J_kernel(
 
     const sunrealtype inv_det = SUN_RCONST(1.0) / det;
 
-    /* A⁻¹[i][j] = (adj A)[i][j] / det,  adj A = transpose(cofactors).
-     * Standard closed form for 3×3. */
+    /* A⁻¹[i][j] = (adj A)[i][j] / det,  adj A = transpose(cofactors). */
     const sunrealtype Pi00 = (A11 * A22 - A12 * A21) * inv_det;
     const sunrealtype Pi01 = (A02 * A21 - A01 * A22) * inv_det;
     const sunrealtype Pi02 = (A01 * A12 - A02 * A11) * inv_det;
@@ -266,10 +246,11 @@ __global__ static void build_J_kernel(
     d_P[8*ncell + cell] = Pi22;
 }
 
-/* ─── apply_P_kernel: z = P⁻¹ r (3×3 block per cell) ────────────────── */
+/* ─── apply_P_kernel: z = ymsk * (P⁻¹ r) ───────────────────────────── */
 __global__ static void apply_P_kernel(
     const sunrealtype* __restrict__ P,
     const sunrealtype* __restrict__ r,
+    const sunrealtype* __restrict__ ymsk,
     sunrealtype*       __restrict__ z,
     int ncell)
 {
@@ -280,18 +261,23 @@ __global__ static void apply_P_kernel(
     const sunrealtype r1 = r[ncell + cell];
     const sunrealtype r2 = r[2*ncell + cell];
 
-    z[cell] =
+    const sunrealtype z0 =
         P[0*ncell + cell] * r0 +
         P[1*ncell + cell] * r1 +
         P[2*ncell + cell] * r2;
-    z[ncell + cell] =
+    const sunrealtype z1 =
         P[3*ncell + cell] * r0 +
         P[4*ncell + cell] * r1 +
         P[5*ncell + cell] * r2;
-    z[2*ncell + cell] =
+    const sunrealtype z2 =
         P[6*ncell + cell] * r0 +
         P[7*ncell + cell] * r1 +
         P[8*ncell + cell] * r2;
+
+    /* Mask drops hole-cell output to 0. */
+    z[cell]           = ymsk[cell]           * z0;
+    z[ncell + cell]   = ymsk[ncell + cell]   * z1;
+    z[2*ncell + cell] = ymsk[2*ncell + cell] * z2;
 }
 
 /* ─── Create/Destroy ────────────────────────────────────────────────── */
@@ -317,8 +303,7 @@ PrecondData* Precond_Create(int ng, int ny, int ncell)
     }
     cudaMemset(pd->d_P, 0, bytes);
 
-    printf("[Precond] Block-Jacobi 3x3: ncell=%d, "
-           "device mem = %.2f MB\n",
+    printf("[Precond] Block-Jacobi 3x3: ncell=%d, device mem = %.2f MB\n",
            ncell, (double)bytes / 1e6);
     return pd;
 }
@@ -340,9 +325,6 @@ int PrecondSetup(sunrealtype t, N_Vector y, N_Vector fy,
     PcUserData  *ud = (PcUserData*)user_data;
     PrecondData *pd = (PrecondData*)ud->pd_opaque;
 
-    /* Always rebuild: the Jacobian depends on both y AND gamma, and
-     * gamma changes across Newton failures / step-size adjustments.
-     * jcurPtr tells CVODE the Jacobian data is current. */
     *jcurPtr = SUNTRUE;
 
     sunrealtype *ydata = N_VGetDeviceArrayPointer_Cuda(y);
@@ -353,13 +335,12 @@ int PrecondSetup(sunrealtype t, N_Vector y, N_Vector fy,
 
     build_J_kernel<<<grid, block>>>(
         ydata,
-        ud->d_hdmag,                     /* may be non-null but zero-filled */
+        ud->d_hdmag,
         pd->d_P,
         gamma,
         (sunrealtype)ud->nxx0,
         (sunrealtype)ud->nyy0,
         (sunrealtype)ud->nzz0,
-        ud->d_active,
         ud->ng, ud->ny, ud->ncell);
 
     cudaError_t cuerr = cudaPeekAtLastError();
@@ -371,7 +352,7 @@ int PrecondSetup(sunrealtype t, N_Vector y, N_Vector fy,
     return 0;
 }
 
-/* ─── PrecondSolve (apply cached A⁻¹ block per cell) ────────────────── */
+/* ─── PrecondSolve (apply cached A⁻¹ block per cell, mask output) ──── */
 int PrecondSolve(sunrealtype t, N_Vector y, N_Vector fy,
                  N_Vector r, N_Vector z,
                  sunrealtype gamma, sunrealtype delta,
@@ -387,7 +368,7 @@ int PrecondSolve(sunrealtype t, N_Vector y, N_Vector fy,
 
     const int b = 256;
     const int g = (ud->ncell + b - 1) / b;
-    apply_P_kernel<<<g, b>>>(pd->d_P, rdata, zdata, ud->ncell);
+    apply_P_kernel<<<g, b>>>(pd->d_P, rdata, ud->d_ymsk, zdata, ud->ncell);
 
     cudaError_t cuerr = cudaPeekAtLastError();
     if (cuerr != cudaSuccess) {

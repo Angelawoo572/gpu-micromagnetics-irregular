@@ -11,6 +11,9 @@
  * in y, local stencil). Demag contribution to Jv is NOT included:
  * adding it would require a second FFT pipeline per Jv call, and GMRES
  * plus the preconditioner tolerate the inexactness without issue.
+ *
+ * Hole-cell handling: output Jv is masked by ymsk (geometry encoding),
+ * dropping hole entries to 0 — no byte mask, no index lists in the kernel.
  */
 
 #include <sundials/sundials_types.h>

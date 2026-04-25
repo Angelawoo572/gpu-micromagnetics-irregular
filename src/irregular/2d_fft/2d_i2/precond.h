@@ -11,7 +11,9 @@
  *     demag self-coupling N(0) (diagonal by 4-fold symmetry).
  *
  * The 3×3 block is inverted explicitly on device and stored; Solve is one
- * matrix-vector multiply per cell.
+ * matrix-vector multiply per cell.  Output is multiplied by ymsk to drop
+ * hole-cell entries to 0 (geometry encoding lives entirely in ymsk; this
+ * file does not look at any byte mask or index list).
  */
 
 #include <sundials/sundials_types.h>

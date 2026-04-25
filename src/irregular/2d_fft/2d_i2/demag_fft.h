@@ -4,16 +4,16 @@
 /*
  * demag_fft.h  —  FFT demagnetization field, GPU-only pipeline.
  *
- * Per f() call, fully on device:
- *     pack_m_kernel   : SoA y (3*ncell real)        ->  3 complex arrays (mx,my,mz)
- *     cufftExecZ2Z    : FORWARD on each component    ->  m̂ (stays on device)
- *     multiply_kernel : ĥ = f̂ · m̂                   ->  3 complex spectra
- *     cufftExecZ2Z    : INVERSE on each component    ->  h (complex)
- *     unshift_h_kernel: FFT-shift + real-part + strength/N scaling
- *                       write directly to SoA h_out_dev (OVERWRITE, not +=)
+ * Per f() call, fully on device (D2Z/Z2D real-to-complex, half-spectrum):
+ *     gather_real_kernel : SoA y -> 3 contiguous real arrays
+ *     cufftExecD2Z       : FORWARD batched (batch=3) -> M̂ half-spectrum
+ *     multiply_kernel    : Ĥ = f̂ · M̂
+ *     cufftExecZ2D       : INVERSE batched (batch=3) -> H real
+ *     scatter_real_kernel: FFT-shift + strength/N scaling -> SoA h_out_dev
  *
- * f̂ is computed ONCE in Demag_Init and stored permanently on device.
- * No host transfers during Apply.
+ * f̂ is computed ONCE in Demag_Init and stored permanently on device
+ * as half-spectrum (9 components × ncell_half complex).  No host
+ * transfers during Apply.
  *
  * Self-coupling  (for preconditioner):
  *     N(0) = diag(Nxx(0), Nyy(0), Nzz(0))   (off-diagonals vanish at r=0)
