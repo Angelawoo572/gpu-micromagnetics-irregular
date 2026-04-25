@@ -51,69 +51,108 @@
 %     %hold off
 %     %figure(2)
 %     %mesh(mz);
+% % end
+% 
+% clear; clc; close all;
+% 
+% fn = 'output.txt';
+% aa = readmatrix(fn);
+% [nt, ~] = size(aa);
+% 
+% scalar_nx = aa(1,2);
+% ny        = aa(1,3);
+% nx        = scalar_nx / 3;   % physical x cells
+% nqs       = nx * ny;
+% frame_len = nqs + 1;
+% nframe    = floor(nt / frame_len);
+% 
+% stride = 4;   % 可改成 2 / 4 / 8
+% xs = 1:stride:nx;
+% ys = 1:stride:ny;
+% [X,Y] = meshgrid(xs, ys);
+% Z = zeros(size(X));
+% 
+% gif_name = 'quiver_animation.gif';
+% 
+% figure('Color','w');
+% for iframe = 1:nframe
+%     header_row = 1 + (iframe-1)*frame_len;
+%     data_start = header_row + 1;
+%     data_end   = header_row + nqs;
+% 
+%     if data_end > nt
+%         fprintf('Frame %d incomplete, stopping.\n', iframe);
+%         break;
+%     end
+% 
+%     tnow  = aa(header_row, 1);
+%     block = aa(data_start:data_end, :);
+% 
+%     MX_full = reshape(block(:,1), [nx, ny])';
+%     MY_full = reshape(block(:,2), [nx, ny])';
+%     MZ_full = reshape(block(:,3), [nx, ny])';
+% 
+%     MX = MX_full(ys, xs);
+%     MY = MY_full(ys, xs);
+%     MZ = MZ_full(ys, xs);
+%     cla;
+% 
+%     quiver3(X, Y, Z, MX, MY, MZ, 0.7, 'r');
+%     axis image;
+%     axis off;
+%     view(3);
+%     title(sprintf('Magnetization, frame %d / %d, t = %.4f', iframe, nframe, tnow), ...
+%           'FontSize', 14);
+%     drawnow;
+% 
+%     frame = getframe(gcf);
+%     im = frame2im(frame);
+%     [A, map] = rgb2ind(im, 256);
+% 
+%     if iframe == 1
+%         imwrite(A, map, gif_name, 'gif', 'LoopCount', Inf, 'DelayTime', 0.15);
+%     else
+%         imwrite(A, map, gif_name, 'gif', 'WriteMode', 'append', 'DelayTime', 0.15);
+%     end
 % end
+% 
+% fprintf('Saved GIF: %s\n', gif_name);
 
 clear; clc; close all;
 
 fn = 'output.txt';
 aa = readmatrix(fn);
-[nt, ~] = size(aa);
 
 scalar_nx = aa(1,2);
 ny        = aa(1,3);
-nx        = scalar_nx / 3;   % physical x cells
+nx        = scalar_nx / 3;
 nqs       = nx * ny;
-frame_len = nqs + 1;
-nframe    = floor(nt / frame_len);
 
-stride = 4;   % 可改成 2 / 4 / 8
-xs = 1:stride:nx;
-ys = 1:stride:ny;
-[X,Y] = meshgrid(xs, ys);
-Z = zeros(size(X));
+block = aa(2:1+nqs, :);
 
-gif_name = 'quiver_animation.gif';
+MX = reshape(block(:,1), [nx, ny])';
+MY = reshape(block(:,2), [nx, ny])';
+MZ = reshape(block(:,3), [nx, ny])';
+
+[x, y] = meshgrid(1:nx, 1:ny);
 
 figure('Color','w');
-for iframe = 1:nframe
-    header_row = 1 + (iframe-1)*frame_len;
-    data_start = header_row + 1;
-    data_end   = header_row + nqs;
+surf(x, y, MX);
+shading interp;
+colorbar;
+axis tight;
+xlabel('x');
+ylabel('y');
+zlabel('m_x');
+title('Final state: m_x');
 
-    if data_end > nt
-        fprintf('Frame %d incomplete, stopping.\n', iframe);
-        break;
-    end
-
-    tnow  = aa(header_row, 1);
-    block = aa(data_start:data_end, :);
-
-    MX_full = reshape(block(:,1), [nx, ny])';
-    MY_full = reshape(block(:,2), [nx, ny])';
-    MZ_full = reshape(block(:,3), [nx, ny])';
-
-    MX = MX_full(ys, xs);
-    MY = MY_full(ys, xs);
-    MZ = MZ_full(ys, xs);
-    cla;
-
-    quiver3(X, Y, Z, MX, MY, MZ, 0.7, 'r');
-    axis image;
-    axis off;
-    view(3);
-    title(sprintf('Magnetization, frame %d / %d, t = %.4f', iframe, nframe, tnow), ...
-          'FontSize', 14);
-    drawnow;
-
-    frame = getframe(gcf);
-    im = frame2im(frame);
-    [A, map] = rgb2ind(im, 256);
-
-    if iframe == 1
-        imwrite(A, map, gif_name, 'gif', 'LoopCount', Inf, 'DelayTime', 0.15);
-    else
-        imwrite(A, map, gif_name, 'gif', 'WriteMode', 'append', 'DelayTime', 0.15);
-    end
-end
-
-fprintf('Saved GIF: %s\n', gif_name);
+% 如果想从上往下看 hole/纹理，用这个：
+figure('Color','w');
+surf(x, y, MX);
+shading interp;
+view(2);
+axis equal tight;
+colorbar;
+xlabel('x');
+ylabel('y');
+title('Final state: m_x top view');
