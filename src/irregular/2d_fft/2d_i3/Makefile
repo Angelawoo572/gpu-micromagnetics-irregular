@@ -44,13 +44,18 @@ EARLY_SAVE_UNTIL ?= 0.0
 EARLY_SAVE_EVERY ?= 100
 LATE_SAVE_EVERY  ?= 100
 
+NUM_GRAINS      ?= 48
+DEAD_GRAIN_FRAC ?= 0.18
+
 ifeq ($(BUILD),debug)
   NVCC_FLAGS := $(CUDA_ARCH) -G -g -lineinfo -Xcompiler -O0
 else
   NVCC_FLAGS := $(CUDA_ARCH) -O3 -lineinfo --use_fast_math
 endif
 
-NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
+NVCC_FLAGS += -DNUM_GRAINS=$(NUM_GRAINS) \
+              -DDEAD_GRAIN_FRAC=$(DEAD_GRAIN_FRAC) \
+			  -DENABLE_OUTPUT=$(PRINT) \
               -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) \
               -DRTOL_VAL=$(RTOL_VAL) -DATOL_VAL=$(ATOL_VAL) \
               -DT_TOTAL=$(T_TOTAL) \

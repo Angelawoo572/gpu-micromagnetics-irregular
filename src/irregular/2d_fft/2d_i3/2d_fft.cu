@@ -1,37 +1,28 @@
 /**
- * 2D LLG solver — irregular antidot mesh + soft-edge mask + FFT demag
- * Drop-in replacement for src/irregular/2d_fft/2d_i1/2d_fft.cu
+ * 2D LLG solver — Voronoi polycrystal + dead-grain holes + FFT demag
+ * Drop-in replacement for 2d_i3/2d_fft.cu
  *
  * ─── Geometry ────────────────────────────────────────────────────────
- * N_HOLES_X × N_HOLES_Y stratified-jitter grid of ellipse holes:
- *   - center jittered within each super-cell
- *   - random aspect ratio in [HOLE_ASPECT_MIN, HOLE_ASPECT_MAX]
- *   - random rotation in [0, π]
- *   - periodic copies (3×3 tile) included so PBC tiles cleanly
- *
- * Continuous weight field on host (computed once):
- *   w(x,y) = 0.5 · (1 + tanh(SDF(x,y) / MASK_EPS_CELLS))
+ *   - NUM_GRAINS Voronoi seeds (stratified jitter, periodic)
+ *   - DEAD_GRAIN_FRAC of grains are killed → polygonal holes
+ *   - soft tanh boundary only at hole boundaries
+ *   - grain↔grain interfaces stay sharp (m discontinuity = mesh look)
  *
  * ─── Physics ─────────────────────────────────────────────────────────
- *   - exchange / DMI use weighted neighbors  w_j · n̂_j   (via y_eff buffer)
- *   - anisotropy uses self n̂  (unit vector after normalize)
- *   - demag uses w · n̂ globally — long-range field naturally tapered at holes
- *   - LLG governs n̂ on unit sphere; output yd = LLG(...) · w[self]
- *     so deep-hole cells stay frozen and boundary cells evolve fractionally
- *   - normalize_m_kernel: only re-projects cells with w > 1e-3
+ *   - per-cell easy axis msk(x,y) (uniform inside a grain, random per grain)
+ *   - proper uniaxial anisotropy:  h_α += msk_α · (chk · (m·msk) + cha)
+ *   - exchange / DMI use weighted neighbors w·n̂  (via y_eff buffer)
+ *   - demag: FFT( w·n̂ ) — windowed magnetization, no leakage into holes
+ *   - yd = LLG(m, h_eff) · w[self]   (deep-hole frozen, soft boundary)
  *
- * ─── PMPP optimizations ──────────────────────────────────────────────
- *   - DENSE execution, branch-free hot path (no `if active` in RHS kernel)
- *   - all reads coalesced (SoA + dense launch); w is 1D float-double per cell
- *   - one fused kernel: exchange + aniso + DMI + demag + LLG + w-scale
- *   - pre-pass `apply_weight_kernel` writes y_eff = w·y once, reused by
- *     both Demag_Apply (gather) and the unified RHS (neighbor sums)
- *   - one extra normalize check (compare w to 1e-3) — single FMA, no branch
- *     divergence within a warp because the comparison is on read-only data
+ * ─── PMPP-clean GPU layout ───────────────────────────────────────────
+ *   - DENSE launch, no `if (active)` in hot path
+ *   - msk stored in SoA layout identical to y → reads are coalesced
+ *   - one fused kernel: exchange + per-cell aniso + DMI + demag + LLG + w
+ *   - apply_weight_kernel pre-pass writes y_eff once, reused by demag and RHS
  *
- * Build:  make run-demag PRINT=1
- * Plot:   mdyn2D.m on output.txt (arrows fade smoothly to 0 in holes)
- *         mask.txt is also written once for overlay if desired
+ * Build: make run-demag PRINT=1
+ * Plot : same mdyn2D.m on output.txt (m·w → arrows fade in holes)
  */
 
 #include <cvode/cvode.h>
@@ -79,7 +70,6 @@
 #define ATOL1 SUN_RCONST(ATOL_VAL)
 #define ATOL2 SUN_RCONST(ATOL_VAL)
 #define ATOL3 SUN_RCONST(ATOL_VAL)
-
 #define T0   SUN_RCONST(0.0)
 #define T1   SUN_RCONST(0.1)
 #define ZERO SUN_RCONST(0.0)
@@ -97,15 +87,9 @@
 #define BLOCK_Y 8
 #endif
 
-/* ─── Initial-condition knobs (head-on three-stripe) ─────────────── */
-#ifndef STRIPE_LEFT_FRAC
-#define STRIPE_LEFT_FRAC 0.25
-#endif
-#ifndef STRIPE_RIGHT_FRAC
-#define STRIPE_RIGHT_FRAC 0.75
-#endif
+/* ─── Initial-condition knobs ────────────────────────────────────── */
 #ifndef INIT_RANDOM_EPS
-#define INIT_RANDOM_EPS 0.01
+#define INIT_RANDOM_EPS 0.05
 #endif
 #ifndef INIT_RANDOM_SEED
 #define INIT_RANDOM_SEED 12345
@@ -120,46 +104,30 @@
 #define LATE_SAVE_EVERY 100
 #endif
 
-/* ─── Irregular antidot-mesh geometry knobs ──────────────────────── */
-#ifndef N_HOLES_X
-#define N_HOLES_X 4
+/* ─── Polycrystal knobs ──────────────────────────────────────────── */
+#ifndef NUM_GRAINS
+#define NUM_GRAINS 48
 #endif
-#ifndef N_HOLES_Y
-#define N_HOLES_Y 4
+#ifndef DEAD_GRAIN_FRAC
+#define DEAD_GRAIN_FRAC 0.18
 #endif
-#define N_HOLES (N_HOLES_X * N_HOLES_Y)
-
 #ifndef HOLE_SEED
 #define HOLE_SEED 20251101
 #endif
 #ifndef MASK_EPS_CELLS
-#define MASK_EPS_CELLS 1.5      /* tanh transition half-width, in cells   */
-#endif
-#ifndef HOLE_BASE_FRAC
-#define HOLE_BASE_FRAC 0.18     /* base radius as fraction of super-cell  */
-#endif
-#ifndef HOLE_GROWTH_FRAC
-#define HOLE_GROWTH_FRAC 0.14   /* extra random radius up to this         */
-#endif
-#ifndef HOLE_ASPECT_MIN
-#define HOLE_ASPECT_MIN 0.55
-#endif
-#ifndef HOLE_ASPECT_MAX
-#define HOLE_ASPECT_MAX 1.85
-#endif
-#ifndef HOLE_JITTER
-#define HOLE_JITTER 0.60        /* center stays in central HOLE_JITTER fraction */
+#define MASK_EPS_CELLS 1.5
 #endif
 
 #ifndef GRID_NX
-#define GRID_NX 768             /* total scalar width = GROUPSIZE * ng */
+#define GRID_NX 768
 #endif
 #ifndef GRID_NY
 #define GRID_NY 256
 #endif
 
 /* ─── Material constants (device constant memory) ────────────────── */
-__constant__ sunrealtype c_msk[3] = {SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
+/* c_msk_default kept for reference; the kernel actually reads per-cell d_msk.
+ * c_nsk (DMI direction) stays uniform along x. */
 __constant__ sunrealtype c_nsk[3] = {SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
 __constant__ sunrealtype c_chk   = SUN_RCONST(4.0);
 __constant__ sunrealtype c_che   = SUN_RCONST(4.0);
@@ -168,49 +136,44 @@ __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
 __constant__ sunrealtype c_cha   = SUN_RCONST(0.0);
 __constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
 
-/* ─── Error checking macros ──────────────────────────────────────── */
+/* ─── Error checking ─────────────────────────────────────────────── */
 #define CHECK_CUDA(call)                                                     \
-  do {                                                                       \
-    cudaError_t _err = (call);                                               \
-    if (_err != cudaSuccess) {                                               \
-      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,       \
-              cudaGetErrorString(_err));                                     \
-      exit(EXIT_FAILURE);                                                    \
-    }                                                                        \
-  } while (0)
+  do { cudaError_t _err = (call);                                            \
+       if (_err != cudaSuccess) {                                            \
+         fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,    \
+                 cudaGetErrorString(_err)); exit(EXIT_FAILURE); } } while (0)
 
 #define CHECK_SUNDIALS(call)                                                 \
-  do {                                                                       \
-    int _flag = (call);                                                      \
-    if (_flag < 0) {                                                         \
-      fprintf(stderr, "SUNDIALS error at %s:%d: flag = %d\n",                \
-              __FILE__, __LINE__, _flag);                                    \
-      exit(EXIT_FAILURE);                                                    \
-    }                                                                        \
-  } while (0)
+  do { int _flag = (call);                                                   \
+       if (_flag < 0) {                                                      \
+         fprintf(stderr, "SUNDIALS error at %s:%d: flag = %d\n",             \
+                 __FILE__, __LINE__, _flag); exit(EXIT_FAILURE); } } while (0)
 
 /* ─── UserData ───────────────────────────────────────────────────── */
-/* Layout-critical first 16 bytes (pd, demag, d_hdmag) and offsets up
- * through nzz0 (offset 64) MUST match precond.cu / jtv.cu mirrors.
- * The new fields (d_w, d_y_eff, h_w) sit AFTER nzz0 and are invisible
- * to the precond/jtv casts, so no header churn there. */
+/* First 72 bytes (pd, demag, d_hdmag, ints, doubles) MUST match the
+ * mirrors in precond.cu / jtv.cu byte-for-byte.  All extension fields
+ * sit AFTER nzz0 and are invisible to those casts. */
 typedef struct {
-  PrecondData  *pd;              /* offset 0  */
-  DemagData    *demag;           /* offset 8  */
-  sunrealtype  *d_hdmag;         /* offset 16 */
-  int nx;                        /* offset 24 */
-  int ny;                        /* offset 28 */
-  int ng;                        /* offset 32 */
-  int ncell;                     /* offset 36 */
-  int neq;                       /* offset 40 */
-  /* 4 bytes pad before doubles */
-  double nxx0;                   /* offset 48 */
-  double nyy0;                   /* offset 56 */
-  double nzz0;                   /* offset 64 */
-  /* === extensions (after the precond/jtv mirrors) === */
-  sunrealtype  *d_w;             /* per-cell soft weight, device */
-  sunrealtype  *d_y_eff;         /* scratch w·y, device, 3*ncell  */
-  double       *h_w;             /* host copy of weight (for I/O) */
+  PrecondData  *pd;          /* 0  */
+  DemagData    *demag;       /* 8  */
+  sunrealtype  *d_hdmag;     /* 16 */
+  int nx;                    /* 24 */
+  int ny;                    /* 28 */
+  int ng;                    /* 32 */
+  int ncell;                 /* 36 */
+  int neq;                   /* 40 */
+  /* 4-byte pad */
+  double nxx0;               /* 48 */
+  double nyy0;               /* 56 */
+  double nzz0;               /* 64 */
+  /* === extensions (invisible to precond/jtv mirrors) === */
+  sunrealtype  *d_w;         /* per-cell soft weight */
+  sunrealtype  *d_y_eff;     /* scratch w·y, 3*ncell */
+  sunrealtype  *d_msk;       /* per-cell easy axis, SoA 3*ncell */
+  double       *h_w;
+  double       *h_msk;       /* host SoA copy */
+  int          *h_grain_id;  /* host: which grain each cell belongs to */
+  int           num_dead;
 } UserData;
 
 /* ─── SoA indexing helpers ───────────────────────────────────────── */
@@ -224,99 +187,168 @@ __host__ __device__ static inline int wrap_y(int y, int ny) {
   return (y < 0) ? (y + ny) : ((y >= ny) ? (y - ny) : y);
 }
 
-/* ─── Hole geometry (host-side) ──────────────────────────────────── */
+/* ─── Polycrystal: host-side generation ──────────────────────────── */
 typedef struct {
-  double cx, cy;       /* center in cell coords */
-  double rx, ry;       /* semi-axes in cells    */
-  double cos_t, sin_t; /* rotation              */
-} HoleSpec;
+  double sx, sy;          /* seed center (cell coords) */
+  double ax, ay, az;      /* easy axis (unit vector)   */
+  int    dead;            /* 1 → grain becomes hole    */
+} GrainSpec;
 
-static HoleSpec g_holes[N_HOLES];
+static GrainSpec g_grains[NUM_GRAINS];
 
-static double rand_unit(void) {
-  return (double)rand() / (double)RAND_MAX;
-}
+static double rand_unit(void) { return (double)rand() / (double)RAND_MAX; }
 
-static void generate_holes(int ng, int ny) {
+static void generate_grains(int ng, int ny) {
   srand((unsigned)HOLE_SEED);
-  const double dx = (double)ng / (double)N_HOLES_X;
-  const double dy = (double)ny / (double)N_HOLES_Y;
-  const double mean_super = 0.5 * (dx + dy);
+
+  /* Stratified-jitter seed placement → no clustering, still random-feel. */
+  int gx = (int)ceil(sqrt((double)NUM_GRAINS * (double)ng / (double)ny));
+  if (gx < 1) gx = 1;
+  int gy = (NUM_GRAINS + gx - 1) / gx;
+  const double dxs = (double)ng / (double)gx;
+  const double dys = (double)ny / (double)gy;
+
   int idx = 0;
-  for (int j = 0; j < N_HOLES_Y; j++) {
-    for (int i = 0; i < N_HOLES_X; i++) {
-      const double margin = (1.0 - HOLE_JITTER) * 0.5;
-      const double cx = ((double)i + margin + HOLE_JITTER * rand_unit()) * dx;
-      const double cy = ((double)j + margin + HOLE_JITTER * rand_unit()) * dy;
-      const double base = HOLE_BASE_FRAC + HOLE_GROWTH_FRAC * rand_unit();
-      const double mean_r = base * mean_super;
-      const double aspect = HOLE_ASPECT_MIN
-        + (HOLE_ASPECT_MAX - HOLE_ASPECT_MIN) * rand_unit();
-      const double r1 = mean_r * sqrt(aspect);
-      const double r2 = mean_r / sqrt(aspect);
-      const double theta = M_PI * rand_unit();
-      g_holes[idx].cx = cx;
-      g_holes[idx].cy = cy;
-      g_holes[idx].rx = r1;
-      g_holes[idx].ry = r2;
-      g_holes[idx].cos_t = cos(theta);
-      g_holes[idx].sin_t = sin(theta);
+  for (int j = 0; j < gy && idx < NUM_GRAINS; j++) {
+    for (int i = 0; i < gx && idx < NUM_GRAINS; i++) {
+      g_grains[idx].sx = ((double)i + 0.15 + 0.7 * rand_unit()) * dxs;
+      g_grains[idx].sy = ((double)j + 0.15 + 0.7 * rand_unit()) * dys;
+      while (g_grains[idx].sx <  0.0)         g_grains[idx].sx += (double)ng;
+      while (g_grains[idx].sx >= (double)ng)  g_grains[idx].sx -= (double)ng;
+      while (g_grains[idx].sy <  0.0)         g_grains[idx].sy += (double)ny;
+      while (g_grains[idx].sy >= (double)ny)  g_grains[idx].sy -= (double)ny;
       idx++;
     }
   }
+  while (idx < NUM_GRAINS) {
+    g_grains[idx].sx = rand_unit() * (double)ng;
+    g_grains[idx].sy = rand_unit() * (double)ny;
+    idx++;
+  }
+
+  /* Per-grain random easy axis (uniform on unit sphere) and dead flag. */
+  for (int g = 0; g < NUM_GRAINS; g++) {
+    const double z   = 2.0 * rand_unit() - 1.0;
+    const double phi = 2.0 * M_PI * rand_unit();
+    const double rxy = sqrt(fmax(0.0, 1.0 - z*z));
+    g_grains[g].ax = rxy * cos(phi);
+    g_grains[g].ay = rxy * sin(phi);
+    g_grains[g].az = z;
+    g_grains[g].dead = (rand_unit() < (double)DEAD_GRAIN_FRAC) ? 1 : 0;
+  }
 }
 
-/* Signed distance to the union of 16 holes + their 8 periodic copies.
- * Positive outside all holes, negative inside any. */
-static double sdf_at(double x, double y, int ng, int ny) {
-  double best = 1.0e30;
-  for (int dy_p = -1; dy_p <= 1; dy_p++) {
-    for (int dx_p = -1; dx_p <= 1; dx_p++) {
-      for (int h = 0; h < N_HOLES; h++) {
-        const double cx = g_holes[h].cx + (double)dx_p * (double)ng;
-        const double cy = g_holes[h].cy + (double)dy_p * (double)ny;
-        const double rx = x - cx;
-        const double ry = y - cy;
-        const double lx =  rx * g_holes[h].cos_t + ry * g_holes[h].sin_t;
-        const double ly = -rx * g_holes[h].sin_t + ry * g_holes[h].cos_t;
-        const double a = g_holes[h].rx;
-        const double b = g_holes[h].ry;
-        const double rnorm = sqrt((lx/a)*(lx/a) + (ly/b)*(ly/b));
-        /* convert normalized ellipse coordinate to physical-ish distance
-         * by multiplying by min semi-axis (good enough for soft tanh). */
-        const double sdf_h = (rnorm - 1.0) * fmin(a, b);
-        if (sdf_h < best) best = sdf_h;
+/* Nearest grain (with periodic 3×3 replication). */
+static int nearest_grain(double x, double y, int ng, int ny) {
+  int best = 0;
+  double best_d2 = 1.0e30;
+  for (int g = 0; g < NUM_GRAINS; g++) {
+    for (int dyp = -1; dyp <= 1; dyp++) {
+      for (int dxp = -1; dxp <= 1; dxp++) {
+        const double sx = g_grains[g].sx + (double)dxp * (double)ng;
+        const double sy = g_grains[g].sy + (double)dyp * (double)ny;
+        const double dx = x - sx, dy = y - sy;
+        const double d2 = dx*dx + dy*dy;
+        if (d2 < best_d2) { best_d2 = d2; best = g; }
       }
     }
   }
   return best;
 }
 
-static void build_weight(int ng, int ny, double *h_w) {
+/* Build grain_id, soft weight w, and per-cell easy-axis msk in one go. */
+static void build_polycrystal(int ng, int ny, UserData *udata) {
+  const int ncell = ng * ny;
+  generate_grains(ng, ny);
+
+  /* Pass 1: assign grain to every cell. */
   for (int j = 0; j < ny; j++) {
     for (int i = 0; i < ng; i++) {
-      const double sdf = sdf_at((double)i + 0.5, (double)j + 0.5, ng, ny);
-      double w = 0.5 * (1.0 + tanh(sdf / (double)MASK_EPS_CELLS));
-      if (w < 1.0e-3) w = 0.0;
-      if (w > 1.0 - 1.0e-3) w = 1.0;
-      h_w[j * ng + i] = w;
+      udata->h_grain_id[j*ng + i] =
+        nearest_grain((double)i + 0.5, (double)j + 0.5, ng, ny);
     }
+  }
+
+  /* Pass 2: distance to nearest dead-grain cell (PBC, brute-force). */
+  int n_dead_grains = 0;
+  for (int g = 0; g < NUM_GRAINS; g++) if (g_grains[g].dead) n_dead_grains++;
+  udata->num_dead = n_dead_grains;
+
+  int n_hole_cells = 0;
+  for (int k = 0; k < ncell; k++)
+    if (g_grains[udata->h_grain_id[k]].dead) n_hole_cells++;
+
+  if (n_hole_cells == 0) {
+    for (int k = 0; k < ncell; k++) udata->h_w[k] = 1.0;
+  } else {
+    int *hx = (int*)malloc((size_t)n_hole_cells * sizeof(int));
+    int *hy = (int*)malloc((size_t)n_hole_cells * sizeof(int));
+    if (!hx || !hy) { fprintf(stderr, "hx/hy alloc failed\n"); exit(1); }
+    int idx = 0;
+    for (int j = 0; j < ny; j++)
+      for (int i = 0; i < ng; i++)
+        if (g_grains[udata->h_grain_id[j*ng+i]].dead)
+          { hx[idx]=i; hy[idx]=j; idx++; }
+
+    for (int j = 0; j < ny; j++) {
+      for (int i = 0; i < ng; i++) {
+        const int cell = j * ng + i;
+        if (g_grains[udata->h_grain_id[cell]].dead) {
+          udata->h_w[cell] = 0.0;
+          continue;
+        }
+        double d2_min = 1.0e30;
+        for (int k = 0; k < n_hole_cells; k++) {
+          int ddx = i - hx[k];
+          int ddy = j - hy[k];
+          if (ddx >  ng/2) ddx -= ng;
+          if (ddx < -ng/2) ddx += ng;
+          if (ddy >  ny/2) ddy -= ny;
+          if (ddy < -ny/2) ddy += ny;
+          const double d2 = (double)(ddx*ddx + ddy*ddy);
+          if (d2 < d2_min) d2_min = d2;
+        }
+        const double d = sqrt(d2_min) - 0.5;   /* sub-cell offset */
+        double w = 0.5 * (1.0 + tanh(d / (double)MASK_EPS_CELLS));
+        if (w < 1.0e-3)        w = 0.0;
+        if (w > 1.0 - 1.0e-3)  w = 1.0;
+        udata->h_w[cell] = w;
+      }
+    }
+    free(hx); free(hy);
+  }
+
+  /* Pass 3: per-cell easy axis (SoA — same layout as y). */
+  for (int k = 0; k < ncell; k++) {
+    const int g = udata->h_grain_id[k];
+    udata->h_msk[idx_mx(k, ncell)] = g_grains[g].ax;
+    udata->h_msk[idx_my(k, ncell)] = g_grains[g].ay;
+    udata->h_msk[idx_mz(k, ncell)] = g_grains[g].az;
   }
 }
 
-static void write_mask_file(int ng, int ny, const double *h_w) {
+/* ─── Output helpers ─────────────────────────────────────────────── */
+static void write_aux_files(int ng, int ny,
+                            const double *h_w, const int *h_grain_id) {
   FILE *fm = fopen("mask.txt", "w");
-  if (!fm) return;
-  fprintf(fm, "%d %d\n", ng, ny);
-  for (int j = 0; j < ny; j++) {
-    for (int i = 0; i < ng; i++) {
-      fprintf(fm, "%f\n", h_w[j*ng + i]);
-    }
+  if (fm) {
+    fprintf(fm, "%d %d\n", ng, ny);
+    for (int j = 0; j < ny; j++)
+      for (int i = 0; i < ng; i++)
+        fprintf(fm, "%f\n", h_w[j*ng + i]);
+    fclose(fm);
   }
-  fclose(fm);
+  FILE *fg = fopen("grain_id.txt", "w");
+  if (fg) {
+    fprintf(fg, "%d %d\n", ng, ny);
+    for (int j = 0; j < ny; j++)
+      for (int i = 0; i < ng; i++)
+        fprintf(fg, "%d\n", h_grain_id[j*ng + i]);
+    fclose(fg);
+  }
 }
 
-/* ─── Kernel: y_eff = w · y  (one pass, coalesced) ───────────────── */
+/* ─── y_eff = w · y  (one pass, coalesced) ───────────────────────── */
 __global__ static void apply_weight_kernel(
     const sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ w,
@@ -326,12 +358,12 @@ __global__ static void apply_weight_kernel(
   const int cell = blockIdx.x * blockDim.x + threadIdx.x;
   if (cell >= ncell) return;
   const sunrealtype ww = w[cell];
-  y_eff[cell]              = ww * y[cell];
-  y_eff[ncell + cell]      = ww * y[ncell + cell];
-  y_eff[2 * ncell + cell]  = ww * y[2 * ncell + cell];
+  y_eff[cell]             = ww * y[cell];
+  y_eff[ncell + cell]     = ww * y[ncell + cell];
+  y_eff[2 * ncell + cell] = ww * y[2 * ncell + cell];
 }
 
-/* ─── Kernel: in-place |m|=1 normalization on active cells only ──── */
+/* ─── |m|=1 normalization on cells outside deep holes ───────────── */
 __global__ static void normalize_m_kernel_w(
     sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ w,
@@ -339,43 +371,25 @@ __global__ static void normalize_m_kernel_w(
 {
   const int cell = blockIdx.x * blockDim.x + threadIdx.x;
   if (cell >= ncell) return;
-  if (w[cell] < SUN_RCONST(1.0e-3)) return;   /* skip deep-hole cells */
+  if (w[cell] < SUN_RCONST(1.0e-3)) return;
 
   const int mx = idx_mx(cell, ncell);
   const int my = idx_my(cell, ncell);
   const int mz = idx_mz(cell, ncell);
-
-  const sunrealtype m1 = y[mx];
-  const sunrealtype m2 = y[my];
-  const sunrealtype m3 = y[mz];
+  const sunrealtype m1 = y[mx], m2 = y[my], m3 = y[mz];
   const sunrealtype ymp = sqrt(m1*m1 + m2*m2 + m3*m3);
   if (ymp > SUN_RCONST(1.0e-30)) {
     const sunrealtype inv = SUN_RCONST(1.0) / ymp;
-    y[mx] = m1 * inv;
-    y[my] = m2 * inv;
-    y[mz] = m3 * inv;
+    y[mx] = m1 * inv; y[my] = m2 * inv; y[mz] = m3 * inv;
   }
 }
 
-/* ─── Unified RHS kernel — soft-irregular dense, branch-free ─────── */
-/*
- * Reads:
- *   y[self]                 — unit vector (after normalize)
- *   y_eff[neighbors]        — w·n̂ at the 4 neighbors, used for
- *                             exchange and DMI sums
- *   w[self]                 — for final yd scaling
- *   h_dmag[self]            — demag field from FFT( w·n̂ )
- *
- * Writes:
- *   yd = w[self] · LLG(n̂_self, h_eff)
- *
- * No branch on hole/active.  Cells with w_self ≈ 0 produce yd ≈ 0
- * automatically; cells with w_self ∈ (0,1) evolve at fractional rate.
- */
-__global__ static void f_kernel_unified_irregular_soft(
+/* ─── Unified RHS: per-cell easy axis + weighted neighbors ──────── */
+__global__ static void f_kernel_unified_polycrystal(
     const sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ y_eff,
     const sunrealtype* __restrict__ w,
+    const sunrealtype* __restrict__ msk,    /* SoA, same layout as y */
     const sunrealtype* __restrict__ h_dmag,
     sunrealtype*       __restrict__ yd,
     int ng, int ny, int ncell)
@@ -389,22 +403,27 @@ __global__ static void f_kernel_unified_irregular_soft(
   const int my_i = idx_my(cell, ncell);
   const int mz_i = idx_mz(cell, ncell);
 
-  const int xl   = wrap_x(gx - 1, ng);
-  const int xr   = wrap_x(gx + 1, ng);
-  const int yu   = wrap_y(gy - 1, ny);
-  const int ydn  = wrap_y(gy + 1, ny);
-
+  const int xl  = wrap_x(gx - 1, ng);
+  const int xr  = wrap_x(gx + 1, ng);
+  const int yu  = wrap_y(gy - 1, ny);
+  const int ydn = wrap_y(gy + 1, ny);
   const int lc = gy  * ng + xl;
   const int rc = gy  * ng + xr;
   const int uc = yu  * ng + gx;
   const int dc = ydn * ng + gx;
 
+  /* self */
   const sunrealtype m1 = y[mx_i];
   const sunrealtype m2 = y[my_i];
   const sunrealtype m3 = y[mz_i];
   const sunrealtype w_self = w[cell];
 
-  /* Effective neighbor m's (already w·n̂) — coalesced reads. */
+  /* per-cell easy axis (3 coalesced reads, same layout as y) */
+  const sunrealtype mskx = msk[mx_i];
+  const sunrealtype msky = msk[my_i];
+  const sunrealtype mskz = msk[mz_i];
+
+  /* weighted neighbors (already w·n̂) */
   const sunrealtype lx1 = y_eff[idx_mx(lc, ncell)];
   const sunrealtype lx2 = y_eff[idx_my(lc, ncell)];
   const sunrealtype lx3 = y_eff[idx_mz(lc, ncell)];
@@ -418,33 +437,34 @@ __global__ static void f_kernel_unified_irregular_soft(
   const sunrealtype dx2 = y_eff[idx_my(dc, ncell)];
   const sunrealtype dx3 = y_eff[idx_mz(dc, ncell)];
 
-  /* h_eff = exchange(weighted) + anisotropy(self) + DMI(weighted x-nbrs) + demag */
+  /* proper uniaxial anisotropy: h_α += msk_α · (chk · m·msk + cha) */
+  const sunrealtype mdotmsk     = m1*mskx + m2*msky + m3*mskz;
+  const sunrealtype aniso_factor = c_chk * mdotmsk + c_cha;
+
   const sunrealtype h1 =
       c_che * (lx1 + rx1 + ux1 + dx1)
-    + c_msk[0] * (c_chk * m1 + c_cha)
+    + mskx * aniso_factor
     + c_chb * c_nsk[0] * (lx1 + rx1)
     + h_dmag[mx_i];
   const sunrealtype h2 =
       c_che * (lx2 + rx2 + ux2 + dx2)
-    + c_msk[1] * (c_chk * m1 + c_cha)
+    + msky * aniso_factor
     + c_chb * c_nsk[1] * (lx2 + rx2)
     + h_dmag[my_i];
   const sunrealtype h3 =
       c_che * (lx3 + rx3 + ux3 + dx3)
-    + c_msk[2] * (c_chk * m1 + c_cha)
+    + mskz * aniso_factor
     + c_chb * c_nsk[2] * (lx3 + rx3)
     + h_dmag[mz_i];
 
-  const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
+  const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
 
-  /* Standard LLG for n̂ (|n̂|=1 enforced by normalize_m_kernel_w),
-   * scaled by w_self for soft boundary dynamics. */
-  yd[mx_i] = w_self * (c_chg * (m3 * h2 - m2 * h3) + c_alpha * (h1 - mh * m1));
-  yd[my_i] = w_self * (c_chg * (m1 * h3 - m3 * h1) + c_alpha * (h2 - mh * m2));
-  yd[mz_i] = w_self * (c_chg * (m2 * h1 - m1 * h2) + c_alpha * (h3 - mh * m3));
+  yd[mx_i] = w_self * (c_chg * (m3*h2 - m2*h3) + c_alpha * (h1 - mh*m1));
+  yd[my_i] = w_self * (c_chg * (m1*h3 - m3*h1) + c_alpha * (h2 - mh*m2));
+  yd[mz_i] = w_self * (c_chg * (m2*h1 - m1*h2) + c_alpha * (h3 - mh*m3));
 }
 
-/* ─── RHS wrapper for CVODE ──────────────────────────────────────── */
+/* ─── RHS wrapper ────────────────────────────────────────────────── */
 static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   (void)t;
   UserData* udata = (UserData*)user_data;
@@ -452,50 +472,43 @@ static int f(sunrealtype t, N_Vector y, N_Vector ydot, void* user_data) {
   sunrealtype* ydotdata = N_VGetDeviceArrayPointer_Cuda(ydot);
 
   if (BLOCK_X * BLOCK_Y > 1024) {
-    fprintf(stderr, "Invalid block size: BLOCK_X * BLOCK_Y = %d > 1024\n",
-            BLOCK_X * BLOCK_Y);
+    fprintf(stderr, "Invalid block size: %d > 1024\n", BLOCK_X * BLOCK_Y);
     return -1;
   }
 
-  /* Step 0: |n̂|=1 in active cells (skip deep-hole). */
+  /* 0) |n̂|=1 outside deep holes */
   {
     const int nb = 256;
     const int gd = (udata->ncell + nb - 1) / nb;
     normalize_m_kernel_w<<<gd, nb>>>(ydata, udata->d_w, udata->ncell);
   }
-
-  /* Step 1: y_eff = w · y  (used by both demag gather and unified RHS). */
+  /* 1) y_eff = w · y */
   {
     const int nb = 256;
     const int gd = (udata->ncell + nb - 1) / nb;
     apply_weight_kernel<<<gd, nb>>>(ydata, udata->d_w, udata->d_y_eff,
                                     udata->ncell);
   }
-
-  /* Step 2: demag — feed Demag_Apply the windowed magnetization. */
+  /* 2) demag on windowed magnetization */
   if (udata->demag && DEMAG_STRENGTH > 0.0) {
-    Demag_Apply(udata->demag,
-                (const double*)udata->d_y_eff,
-                (double*)udata->d_hdmag);
+    Demag_Apply(udata->demag, (const double*)udata->d_y_eff,
+                              (double*)udata->d_hdmag);
   } else {
     cudaMemsetAsync(udata->d_hdmag, 0,
                     (size_t)3 * udata->ncell * sizeof(sunrealtype), 0);
   }
-
-  /* Step 3: unified RHS — fuse exchange + aniso + DMI + demag + LLG + w */
+  /* 3) unified RHS */
   dim3 block(BLOCK_X, BLOCK_Y);
-  dim3 grid((udata->ng + block.x - 1) / block.x,
-            (udata->ny + block.y - 1) / block.y);
-
-  f_kernel_unified_irregular_soft<<<grid, block>>>(
-      ydata, udata->d_y_eff, udata->d_w,
+  dim3 grid((udata->ng + block.x - 1)/block.x,
+            (udata->ny + block.y - 1)/block.y);
+  f_kernel_unified_polycrystal<<<grid, block>>>(
+      ydata, udata->d_y_eff, udata->d_w, udata->d_msk,
       udata->d_hdmag, ydotdata,
       udata->ng, udata->ny, udata->ncell);
 
   cudaError_t cuerr = cudaPeekAtLastError();
   if (cuerr != cudaSuccess) {
-    fprintf(stderr, ">>> ERROR in f: kernel launch failed: %s\n",
-            cudaGetErrorString(cuerr));
+    fprintf(stderr, ">>> ERROR in f: %s\n", cudaGetErrorString(cuerr));
     return -1;
   }
   return 0;
@@ -523,31 +536,26 @@ static void PrintFinalStats(void* cvode_mem, SUNLinearSolver LS) {
 }
 
 #if ENABLE_OUTPUT
-/* WriteFrame: outputs m·w_soft so quiver naturally fades to 0 in holes,
- * giving the mesh-like "no obvious grid" visual without any matlab edits. */
-static void WriteFrame(FILE* fp,
-                       sunrealtype t,
+/* WriteFrame outputs m·w → arrows fade smoothly in holes (no grid/ghost). */
+static void WriteFrame(FILE* fp, sunrealtype t,
                        int nx, int ny, int ng, int ncell,
-                       N_Vector y,
-                       const double *h_w)
+                       N_Vector y, const double *h_w)
 {
   N_VCopyFromDevice_Cuda(y);
   sunrealtype* ydata = N_VGetHostArrayPointer_Cuda(y);
-
   fprintf(fp, "%f %d %d\n", (double)t, nx, ny);
-  for (int jp = 0; jp < ny; jp++) {
-    for (int ip = 0; ip < ng; ip++) {
-      const int cell_out = jp * ng + ip;
-      const double w = h_w[cell_out];
+  for (int j = 0; j < ny; j++) {
+    for (int i = 0; i < ng; i++) {
+      const int c = j * ng + i;
+      const double w = h_w[c];
       fprintf(fp, "%f %f %f\n",
-              w * (double)ydata[idx_mx(cell_out, ncell)],
-              w * (double)ydata[idx_my(cell_out, ncell)],
-              w * (double)ydata[idx_mz(cell_out, ncell)]);
+              w * (double)ydata[idx_mx(c, ncell)],
+              w * (double)ydata[idx_my(c, ncell)],
+              w * (double)ydata[idx_mz(c, ncell)]);
     }
   }
   fprintf(fp, "\n");
 }
-
 static int ShouldWriteFrame(long int iout, sunrealtype t) {
   if (t <= SUN_RCONST(EARLY_SAVE_UNTIL)) return (iout % EARLY_SAVE_EVERY) == 0;
   return (iout % LATE_SAVE_EVERY) == 0;
@@ -578,7 +586,6 @@ int main(int argc, char* argv[]) {
 
   const int nx = GRID_NX;
   const int ny = GRID_NY;
-
   if (nx % GROUPSIZE != 0) {
     fprintf(stderr, "nx must be a multiple of GROUPSIZE=%d\n", GROUPSIZE);
     return 1;
@@ -595,65 +602,67 @@ int main(int argc, char* argv[]) {
   FILE* fp = NULL; (void)fp;
 #endif
 
-  const int q1 = (int)(STRIPE_LEFT_FRAC  * (double)ng + 0.5);
-  const int q3 = (int)(STRIPE_RIGHT_FRAC * (double)ng + 0.5);
-
   udata.nx = nx; udata.ny = ny; udata.ng = ng;
   udata.ncell = ncell; udata.neq = neq;
 
   CHECK_SUNDIALS(SUNContext_Create(SUN_COMM_NULL, &sunctx));
 
-  /* ─── Build geometry: 16 holes + soft weight on host ──────────── */
-  udata.h_w = (double*)malloc((size_t)ncell * sizeof(double));
-  if (!udata.h_w) { fprintf(stderr, "h_w alloc failed\n"); return 1; }
-  generate_holes(ng, ny);
-  build_weight(ng, ny, udata.h_w);
+  /* ── Polycrystal: grain ids, soft weight, per-cell easy axis ──── */
+  udata.h_w        = (double*)malloc((size_t)ncell * sizeof(double));
+  udata.h_msk      = (double*)malloc((size_t)3 * ncell * sizeof(double));
+  udata.h_grain_id = (int*)   malloc((size_t)ncell * sizeof(int));
+  if (!udata.h_w || !udata.h_msk || !udata.h_grain_id) {
+    fprintf(stderr, "host alloc failed\n"); return 1;
+  }
+  build_polycrystal(ng, ny, &udata);
+  write_aux_files(ng, ny, udata.h_w, udata.h_grain_id);
 
-  /* Stats for the log line */
   {
     double w_sum = 0.0;
-    int    n_full = 0, n_hole = 0, n_boundary = 0;
+    int n_full = 0, n_hole = 0, n_boundary = 0;
     for (int k = 0; k < ncell; k++) {
       const double w = udata.h_w[k];
       w_sum += w;
-      if (w <= 1.0e-3)         n_hole++;
-      else if (w >= 1.0-1.0e-3) n_full++;
-      else                       n_boundary++;
+      if (w <= 1.0e-3)            n_hole++;
+      else if (w >= 1.0 - 1.0e-3) n_full++;
+      else                         n_boundary++;
     }
-    printf("[Geometry] %d holes (%dx%d stratified-jitter), seed=%d, eps=%.2f cells\n",
-           N_HOLES, N_HOLES_X, N_HOLES_Y, (int)HOLE_SEED, (double)MASK_EPS_CELLS);
-    printf("[Geometry] cells: %d total, %d full (w=1), %d boundary (0<w<1), %d deep-hole (w=0)\n",
+    printf("[Polycrystal] %d grains  (%d dead → polygonal holes), seed=%d\n",
+           NUM_GRAINS, udata.num_dead, (int)HOLE_SEED);
+    printf("[Polycrystal] cells: %d total, %d full, %d soft-boundary, %d deep-hole\n",
            ncell, n_full, n_boundary, n_hole);
-    printf("[Geometry] effective active fraction (sum w / N) = %.4f\n",
+    printf("[Polycrystal] effective active fraction (sum w / N) = %.4f\n",
            w_sum / (double)ncell);
+    printf("[Polycrystal] eps=%.2f cells, output: mask.txt grain_id.txt\n",
+           (double)MASK_EPS_CELLS);
   }
 
-  write_mask_file(ng, ny, udata.h_w);
-
-  /* upload weight + alloc y_eff scratch */
-  CHECK_CUDA(cudaMalloc((void**)&udata.d_w, (size_t)ncell * sizeof(sunrealtype)));
-  {
-    /* h_w is double; sunrealtype is also double — direct copy. */
-    CHECK_CUDA(cudaMemcpy(udata.d_w, udata.h_w,
-                          (size_t)ncell * sizeof(sunrealtype),
-                          cudaMemcpyHostToDevice));
-  }
+  /* upload weight + msk + alloc y_eff scratch */
+  CHECK_CUDA(cudaMalloc((void**)&udata.d_w,
+                        (size_t)ncell * sizeof(sunrealtype)));
+  CHECK_CUDA(cudaMemcpy(udata.d_w, udata.h_w,
+                        (size_t)ncell * sizeof(sunrealtype),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMalloc((void**)&udata.d_msk,
+                        (size_t)3 * ncell * sizeof(sunrealtype)));
+  CHECK_CUDA(cudaMemcpy(udata.d_msk, udata.h_msk,
+                        (size_t)3 * ncell * sizeof(sunrealtype),
+                        cudaMemcpyHostToDevice));
   CHECK_CUDA(cudaMalloc((void**)&udata.d_y_eff,
                         (size_t)3 * ncell * sizeof(sunrealtype)));
   CHECK_CUDA(cudaMemset(udata.d_y_eff, 0,
                         (size_t)3 * ncell * sizeof(sunrealtype)));
 
-  /* 3x3 block-Jacobi preconditioner (unchanged) */
+  /* preconditioner — same as before; precond's anisotropy assumption is
+   * approximate for varying easy axis but GMRES tolerates it. */
   udata.pd = Precond_Create(ng, ny, ncell);
   if (!udata.pd) { fprintf(stderr, "Precond_Create failed\n"); return 1; }
 
-  /* d_hdmag always allocated (zero-fill if demag off) */
   CHECK_CUDA(cudaMalloc((void**)&udata.d_hdmag,
                         (size_t)3 * ncell * sizeof(sunrealtype)));
   CHECK_CUDA(cudaMemset(udata.d_hdmag, 0,
                         (size_t)3 * ncell * sizeof(sunrealtype)));
 
-  /* FFT demag init (Newell tensor f̂) */
   const double dstr = (double)DEMAG_STRENGTH;
   const double dthk = (double)DEMAG_THICK;
   if (dstr > 0.0) {
@@ -662,14 +671,13 @@ int main(int argc, char* argv[]) {
       fprintf(stderr, "Demag_Init failed\n");
       Precond_Destroy(udata.pd);
       cudaFree(udata.d_hdmag);
-      cudaFree(udata.d_w);
-      cudaFree(udata.d_y_eff);
+      cudaFree(udata.d_w); cudaFree(udata.d_y_eff); cudaFree(udata.d_msk);
       return 1;
     }
     Demag_GetSelfCoupling(udata.demag,
                           &udata.nxx0, &udata.nyy0, &udata.nzz0);
-    printf("[main] Demag self-coupling (strength-scaled): "
-           "nxx0=%.4e  nyy0=%.4e  nzz0=%.4e\n",
+    printf("[main] Demag self-coupling (scaled): "
+           "nxx0=%.4e nyy0=%.4e nzz0=%.4e\n",
            udata.nxx0, udata.nyy0, udata.nzz0);
   }
 
@@ -681,35 +689,30 @@ int main(int argc, char* argv[]) {
   ydata       = N_VGetHostArrayPointer_Cuda(y);
   abstol_data = N_VGetHostArrayPointer_Cuda(abstol);
 
-  /* ─── Initial condition: head-on stripes, masked by w ─────────── */
+  /* ── IC: each cell aligned with its grain's easy axis + small noise ── */
   {
     const double eps = (double)INIT_RANDOM_EPS;
     srand((unsigned)INIT_RANDOM_SEED);
-    for (int j = 0; j < ny; j++) {
-      for (int i = 0; i < ng; i++) {
-        const int cell = j * ng + i;
-        const int mx_i = idx_mx(cell, ncell);
-        const int my_i = idx_my(cell, ncell);
-        const int mz_i = idx_mz(cell, ncell);
-
-        if (udata.h_w[cell] > 1.0e-3) {
-          double mx0 = (i >= q1 && i < q3) ? 1.0 : -1.0;
-          double my0 = eps * (2.0 * (double)rand()/(double)RAND_MAX - 1.0);
-          double mz0 = eps * (2.0 * (double)rand()/(double)RAND_MAX - 1.0);
-          const double n = sqrt(mx0*mx0 + my0*my0 + mz0*mz0);
-          mx0 /= n; my0 /= n; mz0 /= n;
-          ydata[mx_i] = SUN_RCONST(mx0);
-          ydata[my_i] = SUN_RCONST(my0);
-          ydata[mz_i] = SUN_RCONST(mz0);
-        } else {
-          ydata[mx_i] = ZERO;
-          ydata[my_i] = ZERO;
-          ydata[mz_i] = ZERO;
-        }
-        abstol_data[mx_i] = ATOL1;
-        abstol_data[my_i] = ATOL2;
-        abstol_data[mz_i] = ATOL3;
+    for (int k = 0; k < ncell; k++) {
+      const int mx_i = idx_mx(k, ncell);
+      const int my_i = idx_my(k, ncell);
+      const int mz_i = idx_mz(k, ncell);
+      if (udata.h_w[k] > 1.0e-3) {
+        double mx0 = udata.h_msk[mx_i] + eps * (2.0*rand_unit() - 1.0);
+        double my0 = udata.h_msk[my_i] + eps * (2.0*rand_unit() - 1.0);
+        double mz0 = udata.h_msk[mz_i] + eps * (2.0*rand_unit() - 1.0);
+        const double n = sqrt(mx0*mx0 + my0*my0 + mz0*mz0);
+        if (n > 1.0e-12) { mx0/=n; my0/=n; mz0/=n; }
+        else { mx0 = 1.0; my0 = 0.0; mz0 = 0.0; }
+        ydata[mx_i] = SUN_RCONST(mx0);
+        ydata[my_i] = SUN_RCONST(my0);
+        ydata[mz_i] = SUN_RCONST(mz0);
+      } else {
+        ydata[mx_i] = ZERO; ydata[my_i] = ZERO; ydata[mz_i] = ZERO;
       }
+      abstol_data[mx_i] = ATOL1;
+      abstol_data[my_i] = ATOL2;
+      abstol_data[mz_i] = ATOL3;
     }
   }
   N_VCopyToDevice_Cuda(y);
@@ -740,26 +743,18 @@ int main(int argc, char* argv[]) {
     CHECK_SUNDIALS(SUNLinSol_SPGMRSetGSType(LS, SUN_CLASSICAL_GS));
     printf("GS type: Classical (overhead-limited, neq=%d)\n", neq);
   } else {
-    printf("GS type: Modified  (bandwidth-limited, neq=%d)\n", neq);
+    printf("GS type: Modified (bandwidth-limited, neq=%d)\n", neq);
   }
   CHECK_SUNDIALS(CVodeSetMaxOrd(cvode_mem, MAX_BDF_ORDER));
 
-  printf("\n2D irregular antidot mesh + soft-edge mask + FFT demag\n");
-  printf("LLG form: standard, |n̂|=1 enforced by normalize-in-f, yd scaled by w\n\n");
+  printf("\n2D Voronoi polycrystal + dead-grain holes + FFT demag\n");
+  printf("LLG form: standard with per-cell easy axis, |n̂|=1 enforced\n");
   printf("nx=%d  ny=%d  ng=%d  ncell=%d  neq=%d\n", nx, ny, ng, ncell, neq);
-  printf("periodic BC: x and y\n");
-  printf("Init: head-on stripes  q1=%d (x=%.2f*ng)  q3=%d (x=%.2f*ng)\n",
-         q1, (double)STRIPE_LEFT_FRAC, q3, (double)STRIPE_RIGHT_FRAC);
-  printf("DEMAG_STRENGTH=%.4f  DEMAG_THICK=%.4f  (%s)\n",
-         dstr, dthk,
-         dstr > 0.0 ? "h_dmag = IFFT[f_hat * (w·m)_hat]"
-                    : "demag disabled");
-  printf("T_TOTAL=%.2f  RTOL/ATOL=%.1e\n",
-         (double)T_TOTAL, (double)RTOL_VAL);
+  printf("DEMAG_STRENGTH=%.4f  DEMAG_THICK=%.4f  T_TOTAL=%.2f  RTOL=%.1e\n",
+         dstr, dthk, (double)T_TOTAL, (double)RTOL_VAL);
 
   NOUT = (long int)(ttotal / T1 + SUN_RCONST(0.5));
   iout = 0;
-
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
   CHECK_CUDA(cudaEventRecord(start, 0));
@@ -793,10 +788,13 @@ cleanup:
   if (sunctx) SUNContext_Free(&sunctx);
   Precond_Destroy(udata.pd);
   Demag_Destroy(udata.demag);
-  if (udata.d_hdmag) cudaFree(udata.d_hdmag);
-  if (udata.d_w)     cudaFree(udata.d_w);
-  if (udata.d_y_eff) cudaFree(udata.d_y_eff);
-  if (udata.h_w)     free(udata.h_w);
+  if (udata.d_hdmag)    cudaFree(udata.d_hdmag);
+  if (udata.d_w)        cudaFree(udata.d_w);
+  if (udata.d_y_eff)    cudaFree(udata.d_y_eff);
+  if (udata.d_msk)      cudaFree(udata.d_msk);
+  if (udata.h_w)        free(udata.h_w);
+  if (udata.h_msk)      free(udata.h_msk);
+  if (udata.h_grain_id) free(udata.h_grain_id);
   FusedNVec_FreePool();
 #if ENABLE_OUTPUT
   if (fp) fclose(fp);
