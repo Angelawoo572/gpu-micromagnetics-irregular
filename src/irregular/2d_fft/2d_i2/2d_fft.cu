@@ -171,12 +171,10 @@ __constant__ sunrealtype c_msk[3] = {
 __constant__ sunrealtype c_nsk[3] = {
     SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
 
-__constant__ sunrealtype c_chk   = SUN_RCONST(4.0);
+__constant__ sunrealtype c_chk   = SUN_RCONST(1.0);
 __constant__ sunrealtype c_che   = SUN_RCONST(4.0);
 __constant__ sunrealtype c_alpha = SUN_RCONST(0.2);
 __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
-__constant__ sunrealtype c_cha   = SUN_RCONST(0.0);
-__constant__ sunrealtype c_chb   = SUN_RCONST(0.3);
 
 /* ─── Error checking ──────────────────────────────────────────────── */
 #define CHECK_CUDA(call)                                                     \
@@ -346,23 +344,9 @@ __global__ static void f_kernel_unified_soa_periodic(
   const sunrealtype y3D = y[idx_mz(dc, ncell)];
 
   /* Total field.  Anisotropy {1,0,0} → only h1.  DMI {1,0,0} → only h1. */
-  const sunrealtype h1 =
-      c_che * (y1L + y1R + y1U + y1D) +
-      c_msk[0] * (c_chk * m1 + c_cha) +
-      c_chb * c_nsk[0] * (y1L + y1R) +
-      h_dmag[mx];
-
-  const sunrealtype h2 =
-      c_che * (y2L + y2R + y2U + y2D) +
-      c_msk[1] * (c_chk * m2 + c_cha) +
-      c_chb * c_nsk[1] * (y2L + y2R) +
-      h_dmag[my];
-
-  const sunrealtype h3 =
-      c_che * (y3L + y3R + y3U + y3D) +
-      c_msk[2] * (c_chk * m3 + c_cha) +
-      c_chb * c_nsk[2] * (y3L + y3R) +
-      h_dmag[mz];
+  const sunrealtype h1 = c_che * (y1L + y1R + y1U + y1D) + c_msk[0] * c_chk * m1*(m1*m1-m1)+ h_dmag[mx];
+  const sunrealtype h2 = c_che * (y2L + y2R + y2U + y2D) + c_msk[1] * c_chk * m2*(m2*m2-m2)+ h_dmag[my];
+  const sunrealtype h3 = c_che * (y3L + y3R + y3U + y3D) + c_msk[2] * c_chk * m3*(m3*m3-m3)+ h_dmag[mz];
 
   const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
 
@@ -745,6 +729,33 @@ int main(int argc, char* argv[]) {
   printf("GPU simulation took %.3f ms\n", elapsedTime);
 
   PrintFinalStats(cvode_mem, LS);
+  /* ====== FINAL STATE OUTPUT ====== */
+// {
+//   FILE* fp_final = fopen("output.txt", "w");
+//   if (!fp_final) {
+//     fprintf(stderr, "Failed to open output.txt\n");
+//   } else {
+//     N_VCopyFromDevice_Cuda(y);
+//     sunrealtype* yhost = N_VGetHostArrayPointer_Cuda(y);
+
+//     fprintf(fp_final, "%f %d %d\n", (double)t, nx, ny);
+
+//     for (int j = 0; j < ny; j++) {
+//       for (int i = 0; i < ng; i++) {
+//         int cell = j * ng + i;
+
+//         fprintf(fp_final, "%e %e %e\n",
+//           (double)yhost[idx_mx(cell, ncell)],
+//           (double)yhost[idx_my(cell, ncell)],
+//           (double)yhost[idx_mz(cell, ncell)]
+//         );
+//       }
+//     }
+
+//     fclose(fp_final);
+//     printf("[output] final state written to output.txt\n");
+//   }
+// }
 
 cleanup:
   if (LS) SUNLinSolFree(LS);

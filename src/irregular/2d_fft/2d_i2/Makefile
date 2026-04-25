@@ -30,7 +30,7 @@ T_TOTAL  ?= 1000.0
 KRYLOV_DIM ?= 5
 
 # ====== FFT Demagnetization ======
-DEMAG_STRENGTH ?= 5.0
+DEMAG_STRENGTH ?= 4.0
 DEMAG_THICK    ?= 1.0
 
 # ====== Irregular geometry: square interior hole ======
@@ -151,7 +151,7 @@ run-noprint:
 
 run-demag:
 	$(MAKE) clean
-	$(MAKE) DEMAG_STRENGTH=2.0 DEMAG_THICK=1.0
+	$(MAKE) DEMAG_STRENGTH=4.0 DEMAG_THICK=1.0
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
 run-no-demag:
