@@ -85,22 +85,22 @@ __global__ static void jtv_kernel(
   /* DMI is along x: L/R neighbors of mx get coeff (che + chb).
    * Anisotropy is along x: only h1 picks up jc_chk * m1. */
   const sunrealtype h1 =
-    jc_che * (y1L + y1R + y1U + y1D)
-  + jc_chk * m1 * (m1 * m1 - m1);
+      jc_che * (y1L + y1R + y1U + y1D)
+    + jc_chk * m1 * (m1 * m1 - SUN_RCONST(1.0));   // ← 把 -m1 改成 -1.0
 
   const sunrealtype h2 =
       jc_che * (y2L + y2R + y2U + y2D)
-    + jc_chk * m2 * (m2 * m2 - m2);
+    + jc_chk * m2 * (m2 * m2 - SUN_RCONST(1.0));
 
   const sunrealtype h3 =
       jc_che * (y3L + y3R + y3U + y3D)
-    + jc_chk * m3 * (m3 * m3 - m3);
+    + jc_chk * m3 * (m3 * m3 - SUN_RCONST(1.0));
 
   const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
 
-  const sunrealtype k1 = jc_chk * (SUN_RCONST(3.0) * m1 * m1 - SUN_RCONST(2.0) * m1);
-  const sunrealtype k2 = jc_chk * (SUN_RCONST(3.0) * m2 * m2 - SUN_RCONST(2.0) * m2);
-  const sunrealtype k3 = jc_chk * (SUN_RCONST(3.0) * m3 * m3 - SUN_RCONST(2.0) * m3);
+  const sunrealtype k1 = jc_chk * (SUN_RCONST(3.0) * m1 * m1 - SUN_RCONST(1.0));
+  const sunrealtype k2 = jc_chk * (SUN_RCONST(3.0) * m2 * m2 - SUN_RCONST(1.0));
+  const sunrealtype k3 = jc_chk * (SUN_RCONST(3.0) * m3 * m3 - SUN_RCONST(1.0));
 
   const sunrealtype dh1 =
       jc_che * (v1L + v1R + v1U + v1D)

@@ -344,9 +344,9 @@ __global__ static void f_kernel_unified_soa_periodic(
   const sunrealtype y3D = y[idx_mz(dc, ncell)];
 
   /* Total field.  Anisotropy {1,0,0} → only h1.  DMI {1,0,0} → only h1. */
-  const sunrealtype h1 = c_che * (y1L + y1R + y1U + y1D) + c_msk[0] * c_chk * m1*(m1*m1-m1)+ h_dmag[mx];
-  const sunrealtype h2 = c_che * (y2L + y2R + y2U + y2D) + c_msk[1] * c_chk * m2*(m2*m2-m2)+ h_dmag[my];
-  const sunrealtype h3 = c_che * (y3L + y3R + y3U + y3D) + c_msk[2] * c_chk * m3*(m3*m3-m3)+ h_dmag[mz];
+  const sunrealtype h1 = c_che * (y1L + y1R + y1U + y1D) + c_msk[0] * c_chk * m1*(m1*m1-SUN_RCONST(1.0))+ h_dmag[mx];
+  const sunrealtype h2 = c_che * (y2L + y2R + y2U + y2D) + c_msk[1] * c_chk * m2*(m2*m2-SUN_RCONST(1.0))+ h_dmag[my];
+  const sunrealtype h3 = c_che * (y3L + y3R + y3U + y3D) + c_msk[2] * c_chk * m3*(m3*m3-SUN_RCONST(1.0))+ h_dmag[mz];
 
   const sunrealtype mh = m1 * h1 + m2 * h2 + m3 * h3;
 
