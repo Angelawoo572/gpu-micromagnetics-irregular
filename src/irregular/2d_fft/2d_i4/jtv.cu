@@ -37,8 +37,6 @@ __constant__ sunrealtype jc_chk   = 1.0;
 __constant__ sunrealtype jc_che   = 20.0;
 __constant__ sunrealtype jc_alpha = 0.2;
 __constant__ sunrealtype jc_chg   = 1.0;
-__constant__ sunrealtype jc_cha   = 0.0;
-__constant__ sunrealtype jc_chb   = 0.3;
 
 __device__ static inline int jidx_mx(int c,int nc){return c;}
 __device__ static inline int jidx_my(int c,int nc){return nc+c;}

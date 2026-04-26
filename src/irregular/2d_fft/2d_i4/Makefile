@@ -42,8 +42,8 @@ HOLE_RADIUS_FRAC_Y ?= 0.05
 
 # ====== Output schedule ======
 EARLY_SAVE_UNTIL ?= 0
-EARLY_SAVE_EVERY ?= 10000
-LATE_SAVE_EVERY  ?= 10000
+EARLY_SAVE_EVERY ?= 100
+LATE_SAVE_EVERY  ?= 100
 
 ifeq ($(BUILD),debug)
   NVCC_FLAGS := $(CUDA_ARCH) -G -g -lineinfo -Xcompiler -O0

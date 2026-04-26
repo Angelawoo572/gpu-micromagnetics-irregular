@@ -66,8 +66,9 @@ __constant__ static sunrealtype pc_chk   = SUN_RCONST(1.0);
 __constant__ static sunrealtype pc_che   = SUN_RCONST(20.0);
 __constant__ static sunrealtype pc_alpha = SUN_RCONST(0.2);
 __constant__ static sunrealtype pc_chg   = SUN_RCONST(1.0);
-__constant__ static sunrealtype pc_cha   = SUN_RCONST(0.0);
-__constant__ static sunrealtype pc_chb   = SUN_RCONST(0.3);
+__constant__ static sunrealtype pc_happ1  = SUN_RCONST(-1.0);   // ← 新增
+__constant__ static sunrealtype pc_happ2  = SUN_RCONST( 0.0);   // ← 新增
+__constant__ static sunrealtype pc_happ3  = SUN_RCONST( 0.0);
 /* Anisotropy axis fixed at {1,0,0} (x); DMI direction fixed at {1,0,0}.
  * These are baked into the kernel rather than loaded from constant mem
  * to save some fetches — change here if the axes ever change. */
@@ -149,20 +150,20 @@ __global__ static void build_J_kernel(
 
     /* Total h at this cell — anisotropy on h1 only (c_msk={1,0,0}),
      * DMI on h1 only (c_nsk={1,0,0}). */
-    sunrealtype h1 =
-        pc_che * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)] +
-                y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)])
-    + pc_chk * m1 * (m1 * m1 - SUN_RCONST(1.0));
+    sunrealtype h1 = pc_happ1 +        /* happ_x */
+                + pc_che * (y[pidx_mx(lc,ncell)] + y[pidx_mx(rc,ncell)] +
+                            y[pidx_mx(uc,ncell)] + y[pidx_mx(dc,ncell)])
+                + pc_chk * m1 * (m1 * m1 - SUN_RCONST(1.0));
 
-    sunrealtype h2 =
-        pc_che * (y[pidx_my(lc,ncell)] + y[pidx_my(rc,ncell)] +
-                y[pidx_my(uc,ncell)] + y[pidx_my(dc,ncell)])
-    + pc_chk * m2 * (m2 * m2 - SUN_RCONST(1.0));
+    sunrealtype h2 = pc_happ2 +          /* happ_y */
+                + pc_che * (y[pidx_my(lc,ncell)] + y[pidx_my(rc,ncell)] +
+                            y[pidx_my(uc,ncell)] + y[pidx_my(dc,ncell)])
+                + pc_chk * m2 * (m2 * m2 - SUN_RCONST(1.0));
 
-    sunrealtype h3 =
-        pc_che * (y[pidx_mz(lc,ncell)] + y[pidx_mz(rc,ncell)] +
-                y[pidx_mz(uc,ncell)] + y[pidx_mz(dc,ncell)])
-    + pc_chk * m3 * (m3 * m3 - SUN_RCONST(1.0));
+    sunrealtype h3 =  pc_happ3 +         /* happ_z */
+                + pc_che * (y[pidx_mz(lc,ncell)] + y[pidx_mz(rc,ncell)] +
+                            y[pidx_mz(uc,ncell)] + y[pidx_mz(dc,ncell)])
+                + pc_chk * m3 * (m3 * m3 - SUN_RCONST(1.0));
 
     if (h_dmag) {
         h1 += h_dmag[mx];

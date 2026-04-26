@@ -175,9 +175,9 @@ __constant__ sunrealtype c_chk   = SUN_RCONST(1.0);
 __constant__ sunrealtype c_che   = SUN_RCONST(20.0);
 __constant__ sunrealtype c_alpha = SUN_RCONST(0.2);
 __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
-__constant__ sunrealtype happ1  = SUN_RCONST();
-__constant__ sunrealtype happ2  = SUN_RCONST();
-__constant__ sunrealtype happ3  = SUN_RCONST();
+__constant__ sunrealtype happ1  = SUN_RCONST(-1.0);
+__constant__ sunrealtype happ2  = SUN_RCONST(0.0);
+__constant__ sunrealtype happ3  = SUN_RCONST(0.0);
 
 /* ─── Error checking ──────────────────────────────────────────────── */
 #define CHECK_CUDA(call)                                                     \
@@ -424,7 +424,7 @@ int main(int argc, char* argv[]) {
   (void)argv;
 
   SUNContext sunctx = NULL;
-  sunrealtype *ydata = NULL, *abstol_data = NULL;
+  sunrealtype *ydata = NULL, *abstol_data = NULL,*yhost = NULL;;
   sunrealtype t = T0, tout = T1;
   sunrealtype ttotal = SUN_RCONST(T_TOTAL);
 
@@ -559,15 +559,14 @@ int main(int argc, char* argv[]) {
   }
 
   /* ─── Initial condition ───────────────────────────────────────────
-   * UNIFORM direction across ALL active cells (per professor):
-   *     m = (INIT_MX, INIT_MY, INIT_MZ) / |...|
-   * Hole cells: m = 0 exactly.  Frozen there forever via ymsk. */
+   *   Upper 1/4 (high gy):       m = (-1, 0, 0)         (anti-aligned with body)
+   *   Lower 3/4 (low gy):        m = (+1, m_y_tail, 0)
+   *      where m_y_tail = -INIT_MY_TAIL on left half  (gx <  ng/2)
+   *                     = +INIT_MY_TAIL on right half (gx >= ng/2)
+   * Hole cells: m = 0 exactly. */
   {
-    double mx0 = (double)INIT_MX;
-    double my0 = (double)INIT_MY;
-    double mz0 = (double)INIT_MZ;
-    const double n0 = sqrt(mx0*mx0 + my0*my0 + mz0*mz0);
-    if (n0 > 1.0e-30) { mx0 /= n0; my0 /= n0; mz0 /= n0; }
+    const int    j_split   = (3 * ny) / 4;          /* boundary between body and top stripe */
+    const double m_tail    = (double)INIT_MY;       /* small ±y perturbation amplitude */
 
     for (int j = 0; j < ny; j++) {
       for (int i = 0; i < ng; i++) {
@@ -577,6 +576,22 @@ int main(int argc, char* argv[]) {
         const int mz_i = idx_mz(cell, ncell);
 
         if (h_ymsk[mx_i] != SUN_RCONST(0.0)) {
+          double mx0, my0, mz0 = 0.0;
+
+          if (j >= j_split) {
+            /* Upper 1/4: anti-aligned. */
+            mx0 = -1.0;
+            my0 =  0.0;
+          } else {
+            /* Lower 3/4: aligned with +x, with a left/right tail in m_y. */
+            mx0 = +1.0;
+            my0 = (i < ng / 2) ? -m_tail : +m_tail;
+          }
+
+          /* Normalize to unit length. */
+          const double n0 = sqrt(mx0*mx0 + my0*my0 + mz0*mz0);
+          if (n0 > 1e-30) { mx0 /= n0; my0 /= n0; mz0 /= n0; }
+
           ydata[mx_i] = SUN_RCONST(mx0);
           ydata[my_i] = SUN_RCONST(my0);
           ydata[mz_i] = SUN_RCONST(mz0);
@@ -682,51 +697,56 @@ int main(int argc, char* argv[]) {
   CHECK_CUDA(cudaEventSynchronize(stop));
   CHECK_CUDA(cudaEventElapsedTime(&elapsedTime, start, stop));
   printf("GPU simulation took %.3f ms\n", elapsedTime);
-  sunrealtype* yhost = N_VGetHostArrayPointer_Cuda(y);
+
+  /* Copy final state to host and normalize only for output. */
+  N_VCopyFromDevice_Cuda(y);
+  yhost = N_VGetHostArrayPointer_Cuda(y);
+
   for (int j = 0; j < ny; j++) {
     for (int i = 0; i < ng; i++) {
       int cell = j * ng + i;
       int mx_i = idx_mx(cell, ncell);
       int my_i = idx_my(cell, ncell);
       int mz_i = idx_mz(cell, ncell);
-      double m1 = yhost[mx_i], m2 = yhost[my_i], m3 = yhost[mz_i];
+
+      double m1 = (double)yhost[mx_i];
+      double m2 = (double)yhost[my_i];
+      double m3 = (double)yhost[mz_i];
       double mag = sqrt(m1*m1 + m2*m2 + m3*m3);
-      if (mag > 1e-12) {           // active cells (hole cells skipped: mag=0)
-        yhost[mx_i] = m1 / mag;
-        yhost[my_i] = m2 / mag;
-        yhost[mz_i] = m3 / mag;
+
+      if (mag > 1e-12) {
+        yhost[mx_i] = SUN_RCONST(m1 / mag);
+        yhost[my_i] = SUN_RCONST(m2 / mag);
+        yhost[mz_i] = SUN_RCONST(m3 / mag);
       }
     }
   }
 
   PrintFinalStats(cvode_mem, LS);
   /* ====== FINAL STATE OUTPUT ====== */
-{
-  FILE* fp_final = fopen("output.txt", "w");
-  if (!fp_final) {
-    fprintf(stderr, "Failed to open output.txt\n");
-  } else {
-    N_VCopyFromDevice_Cuda(y);
-    sunrealtype* yhost = N_VGetHostArrayPointer_Cuda(y);
+  {
+    FILE* fp_final = fopen("output.txt", "w");
+    if (!fp_final) {
+      fprintf(stderr, "Failed to open output.txt\n");
+    } else {
+      fprintf(fp_final, "%f %d %d\n", (double)t, nx, ny);
 
-    fprintf(fp_final, "%f %d %d\n", (double)t, nx, ny);
+      for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < ng; i++) {
+          int cell = j * ng + i;
 
-    for (int j = 0; j < ny; j++) {
-      for (int i = 0; i < ng; i++) {
-        int cell = j * ng + i;
-
-        fprintf(fp_final, "%e %e %e\n",
-          (double)yhost[idx_mx(cell, ncell)],
-          (double)yhost[idx_my(cell, ncell)],
-          (double)yhost[idx_mz(cell, ncell)]
-        );
+          fprintf(fp_final, "%e %e %e\n",
+            (double)yhost[idx_mx(cell, ncell)],
+            (double)yhost[idx_my(cell, ncell)],
+            (double)yhost[idx_mz(cell, ncell)]
+          );
+        }
       }
-    }
 
-    fclose(fp_final);
-    printf("[output] final state written to output.txt\n");
+      fclose(fp_final);
+      printf("[output] final state written to output.txt\n");
+    }
   }
-}
 
 cleanup:
   if (LS) SUNLinSolFree(LS);
