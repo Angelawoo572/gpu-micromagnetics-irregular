@@ -129,13 +129,13 @@
 
 /* ─── Initial-condition knobs (uniform) ──────────────────────────── */
 #ifndef INIT_MX
-#define INIT_MX 0.0
+#define INIT_MX 1.0
 #endif
 #ifndef INIT_MY
-#define INIT_MY 0.0175
+#define INIT_MY -0.0175
 #endif
 #ifndef INIT_MZ
-#define INIT_MZ 0.998
+#define INIT_MZ 0.0
 #endif
 
 /* ─── Output schedule ─────────────────────────────────────────────── */
@@ -172,7 +172,7 @@ __constant__ sunrealtype c_nsk[3] = {
     SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
 
 __constant__ sunrealtype c_chk   = SUN_RCONST(1.0);
-__constant__ sunrealtype c_che   = SUN_RCONST(100.0);
+__constant__ sunrealtype c_che   = SUN_RCONST(50.0);
 __constant__ sunrealtype c_alpha = SUN_RCONST(0.2);
 __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
 

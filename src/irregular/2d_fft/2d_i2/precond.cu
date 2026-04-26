@@ -62,8 +62,8 @@
 #include <cmath>
 
 /* ─── Material constants (mirror 2d_fft.cu values) ──────────────────── */
-__constant__ static sunrealtype pc_chk   = SUN_RCONST(4.0);
-__constant__ static sunrealtype pc_che   = SUN_RCONST(4.0);
+__constant__ static sunrealtype pc_chk   = SUN_RCONST(1.0);
+__constant__ static sunrealtype pc_che   = SUN_RCONST(50.0);
 __constant__ static sunrealtype pc_alpha = SUN_RCONST(0.2);
 __constant__ static sunrealtype pc_chg   = SUN_RCONST(1.0);
 __constant__ static sunrealtype pc_cha   = SUN_RCONST(0.0);

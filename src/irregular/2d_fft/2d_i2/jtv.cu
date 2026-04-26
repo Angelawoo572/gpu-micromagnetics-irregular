@@ -33,8 +33,8 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-__constant__ sunrealtype jc_chk   = 4.0;
-__constant__ sunrealtype jc_che   = 10.0;
+__constant__ sunrealtype jc_chk   = 1.0;
+__constant__ sunrealtype jc_che   = 50.0;
 __constant__ sunrealtype jc_alpha = 0.2;
 __constant__ sunrealtype jc_chg   = 1.0;
 __constant__ sunrealtype jc_cha   = 0.0;
