@@ -523,7 +523,8 @@ int main(int argc, char* argv[]) {
 
         const int in_outer = (dx <= halfW_o && dy <= halfH_o);
         const int in_inner = (dx <= halfW_i && dy <= halfH_i);
-        const int active   = in_outer && !in_inner;
+        // const int active   = in_outer && !in_inner; ring active
+        const int active = !in_outer || in_inner; // ring hole
 
         const sunrealtype m = active ? SUN_RCONST(1.0) : SUN_RCONST(0.0);
         if (active) n_active_count++; else n_hole_count++;
