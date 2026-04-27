@@ -175,7 +175,7 @@ __constant__ sunrealtype c_chk   = SUN_RCONST(1.0);
 __constant__ sunrealtype c_che   = SUN_RCONST(20.0);
 __constant__ sunrealtype c_alpha = SUN_RCONST(0.2);
 __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
-__constant__ sunrealtype happ1  = SUN_RCONST(-0.3);
+__constant__ sunrealtype happ1  = SUN_RCONST(-0.2);
 __constant__ sunrealtype happ2  = SUN_RCONST(0.0);
 __constant__ sunrealtype happ3  = SUN_RCONST(0.0);
 
@@ -565,7 +565,8 @@ int main(int argc, char* argv[]) {
    *                     = +INIT_MY_TAIL on right half (gx >= ng/2)
    * Hole cells: m = 0 exactly. */
   {
-    const int    j_split   = (3 * ny) / 4;          /* boundary between body and top stripe */
+    // (3 * ny) / 4;
+    const int    j_split   = (7 * ny) / 4;          /* boundary between body and top stripe */
     const double m_tail    = (double)INIT_MY;       /* small ±y perturbation amplitude */
 
     for (int j = 0; j < ny; j++) {
