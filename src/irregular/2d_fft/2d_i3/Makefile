@@ -89,9 +89,18 @@ DEMAG_OBJ   := demag_fft.o
 OBJS := $(FUSED_OBJ) $(PRECOND_OBJ) $(JTV_OBJ) $(DEMAG_OBJ)
 ARGS ?=
 
+# ====== Nsight tools ======
+NSYS ?= nsys
+NCU  ?= ncu
+
+PROFILE_OUT ?= profile_$(TARGET)
+
+NSYS_FLAGS := profile --trace=cuda --cuda-memory-usage=true -o $(PROFILE_OUT)
+NCU_FLAGS  ?= --set roofline -o ncu_$(TARGET)
+
 .PHONY: all run run-debug build-debug build-release \
         run-print run-noprint run-demag run-no-demag \
-        show-config clean reallyclean
+        profile stats compute show-config clean reallyclean
 
 all: $(TARGET)
 
@@ -138,6 +147,22 @@ run-no-demag:
 	$(MAKE) DEMAG_STRENGTH=0.0 PRINT=$(PRINT)
 	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS)
 
+profile: $(TARGET)
+	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
+	$(NSYS) $(NSYS_FLAGS) ./$(TARGET) $(ARGS)
+	@echo "Generated: $(PROFILE_OUT).nsys-rep"
+
+stats:
+	@[ -f "$(PROFILE_OUT).nsys-rep" ] || (echo "ERROR: run make profile first."; exit 1)
+	nsys stats --report cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum \
+	    $(PROFILE_OUT).nsys-rep > nsys_report.txt
+	@echo "Wrote: nsys_report.txt"
+
+compute: $(TARGET)
+	LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 \
+	$(NCU) $(NCU_FLAGS) ./$(TARGET) $(ARGS) || \
+	(echo "Nsight Compute failed (likely permission issue)"; exit 1)
+
 show-config:
 	@echo "TARGET         = $(TARGET)"
 	@echo "GRID           = $(GRID_NX) x $(GRID_NY)"
@@ -146,9 +171,12 @@ show-config:
 	@echo "RTOL/ATOL      = $(RTOL_VAL)/$(ATOL_VAL)"
 	@echo "T_TOTAL        = $(T_TOTAL)"
 	@echo "KRYLOV_DIM     = $(KRYLOV_DIM)"
+	@echo "PROFILE_OUT    = $(PROFILE_OUT)"
 
 clean:
 	rm -f $(TARGET) $(OBJS)
 
 reallyclean: clean
 	rm -f output.txt mask.txt
+	rm -f $(PROFILE_OUT).nsys-rep $(PROFILE_OUT).sqlite
+	rm -f ncu_$(TARGET).ncu-rep
