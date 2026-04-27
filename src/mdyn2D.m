@@ -156,3 +156,73 @@ colorbar;
 xlabel('x');
 ylabel('y');
 title('Final state: m_x top view');
+
+clear; clc; close all;
+
+fn = 'output_i4.txt';
+aa = readmatrix(fn);
+[nt, ~] = size(aa);
+
+scalar_nx = aa(1,2);
+ny        = aa(1,3);
+nx        = scalar_nx / 3;
+nqs       = nx * ny;
+frame_len = nqs + 1;
+nframe    = floor(nt / frame_len);
+
+stride = 2;   % 可以调小一点更细腻
+xs = 1:stride:nx;
+ys = 1:stride:ny;
+[X,Y] = meshgrid(xs, ys);
+
+gif_name = 'topview_surf.gif';
+
+figure('Color','w');
+
+for iframe = 1:nframe
+    header_row = 1 + (iframe-1)*frame_len;
+    data_start = header_row + 1;
+    data_end   = header_row + nqs;
+
+    if data_end > nt
+        break;
+    end
+
+    tnow  = aa(header_row, 1);
+    block = aa(data_start:data_end, :);
+
+    MX_full = reshape(block(:,1), [nx, ny])';
+    MX = MX_full(ys, xs);
+
+    cla;
+
+    % ===== TOP VIEW =====
+    surf(X, Y, MX);
+
+    shading interp;   % 平滑颜色（关键）
+    view(2);
+    axis equal tight;
+    colorbar;
+
+    xlabel('x');
+    ylabel('y');
+
+    title(sprintf('m_x (top view), frame %d/%d, t=%.3f', ...
+        iframe, nframe, tnow));
+
+    drawnow;
+
+    frame = getframe(gcf);
+    im = frame2im(frame);
+    [A, cmap] = rgb2ind(im, 256);
+
+    if iframe == 1
+        imwrite(A, cmap, gif_name, 'gif', ...
+            'LoopCount', Inf, 'DelayTime', 0.1);
+    else
+        imwrite(A, cmap, gif_name, 'gif', ...
+            'WriteMode', 'append', 'DelayTime', 0.1);
+    end
+end
+
+fprintf('Saved GIF: %s\n', gif_name);

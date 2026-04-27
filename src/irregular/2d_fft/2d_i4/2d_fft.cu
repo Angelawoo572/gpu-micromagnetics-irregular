@@ -175,7 +175,7 @@ __constant__ sunrealtype c_chk   = SUN_RCONST(1.0);
 __constant__ sunrealtype c_che   = SUN_RCONST(20.0);
 __constant__ sunrealtype c_alpha = SUN_RCONST(0.2);
 __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
-__constant__ sunrealtype happ1  = SUN_RCONST(-1.0);
+__constant__ sunrealtype happ1  = SUN_RCONST(-0.3);
 __constant__ sunrealtype happ2  = SUN_RCONST(0.0);
 __constant__ sunrealtype happ3  = SUN_RCONST(0.0);
 
@@ -724,29 +724,29 @@ int main(int argc, char* argv[]) {
 
   PrintFinalStats(cvode_mem, LS);
   /* ====== FINAL STATE OUTPUT ====== */
-  {
-    FILE* fp_final = fopen("output.txt", "w");
-    if (!fp_final) {
-      fprintf(stderr, "Failed to open output.txt\n");
-    } else {
-      fprintf(fp_final, "%f %d %d\n", (double)t, nx, ny);
+  // {
+  //   FILE* fp_final = fopen("output.txt", "w");
+  //   if (!fp_final) {
+  //     fprintf(stderr, "Failed to open output.txt\n");
+  //   } else {
+  //     fprintf(fp_final, "%f %d %d\n", (double)t, nx, ny);
 
-      for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < ng; i++) {
-          int cell = j * ng + i;
+  //     for (int j = 0; j < ny; j++) {
+  //       for (int i = 0; i < ng; i++) {
+  //         int cell = j * ng + i;
 
-          fprintf(fp_final, "%e %e %e\n",
-            (double)yhost[idx_mx(cell, ncell)],
-            (double)yhost[idx_my(cell, ncell)],
-            (double)yhost[idx_mz(cell, ncell)]
-          );
-        }
-      }
+  //         fprintf(fp_final, "%e %e %e\n",
+  //           (double)yhost[idx_mx(cell, ncell)],
+  //           (double)yhost[idx_my(cell, ncell)],
+  //           (double)yhost[idx_mz(cell, ncell)]
+  //         );
+  //       }
+  //     }
 
-      fclose(fp_final);
-      printf("[output] final state written to output.txt\n");
-    }
-  }
+  //     fclose(fp_final);
+  //     printf("[output] final state written to output.txt\n");
+  //   }
+  // }
 
 cleanup:
   if (LS) SUNLinSolFree(LS);
