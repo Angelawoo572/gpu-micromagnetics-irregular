@@ -1,23 +1,21 @@
 #ifndef FFT_DEMAG_H
 #define FFT_DEMAG_H
 
+#include <cuda_runtime.h>   /* for cudaStream_t */
+
 /*
  * demag_fft.h  —  FFT demagnetization field, GPU-only pipeline.
  *
- * Per f() call, fully on device:
- *     pack_m_kernel   : SoA y (3*ncell real)        ->  3 complex arrays (mx,my,mz)
- *     cufftExecZ2Z    : FORWARD on each component    ->  m̂ (stays on device)
- *     multiply_kernel : ĥ = f̂ · m̂                   ->  3 complex spectra
- *     cufftExecZ2Z    : INVERSE on each component    ->  h (complex)
- *     unshift_h_kernel: FFT-shift + real-part + strength/N scaling
- *                       write directly to SoA h_out_dev (OVERWRITE, not +=)
+ * NEW IN PMPP-TILED EDITION:
+ *   - Demag_ApplyWindowed: gather kernel multiplies y by per-cell w on
+ *     the fly, eliminating the apply_weight_kernel pre-pass that used
+ *     to write a 3*ncell scratch.
+ *   - Demag_SetStream:   route all cuFFT calls + scatter onto a
+ *     user-supplied CUDA stream so the demag pipeline runs concurrently
+ *     with other kernels.
  *
- * f̂ is computed ONCE in Demag_Init and stored permanently on device.
- * No host transfers during Apply.
- *
- * Self-coupling  (for preconditioner):
- *     N(0) = diag(Nxx(0), Nyy(0), Nzz(0))   (off-diagonals vanish at r=0)
- *     Scaled by `strength` (matching the final h_out scale).
+ * Demag_Apply (no-window) is preserved for callers that don't need
+ * windowing — same binary as before.
  */
 
 #ifdef __cplusplus
@@ -28,14 +26,24 @@ typedef struct DemagData DemagData;
 
 DemagData* Demag_Init(int nx, int ny, double thick, double demag_strength);
 
-/* Fully on-GPU: y_dev and h_out_dev are device pointers; h_out_dev is OVERWRITTEN.
- * h_out_dev must be a 3*ncell SoA buffer on device. */
+/* Original: full magnetization, no windowing — unchanged ABI. */
 void       Demag_Apply(DemagData *d, const double *y_dev, double *h_out_dev);
+
+/* NEW: applies per-cell weight w on the fly during the gather step.
+ * Mathematically equivalent to first computing y_eff = w·y on a separate
+ * pass and calling Demag_Apply(y_eff), but saves one full 3*ncell pass
+ * over global memory.  All pointers must be device pointers. */
+void       Demag_ApplyWindowed(DemagData *d,
+                               const double *y_dev,
+                               const double *w_dev,
+                               double *h_out_dev);
+
+/* NEW: route cuFFT execution + helper kernels onto `stream`.  Pass 0
+ * (default stream) to revert.  Cheap; safe to call every f(). */
+void       Demag_SetStream(DemagData *d, cudaStream_t stream);
 
 void       Demag_Destroy(DemagData *d);
 
-/* Get self-coupling values (N_αα(0) × strength) for use in the
- * block-Jacobi preconditioner's local 3x3 Jacobian. */
 void       Demag_GetSelfCoupling(DemagData *d,
                                  double *nxx0_scaled,
                                  double *nyy0_scaled,
