@@ -43,9 +43,9 @@ INNER_W_FRAC_OF_OUTER ?= 0.5
 INNER_H_FRAC_OF_OUTER ?= 0.5
 
 # ====== Output schedule ======
-EARLY_SAVE_UNTIL ?= 0
-EARLY_SAVE_EVERY ?= 100
-LATE_SAVE_EVERY  ?= 100
+EARLY_SAVE_UNTIL ?= 100.0
+EARLY_SAVE_EVERY ?= 50
+LATE_SAVE_EVERY  ?= 500
 
 ifeq ($(BUILD),debug)
   NVCC_FLAGS := $(CUDA_ARCH) -G -g -lineinfo -Xcompiler -O0
