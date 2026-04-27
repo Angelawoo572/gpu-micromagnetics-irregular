@@ -30,8 +30,8 @@ DEMAG_STRENGTH ?= 1.0
 DEMAG_THICK    ?= 1.0
 
 # Grid
-GRID_NX ?= 768
-GRID_NY ?= 256
+GRID_NX ?= 1536
+GRID_NY ?= 512
 
 # Antidot mesh geometry
 N_HOLES_X ?= 4
@@ -40,9 +40,9 @@ HOLE_SEED ?= 20251101
 MASK_EPS_CELLS ?= 2.2
 
 # Output schedule — set EARLY_SAVE_UNTIL=80 if you want fine early frames
-EARLY_SAVE_UNTIL ?= 0.0
-EARLY_SAVE_EVERY ?= 100
-LATE_SAVE_EVERY  ?= 100
+EARLY_SAVE_UNTIL ?= 80
+EARLY_SAVE_EVERY ?= 10
+LATE_SAVE_EVERY  ?= 800
 
 NUM_GRAINS      ?= 72
 DEAD_GRAIN_FRAC ?= 0.16
