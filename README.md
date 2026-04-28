@@ -3,184 +3,402 @@
 ## Overview
 
 This project studies GPU-accelerated micromagnetic simulation for the
-Landau-Lifshitz-Gilbert (LLG) equation. The goal is to build a CUDA-based
-simulation pipeline that supports:
+Landau-Lifshitz-Gilbert (LLG) equation using CUDA and SUNDIALS/CVODE.
+
+The code supports:
 
 - local nearest-neighbor interactions,
 - 2D magnetization dynamics,
-- FFT-based long-range magnetostatic computation,
-- and irregular masked geometries on structured grids.
+- irregular masked geometries,
+- FFT-based long-range demagnetization,
+- and solver-level performance analysis.
 
-The project focuses not only on implementing a working solver, but also on
-understanding how data layout, solver design, and geometry affect performance
-on GPUs. In particular, we study how solver-level overhead (e.g., vector
-operations, synchronization, and Jacobian approximations) impacts end-to-end
-performance.
+The main goal is to understand end-to-end GPU performance, including not only
+the physics kernels, but also the CVODE solver pipeline, vector operations,
+synchronization, and FFT-based global coupling.
 
----
+Project page:
 
-## Quick Navigation
-
-- Code → `src/`
-- Inputs / configs → `configs/`
-- Outputs / plots → `results/`
-- Report / figures → `report/`
-- **FFT demagnetization** → `src/2d_fft/`, `src/irregular/2d_fft/`
-
----
-
-## Main Research Questions
-
-This project is organized around the following systems questions:
-
-1. How should a GPU-based micromagnetic solver organize local computation,
-   long-range FFT computation, and time integration efficiently?
-2. How does irregular geometry affect performance compared with a regular grid?
-3. What tradeoffs arise between dense masked execution and compacted active-cell execution?
-4. How do data layout choices influence local kernel efficiency and FFT efficiency?
-
-## Solver-Level Optimization
-
-Beyond kernel-level optimization, this project investigates solver-level
-performance bottlenecks in GPU-based time integration using SUNDIALS/CVODE.
-
-Profiling shows that the dominant cost is not the physics RHS kernel alone,
-but the surrounding Newton–Krylov solver workflow, including repeated vector
-operations, synchronization, and Jacobian-related computations.
-
-We implement three key optimizations:
-
-- **Fused NVector operations**  
-  Reduce excessive kernel launches and GPU–CPU synchronization by batching
-  vector operations inside the solver.
-
-- **Block-diagonal preconditioner (3×3 per cell)**  
-  Exploit local problem structure to reduce the cost of Krylov linear solves,
-  while maintaining a lightweight GPU-friendly design.
-
-- **Analytic Jacobian–vector product (JTV)**  
-  Replace finite-difference approximations with a direct kernel, eliminating
-  redundant RHS evaluations and improving work efficiency.
-
-These optimizations target different aspects of the solver pipeline:
-coordination overhead, linear solve cost, and redundant computation.
-
-## Current Project Structure
-
-- `src/1d/`  
-  Early 1D local-interaction prototype used for correctness checking.
-
-- `src/2d/`  
-  2D local-interaction solver without FFT-based long-range coupling.
-
-- `src/2d_fft/`  
-  Main 2D solver with FFT-based magnetostatics (cuFFT pipeline).
-
-- `src/irregular/`  
-  Irregular geometries + FFT-based demag variants (final system).
-
-- `configs/`  
-  Input configuration (`sim_config.h`, `params.mk`).  
-  Use this to control geometry, physics, solver, and execution without modifying code.
-
-- `report/`  
-  Proposal source, report, and figures.
-
-- `results/`  
-  Simulation outputs, timing results, and performance plots.
-
----
-
-## Using FFT Demag
-
-FFT-based long-range coupling is enabled in all `2d_fft` variants.
-
-Set:
-
-```bash
-DEMAG_STRENGTH > 0
-```
-
-to activate demagnetization.
-
----
-
-## Running the Code
-
-Basic:
-
-```bash
-make
-make run
-````
-
-Run a specific variant:
-
-```bash
-cd src/irregular/2d_fft/2d_i6
-make
-make run
-```
-
-Override configuration (recommended):
-
-```bash
-make NX_VAL=1536 NY_VAL=512 DEMAG_STRENGTH=2.0 RTOL_VAL=1e-4
+```text
+https://angelawoo572.github.io/gpu-micromagnetics-irregular/
 ```
 
 ---
 
-## Correctness Validation
+## Repository Structure
 
-Validation is performed in stages:
+```text
+gpu-micromagnetics-irregular/
+├── src/
+├── configs/
+├── results/
+├── report/
+├── Makefile
+└── README.md
+```
 
-- **1D local-interaction results**  
-  Verify qualitative spatial magnetization evolution.
+### `src/`
 
-- **Representative 3D magnetization traces**  
-  Verify physically plausible LLG dynamics for individual vectors.
+All simulation source code is stored here.
 
-- **2D local-only vector fields**  
-  Validate the 2D implementation before adding FFT-based long-range terms.
+Important subfolders:
 
-- **FFT-based cases (final system)**  
-  Validate small cases against simplified or direct reference computations where possible.
+```text
+src/1d/
+```
 
-## Conclusion
+Early 1D local-interaction prototype used for correctness checks.
 
-This project emphasizes system-level performance analysis, showing that
-optimizing GPU applications often requires addressing algorithmic and solver
-structure, not just kernel-level efficiency.
+```text
+src/2d/
+```
 
-## Planned Evaluation
+2D local-interaction solver without FFT demagnetization.
 
-We will evaluate both correctness and performance.
+```text
+src/2d_fft/
+```
 
-### Correctness
+2D solver with FFT-based demagnetization.
 
-* 1D magnetization evolution
-* representative vector trajectories
-* 2D local-only field structure
-* consistency checks for small FFT-based cases
+```text
+src/irregular/
+```
 
-### Performance
+Irregular-geometry solvers and experiments, including masked geometries,
+square holes, ring/active-region cases, polycrystal cases, and compact
+active-cell execution.
 
-* total runtime / time-to-solution
-* runtime breakdown:
+Typical variants include:
 
-  * local RHS / field computation
-  * FFT-based long-range computation
-  * solver overhead
-* scaling with grid size
-* impact of irregular geometry
-* comparison of alternative layout / execution strategies
+```text
+2d_i1  head-on stripe / local or FFT baseline
+2d_i2  square-hole geometry with uniform initialization
+2d_i3  Voronoi polycrystal + dead-grain holes + FFT demag
+2d_i4  square-hole geometry with asymmetric two-domain initialization
+2d_i5  ring / central active-region style geometry
+2d_i6  compact active-cell geometry such as ellipse/circle
+```
+
+---
+
+## `configs/`
+
+This folder stores input/configuration templates for running simulations.
+
+The main files are:
+
+```text
+configs/sim_config.h
+configs/params.mk
+```
+
+### `sim_config.h`
+
+Central C/CUDA configuration header.
+
+It contains the main simulation knobs:
+
+- grid size: `NX_VAL`, `NY_VAL`
+- execution model: dense mask or compact active-cell execution
+- geometry type: bulk, square hole, ring, polycrystal, ellipse, custom
+- initial condition type
+- physical constants
+- demag strength and thickness
+- solver tolerance and Krylov dimension
+- output schedule
+
+### `params.mk`
+
+Makefile fragment that exposes the same knobs as command-line variables.
+
+Example:
+
+```bash
+make NX_VAL=1536 NY_VAL=512 DEMAG_STRENGTH=2.0 RTOL_VAL=1.0e-4
+```
+
+Use `configs/` when you want to reproduce or modify a case without rewriting
+the CUDA source code.
+
+---
+
+## `results/`
+
+This folder contains generated outputs and analysis results.
+
+Look here for:
+
+- correctness figures,
+- magnetization visualizations,
+- timing results,
+- scaling plots,
+- Nsight profiling summaries,
+- direct-vs-FFT comparisons,
+- irregular-geometry result images.
+
+The results are meant to show both physical behavior and performance behavior.
+
+---
+
+## `report/`
+
+This folder contains report materials, figures, and final writeups.
+
+The report explains the main design choices:
+
+- regular-grid baseline,
+- irregular masked geometry,
+- dense mask vs compact active-cell execution,
+- solver-level optimizations,
+- FFT demagnetization,
+- profiling interpretation.
+
+Use this folder if you want the full explanation behind the code and results.
+
+---
+
+## Main Simulation Ideas
+
+### 1. Local GPU RHS
+
+The local part of the LLG effective field is computed with CUDA kernels.
+Each cell stores three magnetization components in structure-of-arrays format:
+
+```text
+[mx for all cells][my for all cells][mz for all cells]
+```
+
+This layout matches the SUNDIALS CUDA NVector interface and works well with
+grid-based stencil computation.
+
+### 2. Irregular Geometry
+
+Irregular geometries are embedded inside a structured grid.
+
+Two execution models are used:
+
+```text
+EXEC_YMSK
+```
+
+Dense masked execution. Kernels launch over the full grid, and inactive cells
+are masked out.
+
+```text
+EXEC_COMPACT
+```
+
+Compact active-cell execution. Kernels launch only over active cells using
+active-cell index lists.
+
+Dense masking is simpler. Compact execution is useful when many cells are
+inactive.
+
+### 3. FFT Demagnetization
+
+The long-range demagnetization field is computed using FFT convolution.
+
+The direct method is expensive:
+
+```text
+O(N^2)
+```
+
+The FFT method reduces this to approximately:
+
+```text
+O(N log N)
+```
+
+The FFT pipeline is GPU-resident:
+
+```text
+gather magnetization
+→ cuFFT D2Z
+→ spectral tensor multiply
+→ cuFFT Z2D
+→ scatter demag field
+```
+
+The demag tensor is computed once during initialization and stored on the GPU.
+
+### 4. Solver-Level Optimization
+
+The project also studies CVODE/SPGMR overhead.
+
+Important solver-level components include:
+
+- fused SUNDIALS NVector operations,
+- multi-dot reduction,
+- analytic Jacobian-vector product,
+- block-Jacobi preconditioner,
+- CUDA stream organization.
+
+Profiling shows that total runtime is often dominated by solver orchestration,
+vector kernels, reductions, and synchronization, not only by the physics RHS
+kernel.
+
+---
 
 ## Build
 
 A top-level `Makefile` is provided.
 
-Example targets:
+Basic commands:
 
 ```bash
+make
 make run
 make clean
+```
+
+To show the active configuration:
+
+```bash
+make show-config
+```
+
+To override parameters from the command line:
+
+```bash
+make NX_VAL=1536 NY_VAL=512 RTOL_VAL=1.0e-4 DEMAG_STRENGTH=2.0
+```
+
+---
+
+## Example Runs
+
+### Square-hole case
+
+```bash
+make EXECUTION_MODEL=0 \
+     GEOMETRY_KIND=1 \
+     IC_KIND=0 \
+     DEMAG_STRENGTH=4.0
+```
+
+### Polycrystal FFT case
+
+```bash
+make EXECUTION_MODEL=0 \
+     GEOMETRY_KIND=3 \
+     IC_KIND=3 \
+     NUM_GRAINS=72 \
+     DEAD_GRAIN_FRAC=0.16 \
+     DEMAG_STRENGTH=1.0 \
+     DEMAG_WINDOWED=1
+```
+
+### Compact ellipse / circle case
+
+```bash
+make EXECUTION_MODEL=1 \
+     GEOMETRY_KIND=5 \
+     ACTIVE_RX_FRAC=0.25 \
+     ACTIVE_RY_FRAC=0.25 \
+     BLOCK_SIZE=256
+```
+
+---
+
+## Output
+
+Depending on the selected configuration, the simulation may write magnetization
+states or final-state data.
+
+Common output contains:
+
+```text
+time nx ny
+mx my mz
+mx my mz
+...
+```
+
+These files can be postprocessed into:
+
+- component maps such as `mx`, `my`, `mz`,
+- vector-field plots,
+- 3D surface plots,
+- GIF animations,
+- timing and scaling plots.
+
+Generated figures and processed results should be stored in `results/`.
+
+---
+
+## Validation
+
+Correctness is checked in stages:
+
+1. 1D local-interaction behavior.
+2. Representative magnetization-vector trajectories.
+3. 2D local-only vector fields.
+4. Small FFT-demag cases compared against direct convolution where possible.
+5. Irregular-geometry cases checked through physical consistency and visual
+   evolution.
+
+---
+
+## Performance Evaluation
+
+The project evaluates:
+
+- total runtime / time-to-solution,
+- scaling with grid size,
+- dense mask vs compact active-cell execution,
+- direct demag vs FFT demag,
+- solver tolerance effects,
+- CUDA kernel breakdown,
+- CUDA API synchronization overhead,
+- SUNDIALS vector-operation overhead.
+
+Nsight Systems is used to identify where time is spent across CUDA kernels,
+cuFFT calls, SUNDIALS vector kernels, and synchronization.
+
+---
+
+## Notes for New Users
+
+Start here:
+
+```text
+src/
+```
+
+for the actual CUDA/CVODE solvers.
+
+Use:
+
+```text
+configs/
+```
+
+to understand or modify simulation inputs.
+
+Check:
+
+```text
+results/
+```
+
+to view generated plots, timing data, and example outputs.
+
+Read:
+
+```text
+report/
+```
+
+for the full explanation of the method, experiments, and performance analysis.
+
+---
+
+## Conclusion
+
+This project shows that GPU micromagnetic simulation performance is determined
+by the interaction between local CUDA kernels, FFT-based long-range coupling,
+irregular geometry handling, and the CVODE solver pipeline.
+
+Optimizing only one kernel is not enough; the full solver structure matters.
