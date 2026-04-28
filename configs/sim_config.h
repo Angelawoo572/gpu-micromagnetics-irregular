@@ -1,10 +1,12 @@
 /* ============================================================================
  * sim_config.h  —  General input template for gpu-micromagnetics-irregular
  *
- * Centralized configuration header that consolidates EVERY knob across the
- * 2d_i1 ... 2d_i5 variants of the project. Drop this file at the top of
- * 2d_fft.cu (and #include it before any other module header), and override
- * any value you like via:
+ * v2 (covers 2d_i1 ... 2d_i6).
+ *
+ * Centralized configuration header that consolidates EVERY knob across all
+ * variants.  Drop this file at the top of the variant's main .cu (and
+ * #include it before any other module header), and override any value you
+ * like via:
  *
  *     1. Editing the defaults in this file directly, OR
  *     2. Compile-time -D flags from the Makefile (preferred for sweeps), OR
@@ -15,45 +17,61 @@
  * Makefile -D overrides always win.
  *
  * ─── HOW TO USE FOR A NEW PROBLEM ─────────────────────────────────────
- * Step 1.  Pick a geometry preset:
- *            GEOMETRY_BULK         -- no holes, fully periodic body
- *            GEOMETRY_HOLE_SQUARE  -- one square interior hole
- *            GEOMETRY_RING         -- outer rect minus inner rect (ring)
- *            GEOMETRY_POLYCRYSTAL  -- Voronoi grains + dead-grain holes
- *            GEOMETRY_CUSTOM       -- you build h_ymsk[] yourself
  *
- *          Set GEOMETRY_KIND below (or pass -DGEOMETRY_KIND=... in the
- *          Makefile). Then fill in the matching geometry-specific knobs
- *          in the corresponding section.
+ * Step 0.  Pick an EXECUTION MODEL.  This is the BIGGEST architectural
+ *          fork in the project (introduced with 2d_i6):
  *
- * Step 2.  Pick an initial-condition preset:
- *            IC_UNIFORM            -- all active cells in one direction
- *            IC_HEAD_ON_STRIPES    -- 3-stripe domain wall along x (i1)
- *            IC_TWO_DOMAIN         -- upper anti-aligned, lower aligned (i4)
- *            IC_GRAIN_BUMPS        -- per-grain core ±z, blend at edges (i3)
- *            IC_CUSTOM             -- you fill ydata[] yourself
+ *            EXEC_YMSK    -- byte mask d_ymsk[3*ncell] (1 = active, 0 = hole),
+ *                            kernels launch over the FULL grid and multiply
+ *                            their output by ymsk.  Used by i1..i5.
+ *                            UserData layout: 88 bytes (no id lists).
+ *                            Block dims: BLOCK_X x BLOCK_Y  (2D launches).
  *
- * Step 3.  Set physics constants (anisotropy, exchange, DMI, demag,
- *          applied field). Defaults here match the most general
- *          square-hole + uniform-IC variant (2d_i2 / 2d_i4 baseline).
+ *            EXEC_COMPACT -- compact index lists d_active_ids[n_active] and
+ *                            d_inactive_ids[n_inactive], kernels launch
+ *                            ONE THREAD PER ACTIVE CELL.  Used by i6.
+ *                            UserData layout: 96 bytes (adds id lists +
+ *                            n_active + n_inactive + 4 B pad).
+ *                            Block dims: BLOCK_SIZE (1D launches).
  *
- * Step 4.  Tune solver & kernel settings if needed (RTOL, KRYLOV_DIM,
- *          BLOCK_X/Y, T_TOTAL).
+ *          Which one to pick?
+ *          - >50% active cells (compact body, small holes):
+ *            ymsk and compact are within ~10% of each other.  Either works.
+ *          - <50% active cells (dot, ring, ellipse, sparse polycrystal):
+ *            COMPACT wins — sometimes by 3-5x — because threads in holes
+ *            simply don't exist.
+ *          - For new variants you write from scratch, prefer COMPACT;
+ *            the indexing is simpler (no `if (mask)` mental model needed).
  *
- * Step 5.  `make clean && make` and run.
+ *          The two models cannot be mixed in one variant — they imply
+ *          different UserData byte layouts and different kernel signatures.
+ *
+ * Step 1.  Pick a GEOMETRY preset (Section 1).
+ * Step 2.  Pick an INITIAL CONDITION preset (Section 2).
+ * Step 3.  Set physics constants (Section 3).
+ * Step 4.  Tune solver & kernel settings (Section 5).
+ * Step 5.  `make clean && make show-config && make` and run.
  *
  * ─── INVARIANTS YOU MUST NOT BREAK ────────────────────────────────────
- *   - NX_VAL must be a multiple of GROUPSIZE (= 3). The "logical" number of
- *     columns the kernels see is ng = NX_VAL / GROUPSIZE.
- *   - The UserData struct in 2d_fft.cu, JtvUserData in jtv.cu and
- *     PcUserData in precond.cu MUST stay byte-compatible (mirror layout).
- *     If you add a field, add it to all three in the same offset.
- *   - The material constants below are also baked into __constant__ memory
- *     in jtv.cu and precond.cu. If you change c_chk / c_che / c_alpha /
- *     c_chg / c_chb, you MUST update the matching jc_* and pc_* values.
- *   - Hole / inactive cells live entirely in the SoA mask d_ymsk; every
- *     kernel multiplies its output by ymsk[mα]. Do NOT add `if(active)`
- *     branches in the kernels — build h_ymsk on the host and rely on it.
+ *   - NX_VAL must be a multiple of GROUPSIZE (= 3).  ng = NX_VAL / GROUPSIZE.
+ *   - The UserData / JtvUserData / PcUserData structs in <main>.cu, jtv.cu,
+ *     and precond.cu MUST stay byte-compatible mirrors of each other.
+ *     The layout depends on EXECUTION_MODEL — see Section 9 below for
+ *     the exact field order in each mode.
+ *   - The material constants below (PHYS_*) are also baked into __constant__
+ *     memory in jtv.cu (jc_*) and precond.cu (pc_*).  Three mirrors that
+ *     MUST stay in sync.  The cleanest fix is to refactor those files to
+ *     #include this header and use these macros directly — left as TODO so
+ *     this file remains a drop-in addition.
+ *   - In EXEC_YMSK mode: hole/inactive cells live entirely in d_ymsk;
+ *     every kernel multiplies its output by ymsk[mα].  Do NOT add
+ *     `if (active)` branches.
+ *   - In EXEC_COMPACT mode: hole cells are skipped entirely (kernels never
+ *     run there).  ydot / Jv / z at hole entries are zeroed by small
+ *     dedicated kernels at the start of f / JtvProduct / PrecondSolve so
+ *     SUNDIALS' inner products see consistent zeros.  y[hole] is set to 0
+ *     once at init and stays 0 forever (CVODE's linear-combination updates
+ *     preserve it).  Do NOT inject a stray nonzero IC into a hole cell.
  * ============================================================================ */
 
 #ifndef SIM_CONFIG_H
@@ -63,12 +81,8 @@
  * SECTION 0 — Discretization / problem size
  * ═════════════════════════════════════════════════════════════════════ */
 
-/* GROUPSIZE: physical cells per "x-stride" (do not change unless you also
- * rewrite the SoA indexing in every kernel). Always 3 for this project. */
 #define GROUPSIZE 3
 
-/* Grid dimensions in cells. Scaling logs in 2d_i1 swept from 96x32 up to
- * 3072x1024; FFT crossover vs O(N^2) direct happens around 384x128. */
 #ifndef NX_VAL
 #define NX_VAL 1536            /* must be multiple of GROUPSIZE */
 #endif
@@ -76,32 +90,53 @@
 #define NY_VAL 512
 #endif
 
-/* Periodic boundary conditions are always on in both x and y — change
- * this only by editing wrap_x / wrap_y in 2d_fft.cu and friends. */
+
+/* ═════════════════════════════════════════════════════════════════════
+ * SECTION 0.5 — Execution model (NEW in v2 — covers i6)
+ *
+ * EXEC_YMSK    : byte-mask approach used by i1..i5.
+ * EXEC_COMPACT : compact active-cell approach used by i6.
+ *
+ * This selector is documentation + sanity-check oriented.  The actual
+ * choice of model is structural (it dictates UserData layout, kernel
+ * signatures, and which BLOCK_* knobs apply).  Setting this macro just
+ * makes the active branch in your sources unambiguous and lets the
+ * sanity checks at the bottom verify that the right knobs are present.
+ * ═════════════════════════════════════════════════════════════════════ */
+
+#define EXEC_YMSK     0   /* i1..i5 */
+#define EXEC_COMPACT  1   /* i6     */
+
+#ifndef EXECUTION_MODEL
+#define EXECUTION_MODEL EXEC_YMSK
+#endif
 
 
 /* ═════════════════════════════════════════════════════════════════════
  * SECTION 1 — Geometry
- * Pick exactly ONE GEOMETRY_KIND value. Hole/active cells are encoded
- * in the SoA mask d_ymsk (1 = active, 0 = hole) which the host fills
- * before launch and which every kernel reads transparently.
+ * Pick exactly ONE GEOMETRY_KIND value.
+ *
+ * Active/hole cells are encoded EITHER in d_ymsk (ymsk mode) OR in
+ * d_active_ids / d_inactive_ids (compact mode).  In both cases the
+ * host fills the data structure before launch using exactly the same
+ * geometry predicate, so the GEOMETRY_KIND macros below are
+ * model-agnostic.
  * ═════════════════════════════════════════════════════════════════════ */
 
 #define GEOMETRY_BULK         0   /* no holes — fully active body         */
 #define GEOMETRY_HOLE_SQUARE  1   /* one centered square interior hole    */
 #define GEOMETRY_RING         2   /* outer rect minus inner rect (ring)   */
 #define GEOMETRY_POLYCRYSTAL  3   /* Voronoi grains + dead-grain holes    */
-#define GEOMETRY_CUSTOM       4   /* you build h_ymsk[] yourself          */
+#define GEOMETRY_CUSTOM       4   /* you build h_ymsk[] or id-lists yourself */
+#define GEOMETRY_ELLIPSE      5   /* centered ellipse (i6); circle when rx=ry on square grid */
 
 #ifndef GEOMETRY_KIND
 #define GEOMETRY_KIND GEOMETRY_HOLE_SQUARE
 #endif
 
 /* ── Square-hole knobs (GEOMETRY_HOLE_SQUARE) ────────────────────────
- * The hole is a square centered at (HOLE_CENTER_X_FRAC, HOLE_CENTER_Y_FRAC)
- * (fractions of the ng × ny grid). HOLE_RADIUS_FRAC_Y is the HALF-SIDE
- * of the square in units of ny (so the full side is 2·HOLE_RADIUS_FRAC_Y·ny).
- * Macro name kept for backward compatibility with sweep targets. */
+ * Hole is centered at (HOLE_CENTER_X_FRAC, HOLE_CENTER_Y_FRAC) of the
+ * ng × ny grid; HOLE_RADIUS_FRAC_Y is the HALF-SIDE in units of ny. */
 #ifndef HOLE_CENTER_X_FRAC
 #define HOLE_CENTER_X_FRAC 0.50
 #endif
@@ -112,13 +147,7 @@
 #define HOLE_RADIUS_FRAC_Y 0.22
 #endif
 
-/* ── Ring knobs (GEOMETRY_RING, ie 2d_i5) ────────────────────────────
- * Outer active rectangle, centered:
- *     width  = OUTER_W_FRAC * ng
- *     height = OUTER_H_FRAC * ny
- * Inner rect hole, centered inside outer:
- *     width  = INNER_W_FRAC_OF_OUTER * outer_w
- *     height = INNER_H_FRAC_OF_OUTER * outer_h */
+/* ── Ring knobs (GEOMETRY_RING, ie 2d_i5) ──────────────────────────── */
 #ifndef OUTER_W_FRAC
 #define OUTER_W_FRAC 0.5
 #endif
@@ -132,10 +161,7 @@
 #define INNER_H_FRAC_OF_OUTER 0.5
 #endif
 
-/* ── Polycrystal knobs (GEOMETRY_POLYCRYSTAL, ie 2d_i3) ──────────────
- * NUM_GRAINS Voronoi seeds (stratified jitter, periodic), DEAD_GRAIN_FRAC
- * of them are killed → polygonal holes with soft tanh boundary of width
- * MASK_EPS_CELLS. */
+/* ── Polycrystal knobs (GEOMETRY_POLYCRYSTAL, ie 2d_i3) ─────────────── */
 #ifndef NUM_GRAINS
 #define NUM_GRAINS 72
 #endif
@@ -149,13 +175,27 @@
 #define MASK_EPS_CELLS 2.2          /* tanh boundary width, in cell units */
 #endif
 
+/* ── Ellipse knobs (GEOMETRY_ELLIPSE, ie 2d_i6) ──────────────────────
+ * Centered ellipse with semi-axes
+ *     rx = ACTIVE_RX_FRAC * ng     (cells, along x)
+ *     ry = ACTIVE_RY_FRAC * ny     (cells, along y)
+ * Cells satisfying (dx/rx)^2 + (dy/ry)^2 <= 1 are active.
+ *
+ * Special case: ACTIVE_RX_FRAC == ACTIVE_RY_FRAC on a square ng × ny
+ * grid produces a circle of radius ACTIVE_RX_FRAC * ng cells. */
+#ifndef ACTIVE_RX_FRAC
+#define ACTIVE_RX_FRAC 0.25
+#endif
+#ifndef ACTIVE_RY_FRAC
+#define ACTIVE_RY_FRAC 0.25
+#endif
+
 
 /* ═════════════════════════════════════════════════════════════════════
  * SECTION 2 — Initial condition
- * Pick exactly ONE IC_KIND value.
  * ═════════════════════════════════════════════════════════════════════ */
 
-#define IC_UNIFORM           0   /* all active cells m = (INIT_MX, INIT_MY, INIT_MZ) */
+#define IC_UNIFORM           0   /* m = (INIT_MX, INIT_MY, INIT_MZ) on active cells */
 #define IC_HEAD_ON_STRIPES   1   /* three-stripe head-on transition along x (i1) */
 #define IC_TWO_DOMAIN        2   /* upper anti-aligned + lower aligned (i4) */
 #define IC_GRAIN_BUMPS       3   /* per-grain core ±z bumps, polycrystal only (i3) */
@@ -165,10 +205,7 @@
 #define IC_KIND IC_UNIFORM
 #endif
 
-/* ── Uniform IC (IC_UNIFORM) ─────────────────────────────────────────
- * After normalization the magnitude is 1 in active cells and 0 in holes.
- * A small tilt off the easy axis (default INIT_MY = -0.0175) breaks
- * ±x symmetry so demag + geometry can drive non-uniform dynamics. */
+/* ── Uniform IC ─────────────────────────────────────────────────────── */
 #ifndef INIT_MX
 #define INIT_MX 1.0
 #endif
@@ -179,12 +216,7 @@
 #define INIT_MZ 0.0
 #endif
 
-/* ── Head-on three-stripe IC (IC_HEAD_ON_STRIPES) ────────────────────
- *   i ∈ [0,                   ng·STRIPE_LEFT_FRAC):  mx = -1
- *   i ∈ [ng·STRIPE_LEFT_FRAC, ng·STRIPE_RIGHT_FRAC): mx = +1
- *   i ∈ [ng·STRIPE_RIGHT_FRAC, ng):                  mx = -1
- * INIT_RANDOM_EPS sets a uniform random perturbation in (my, mz) to
- * break y-z symmetry; INIT_RANDOM_SEED makes it reproducible. */
+/* ── Head-on three-stripe IC (i1) ───────────────────────────────────── */
 #ifndef STRIPE_LEFT_FRAC
 #define STRIPE_LEFT_FRAC  0.25
 #endif
@@ -198,21 +230,15 @@
 #define INIT_RANDOM_SEED  12345
 #endif
 
-/* ── Two-domain IC (IC_TWO_DOMAIN, ie 2d_i4) ─────────────────────────
- *   gy >= TWO_DOMAIN_SPLIT_FRAC * ny : m = (-1, 0, 0)
- *   gy <  TWO_DOMAIN_SPLIT_FRAC * ny : m = (+1, ±TWO_DOMAIN_TAIL_MY, 0)
- * with sign of m_y chosen by left/right half. */
+/* ── Two-domain IC (i4) ─────────────────────────────────────────────── */
 #ifndef TWO_DOMAIN_SPLIT_FRAC
-#define TWO_DOMAIN_SPLIT_FRAC 0.875   /* (7*ny)/8 in i4 default */
+#define TWO_DOMAIN_SPLIT_FRAC 0.875
 #endif
 #ifndef TWO_DOMAIN_TAIL_MY
-#define TWO_DOMAIN_TAIL_MY    0.0175  /* uses INIT_MY-style amplitude */
+#define TWO_DOMAIN_TAIL_MY    0.0175
 #endif
 
-/* ── Polycrystal grain bumps (IC_GRAIN_BUMPS, ie 2d_i3) ──────────────
- * Per-grain z-bias, with mz ramped down as a function of distance to
- * the grain seed; in-plane tangent rotates around the seed and blends
- * toward the grain easy axis as you approach the edge. */
+/* ── Polycrystal grain bumps (i3) ───────────────────────────────────── */
 #ifndef GRAIN_Z_BIAS
 #define GRAIN_Z_BIAS 1.6
 #endif
@@ -224,34 +250,25 @@
 /* ═════════════════════════════════════════════════════════════════════
  * SECTION 3 — Physics constants
  *
- * IMPORTANT: these macros set the values at the top of 2d_fft.cu, but
- * jtv.cu and precond.cu store their own __constant__ copies (jc_*, pc_*).
- * If you change anything here you MUST also update those mirror files,
- * or move all three to read from the same header. The cleanest fix is
- * to refactor those files to #include this header and use these macros
- * directly — left as a TODO so this file remains a drop-in addition.
+ * IMPORTANT: these macros set the values at the top of the main .cu,
+ * but jtv.cu and precond.cu store their own __constant__ copies
+ * (jc_*, pc_*).  If you change anything here you MUST also update
+ * those mirror files.  See README "Things that look like knobs but
+ * are NOT" for details and a recommended refactor.
  * ═════════════════════════════════════════════════════════════════════ */
 
-/* Damping & gyromagnetic ratio. Standard simplified LLG:
- *     dm/dt = c_chg (m × h) + c_alpha ( h − (m·h) m ) */
 #ifndef PHYS_C_CHG
-#define PHYS_C_CHG    1.0     /* gyromagnetic precession coefficient */
+#define PHYS_C_CHG    1.0
 #endif
 #ifndef PHYS_C_ALPHA
-#define PHYS_C_ALPHA  0.2     /* Gilbert damping                     */
+#define PHYS_C_ALPHA  0.2
 #endif
 
-/* Exchange constant (coefficient on the 5-point neighbor sum).
- * Range across variants: 4 (i1, i3) ... 50 (i2). Larger = stiffer wall. */
+/* Range across variants: 4 (i1, i3) ... 50 (i2).  i6 default = 10. */
 #ifndef PHYS_C_CHE
 #define PHYS_C_CHE    50.0
 #endif
 
-/* Anisotropy strength. Range across variants: 1 (i2/i4/i5) ... 4 (i1/i3).
- * Two anisotropy laws are used in the project:
- *   - Linear (i1, i3):  h_α += msk_α · (c_chk·m1 + c_cha)
- *   - Cubic  (i2/4/5):  h_α += msk_α · c_chk · m_α · (m_α² − 1)
- * Pick via ANISO_KIND below. */
 #ifndef PHYS_C_CHK
 #define PHYS_C_CHK    1.0
 #endif
@@ -260,15 +277,12 @@
 #endif
 
 #define ANISO_LINEAR  0   /* h += msk · (chk·m1 + cha)         (i1, i3)  */
-#define ANISO_CUBIC   1   /* h += msk_α · chk · m_α·(m_α²-1)   (i2/4/5)  */
+#define ANISO_CUBIC   1   /* h += msk_α · chk · m_α·(m_α²-1)   (i2/4/5/6) */
 
 #ifndef ANISO_KIND
 #define ANISO_KIND ANISO_CUBIC
 #endif
 
-/* Easy-axis direction c_msk. Many variants use {1,0,0} (easy x); 2d_i2/i4/i5
- * use {1,1,1} together with the cubic law. For per-cell axis (polycrystal),
- * leave this as a fallback and rely on udata->d_msk built on the host. */
 #ifndef PHYS_MSK_X
 #define PHYS_MSK_X 1.0
 #endif
@@ -279,9 +293,6 @@
 #define PHYS_MSK_Z 0.0
 #endif
 
-/* DMI strength and direction.
- *   c_chb is the magnitude (default 0.3 across variants).
- *   c_nsk = (PHYS_NSK_X, PHYS_NSK_Y, PHYS_NSK_Z) is the direction. */
 #ifndef PHYS_C_CHB
 #define PHYS_C_CHB 0.3
 #endif
@@ -295,8 +306,7 @@
 #define PHYS_NSK_Z 0.0
 #endif
 
-/* Uniform applied (Zeeman) field. Set HAPP_ENABLE = 1 to add it to h_total
- * (only 2d_i4 uses this). The components are absolute, NOT scaled. */
+/* Uniform applied (Zeeman) field (i4 only).  HAPP_ENABLE = 1 to add. */
 #ifndef HAPP_ENABLE
 #define HAPP_ENABLE 0
 #endif
@@ -314,16 +324,12 @@
 /* ═════════════════════════════════════════════════════════════════════
  * SECTION 4 — Demagnetization (cuFFT D2Z/Z2D pipeline)
  *
- * Demag tensor is precomputed once in Demag_Init using the closed-form
- * Newell calt/ctt construction (81-pt face-averaged). Stored permanently
- * on device as half-spectrum (9 components × ny·(nx/2+1) complex).
- * Per RHS evaluation:
- *   gather → cuFFT D2Z (batch=3) → multiply f̂·m̂ → cuFFT Z2D (batch=3)
- *   → scatter (FFT-shift + scale).
- *
- * DEMAG_STRENGTH = 0.0  → disables demag (h_dmag buffer stays zero)
- * DEMAG_STRENGTH > 0.0  → enables FFT demag, scales N(0) accordingly
- * DEMAG_THICK           → cell thickness in z (in cell-spacing units)
+ * NOTE on EXEC_COMPACT mode: Demag_Apply is FULL-GRID by design (FFT
+ * cannot be compacted).  For active cells the result is correct; for
+ * hole cells h_dmag[] contains garbage, but the compact RHS only
+ * reads h_dmag at active positions, so it doesn't matter.  Hole cells
+ * contribute 0 to the input FFT (since y=0 there), so they don't
+ * contaminate the active cells' output.
  * ═════════════════════════════════════════════════════════════════════ */
 
 #ifndef DEMAG_STRENGTH
@@ -332,13 +338,8 @@
 #ifndef DEMAG_THICK
 #define DEMAG_THICK    1.0
 #endif
-
-/* Windowed demag (only used in 2d_i3 polycrystal): if nonzero, the gather
- * kernel multiplies y by the per-cell weight w on the fly so that demag
- * sees the windowed magnetization w·m. Requires udata->d_w to be allocated
- * and Demag_ApplyWindowed to be linked. Leave 0 for hole/ring/uniform. */
 #ifndef DEMAG_WINDOWED
-#define DEMAG_WINDOWED 0
+#define DEMAG_WINDOWED 0     /* polycrystal-only: gather pre-multiplies y by w */
 #endif
 
 
@@ -346,54 +347,45 @@
  * SECTION 5 — CVODE / SPGMR / kernel tuning
  * ═════════════════════════════════════════════════════════════════════ */
 
-/* Time integration */
 #ifndef T_TOTAL
-#define T_TOTAL 1000.0          /* end time of the simulation */
+#define T_TOTAL 1000.0
 #endif
-
-/* CVODE BDF order cap. 5 is the SUNDIALS maximum. */
 #ifndef MAX_BDF_ORDER
 #define MAX_BDF_ORDER 5
 #endif
-
-/* Tolerances. RTOL = relative; ATOL = absolute (broadcast to all components).
- * Range across variants: 1e-4 ... 1e-6. Tighter → more steps, more accurate. */
 #ifndef RTOL_VAL
 #define RTOL_VAL 1.0e-4
 #endif
 #ifndef ATOL_VAL
 #define ATOL_VAL 1.0e-4
 #endif
-
-/* SPGMR Krylov subspace dimension.
- *   0   → SUNDIALS default (= min(neq, 5))
- *   5   → most variants (best at small/medium grids per i1 sweeps)
- *  10..30 → more headroom before restart, useful at very small grids
- *           where neq < 10k and convergence stalls. */
 #ifndef KRYLOV_DIM
 #define KRYLOV_DIM 5
 #endif
 
-/* CUDA block dimensions for the unified RHS / Jv / preconditioner kernels.
- * BLOCK_X * BLOCK_Y must be ≤ 1024. Default 16x8 = 128 threads/block.
- * The polycrystal tiled stencil sizes its smem off these (BLOCK_X+2)·(BLOCK_Y+2). */
+/* ── CUDA block dimensions ───────────────────────────────────────────
+ *
+ * In EXEC_YMSK mode the per-cell kernels launch as a 2D grid of size
+ *     ceil(ng / BLOCK_X) x ceil(ny / BLOCK_Y)
+ * BLOCK_X * BLOCK_Y must be ≤ 1024.  Default 16x8 = 128 threads/block.
+ *
+ * In EXEC_COMPACT mode the per-cell kernels launch as a 1D grid of size
+ *     ceil(n_active / BLOCK_SIZE)
+ * BLOCK_SIZE must be ≤ 1024.  Default 256.
+ *
+ * Both sets of macros are defined here so a variant can read whichever
+ * applies without #ifdef'ing on EXECUTION_MODEL. */
 #ifndef BLOCK_X
 #define BLOCK_X 16
 #endif
 #ifndef BLOCK_Y
 #define BLOCK_Y 8
 #endif
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256
+#endif
 
-/* Gram-Schmidt orthogonalization in SPGMR.
- *   Small problems (neq < ~500k): Classical GS (CGS) — overhead-limited,
- *     1 fused dot-product-multi call per orthogonalization. Fastest.
- *   Large problems: Modified GS (MGS) — bandwidth-limited, more stable
- *     numerically but has a sync per dot. The default 2d_fft.cu picks
- *     based on neq; you can force one mode here.
- *
- *   GS_KIND_AUTO    — pick CGS if neq < 500k, MGS otherwise (default)
- *   GS_KIND_CGS     — always Classical
- *   GS_KIND_MGS     — always Modified */
+/* Gram-Schmidt orthogonalization in SPGMR. */
 #define GS_KIND_AUTO 0
 #define GS_KIND_CGS  1
 #define GS_KIND_MGS  2
@@ -407,27 +399,18 @@
  * SECTION 6 — Output / I/O schedule
  * ═════════════════════════════════════════════════════════════════════ */
 
-/* ENABLE_OUTPUT = 1 turns on per-frame dumps to output.txt. Zero by
- * default — you almost never want output during sweeps. */
 #ifndef ENABLE_OUTPUT
 #define ENABLE_OUTPUT 0
 #endif
-
-/* Two-rate save schedule. Early frames (when domain wall / nucleation
- * dynamics are fastest) are saved more often; late steady-state frames
- * are saved sparsely. */
 #ifndef EARLY_SAVE_UNTIL
-#define EARLY_SAVE_UNTIL 80.0   /* time in simulation units */
+#define EARLY_SAVE_UNTIL 80.0
 #endif
 #ifndef EARLY_SAVE_EVERY
-#define EARLY_SAVE_EVERY 5      /* save every N output steps for t ≤ EARLY_SAVE_UNTIL */
+#define EARLY_SAVE_EVERY 5
 #endif
 #ifndef LATE_SAVE_EVERY
-#define LATE_SAVE_EVERY  100    /* save every N output steps for t >  EARLY_SAVE_UNTIL */
+#define LATE_SAVE_EVERY  100
 #endif
-
-/* Final-state dump (writes the last frame to output.txt regardless of
- * ENABLE_OUTPUT). Useful for post-mortem visualization. */
 #ifndef WRITE_FINAL_STATE
 #define WRITE_FINAL_STATE 1
 #endif
@@ -437,7 +420,6 @@
  * SECTION 7 — Derived constants (do not edit)
  * ═════════════════════════════════════════════════════════════════════ */
 
-/* SUNDIALS-typed copies of RTOL/ATOL/T_TOTAL. */
 #define RTOL  SUN_RCONST(RTOL_VAL)
 #define ATOL1 SUN_RCONST(ATOL_VAL)
 #define ATOL2 SUN_RCONST(ATOL_VAL)
@@ -459,6 +441,10 @@
 #  error "BLOCK_X * BLOCK_Y exceeds the CUDA per-block thread limit (1024)."
 #endif
 
+#if BLOCK_SIZE > 1024
+#  error "BLOCK_SIZE exceeds the CUDA per-block thread limit (1024)."
+#endif
+
 #if (GEOMETRY_KIND == GEOMETRY_POLYCRYSTAL) && (NUM_GRAINS < 1)
 #  error "GEOMETRY_POLYCRYSTAL requires NUM_GRAINS >= 1."
 #endif
@@ -467,5 +453,49 @@
     ((INNER_W_FRAC_OF_OUTER >= 1.0) || (INNER_H_FRAC_OF_OUTER >= 1.0))
 #  error "Ring geometry requires inner < outer (INNER_*_FRAC_OF_OUTER < 1.0)."
 #endif
+
+#if (GEOMETRY_KIND == GEOMETRY_ELLIPSE) && \
+    ((ACTIVE_RX_FRAC <= 0.0) || (ACTIVE_RY_FRAC <= 0.0))
+#  error "Ellipse geometry requires ACTIVE_RX_FRAC > 0 and ACTIVE_RY_FRAC > 0."
+#endif
+
+#if (EXECUTION_MODEL != EXEC_YMSK) && (EXECUTION_MODEL != EXEC_COMPACT)
+#  error "EXECUTION_MODEL must be EXEC_YMSK or EXEC_COMPACT."
+#endif
+
+
+/* ═════════════════════════════════════════════════════════════════════
+ * SECTION 9 — UserData layouts (REFERENCE — for the .cu source files)
+ *
+ * The struct layout depends on EXECUTION_MODEL.  Three files mirror
+ * the same struct: <main>.cu (UserData), jtv.cu (JtvUserData), and
+ * precond.cu (PcUserData).  All three MUST match byte-for-byte.
+ *
+ * ──── EXEC_YMSK layout (i1..i5) ── 88 bytes ─────────────────────────
+ *   offset 0  : PrecondData *pd
+ *   offset 8  : DemagData   *demag
+ *   offset 16 : sunrealtype *d_hdmag       (3*ncell)
+ *   offset 24 : sunrealtype *d_ymsk        (3*ncell, 1 active / 0 hole)
+ *   offset 32 : int nx, ny, ng, ncell, neq (5*4 = 20 B)
+ *   offset 52 : 4 B padding
+ *   offset 56 : double nxx0, nyy0, nzz0
+ *
+ * ──── EXEC_COMPACT layout (i6) ── 96 bytes ──────────────────────────
+ *   offset 0  : PrecondData *pd
+ *   offset 8  : DemagData   *demag
+ *   offset 16 : sunrealtype *d_hdmag       (3*ncell)
+ *   offset 24 : int         *d_active_ids    (n_active)
+ *   offset 32 : int         *d_inactive_ids  (n_inactive)
+ *   offset 40 : int nx, ny, ng, ncell, neq (5*4 = 20 B)
+ *   offset 60 : int n_active, n_inactive   (2*4 = 8 B)
+ *   offset 68 : 4 B padding
+ *   offset 72 : double nxx0, nyy0, nzz0
+ *
+ * If you EXTEND either layout (e.g. add a new pointer field), you
+ * MUST add the same field at the same offset in jtv.cu's JtvUserData
+ * and precond.cu's PcUserData.  Build will compile fine without it
+ * (the structs are all named differently) but you'll get silent
+ * memory corruption at runtime.
+ * ═════════════════════════════════════════════════════════════════════ */
 
 #endif /* SIM_CONFIG_H */

@@ -1,5 +1,7 @@
 # =============================================================================
-# params.mk  —  Makefile fragment exposing every sim_config.h knob as -D
+# params.mk  —  v2: covers 2d_i1 ... 2d_i6.
+#
+# Makefile fragment exposing every sim_config.h knob as a -D override.
 #
 # Usage:  add `include params.mk` near the top of your variant's Makefile
 #         (replacing the per-variant knob block). All defaults below match
@@ -7,24 +9,28 @@
 #
 #             make NX_VAL=3072 NY_VAL=1024 DEMAG_STRENGTH=2.0
 #             make GEOMETRY_KIND=2 OUTER_W_FRAC=0.6 INNER_W_FRAC_OF_OUTER=0.4
-#             make IC_KIND=1 STRIPE_LEFT_FRAC=0.30 STRIPE_RIGHT_FRAC=0.70
+#             make GEOMETRY_KIND=5 ACTIVE_RX_FRAC=0.3 ACTIVE_RY_FRAC=0.2
+#             make EXECUTION_MODEL=1 BLOCK_SIZE=512  # i6-style compact, 1D launch
 #
-# At the end this file appends ALL -D flags to NVCC_FLAGS. If your variant
-# already has its own NVCC_FLAGS line, just include this file AFTER it.
+# At the end this file appends ALL -D flags to NVCC_FLAGS.
 #
-# Numeric integer codes for GEOMETRY_KIND and IC_KIND must match
-# sim_config.h:
+# Numeric integer codes (must match sim_config.h):
 #
-#   GEOMETRY_KIND :  0=BULK, 1=HOLE_SQUARE, 2=RING, 3=POLYCRYSTAL, 4=CUSTOM
-#   IC_KIND       :  0=UNIFORM, 1=HEAD_ON_STRIPES, 2=TWO_DOMAIN,
-#                    3=GRAIN_BUMPS, 4=CUSTOM
-#   ANISO_KIND    :  0=LINEAR, 1=CUBIC
-#   GS_KIND       :  0=AUTO, 1=CGS, 2=MGS
+#   EXECUTION_MODEL :  0=YMSK (i1..i5),  1=COMPACT (i6)
+#   GEOMETRY_KIND   :  0=BULK, 1=HOLE_SQUARE, 2=RING, 3=POLYCRYSTAL,
+#                      4=CUSTOM, 5=ELLIPSE
+#   IC_KIND         :  0=UNIFORM, 1=HEAD_ON_STRIPES, 2=TWO_DOMAIN,
+#                      3=GRAIN_BUMPS, 4=CUSTOM
+#   ANISO_KIND      :  0=LINEAR, 1=CUBIC
+#   GS_KIND         :  0=AUTO, 1=CGS, 2=MGS
 # =============================================================================
 
 # ── Section 0: discretization ────────────────────────────────────────
 NX_VAL                 ?= 1536
 NY_VAL                 ?= 512
+
+# ── Section 0.5: execution model (NEW — picks ymsk vs compact) ────
+EXECUTION_MODEL        ?= 0
 
 # ── Section 1: geometry selector ─────────────────────────────────────
 GEOMETRY_KIND          ?= 1
@@ -45,6 +51,12 @@ NUM_GRAINS             ?= 72
 DEAD_GRAIN_FRAC        ?= 0.16
 HOLE_SEED              ?= 20251104
 MASK_EPS_CELLS         ?= 2.2
+
+# Ellipse knobs (GEOMETRY_KIND=5, NEW for i6)
+# rx = ACTIVE_RX_FRAC * ng,  ry = ACTIVE_RY_FRAC * ny
+# rx == ry on a square ng x ny grid → circle.
+ACTIVE_RX_FRAC         ?= 0.25
+ACTIVE_RY_FRAC         ?= 0.25
 
 # ── Section 2: initial condition ─────────────────────────────────────
 IC_KIND                ?= 0
@@ -101,8 +113,14 @@ MAX_BDF_ORDER          ?= 5
 RTOL_VAL               ?= 1.0e-4
 ATOL_VAL               ?= 1.0e-4
 KRYLOV_DIM             ?= 5
+
+# Block dims:
+#  - YMSK mode    uses BLOCK_X * BLOCK_Y (2D launches)
+#  - COMPACT mode uses BLOCK_SIZE        (1D launches over n_active)
 BLOCK_X                ?= 16
 BLOCK_Y                ?= 8
+BLOCK_SIZE             ?= 256
+
 GS_KIND                ?= 0
 
 # ── Section 6: output ────────────────────────────────────────────────
@@ -118,6 +136,7 @@ WRITE_FINAL_STATE      ?= 1
 # =============================================================================
 SIM_CONFIG_DEFINES := \
     -DNX_VAL=$(NX_VAL) -DNY_VAL=$(NY_VAL) \
+    -DEXECUTION_MODEL=$(EXECUTION_MODEL) \
     -DGEOMETRY_KIND=$(GEOMETRY_KIND) \
     -DHOLE_CENTER_X_FRAC=$(HOLE_CENTER_X_FRAC) \
     -DHOLE_CENTER_Y_FRAC=$(HOLE_CENTER_Y_FRAC) \
@@ -130,6 +149,8 @@ SIM_CONFIG_DEFINES := \
     -DDEAD_GRAIN_FRAC=$(DEAD_GRAIN_FRAC) \
     -DHOLE_SEED=$(HOLE_SEED) \
     -DMASK_EPS_CELLS=$(MASK_EPS_CELLS) \
+    -DACTIVE_RX_FRAC=$(ACTIVE_RX_FRAC) \
+    -DACTIVE_RY_FRAC=$(ACTIVE_RY_FRAC) \
     -DIC_KIND=$(IC_KIND) \
     -DINIT_MX=$(INIT_MX) -DINIT_MY=$(INIT_MY) -DINIT_MZ=$(INIT_MZ) \
     -DSTRIPE_LEFT_FRAC=$(STRIPE_LEFT_FRAC) \
@@ -153,7 +174,7 @@ SIM_CONFIG_DEFINES := \
     -DT_TOTAL=$(T_TOTAL) -DMAX_BDF_ORDER=$(MAX_BDF_ORDER) \
     -DRTOL_VAL=$(RTOL_VAL) -DATOL_VAL=$(ATOL_VAL) \
     -DKRYLOV_DIM=$(KRYLOV_DIM) \
-    -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) \
+    -DBLOCK_X=$(BLOCK_X) -DBLOCK_Y=$(BLOCK_Y) -DBLOCK_SIZE=$(BLOCK_SIZE) \
     -DGS_KIND=$(GS_KIND) \
     -DENABLE_OUTPUT=$(ENABLE_OUTPUT) \
     -DEARLY_SAVE_UNTIL=$(EARLY_SAVE_UNTIL) \
@@ -167,10 +188,17 @@ NVCC_FLAGS += $(SIM_CONFIG_DEFINES)
 show-config:
 	@echo "─── Discretization ───"
 	@echo "NX_VAL=$(NX_VAL)  NY_VAL=$(NY_VAL)"
+	@echo "─── Execution model ───"
+	@if [ "$(EXECUTION_MODEL)" = "0" ]; then \
+	  echo "  EXEC_YMSK   (i1..i5): full-grid 2D launches, output*=ymsk; BLOCK=$(BLOCK_X)x$(BLOCK_Y)"; \
+	else \
+	  echo "  EXEC_COMPACT (i6)  : 1D launches over n_active; BLOCK_SIZE=$(BLOCK_SIZE)"; \
+	fi
 	@echo "─── Geometry (KIND=$(GEOMETRY_KIND)) ───"
 	@echo "  square hole:  centre=($(HOLE_CENTER_X_FRAC),$(HOLE_CENTER_Y_FRAC))  half-side=$(HOLE_RADIUS_FRAC_Y)"
 	@echo "  ring:         outer=($(OUTER_W_FRAC) x $(OUTER_H_FRAC))  inner=($(INNER_W_FRAC_OF_OUTER) x $(INNER_H_FRAC_OF_OUTER))"
 	@echo "  polycrystal:  ngrains=$(NUM_GRAINS)  dead=$(DEAD_GRAIN_FRAC)  seed=$(HOLE_SEED)  eps=$(MASK_EPS_CELLS)"
+	@echo "  ellipse:      rx=$(ACTIVE_RX_FRAC)*ng  ry=$(ACTIVE_RY_FRAC)*ny"
 	@echo "─── IC (KIND=$(IC_KIND)) ───"
 	@echo "  uniform:        m=($(INIT_MX),$(INIT_MY),$(INIT_MZ))"
 	@echo "  head-on stripes: q=[$(STRIPE_LEFT_FRAC),$(STRIPE_RIGHT_FRAC)]  eps=$(INIT_RANDOM_EPS)  seed=$(INIT_RANDOM_SEED)"
@@ -186,7 +214,6 @@ show-config:
 	@echo "─── Solver ───"
 	@echo "  T_TOTAL=$(T_TOTAL)  RTOL=$(RTOL_VAL)  ATOL=$(ATOL_VAL)"
 	@echo "  KRYLOV_DIM=$(KRYLOV_DIM)  BDF=$(MAX_BDF_ORDER)  GS_KIND=$(GS_KIND)"
-	@echo "  BLOCK=($(BLOCK_X) x $(BLOCK_Y))"
 	@echo "─── Output ───"
 	@echo "  enable=$(ENABLE_OUTPUT)  early<=$(EARLY_SAVE_UNTIL) every $(EARLY_SAVE_EVERY)  late every $(LATE_SAVE_EVERY)"
 	@echo "  final-state dump=$(WRITE_FINAL_STATE)"
