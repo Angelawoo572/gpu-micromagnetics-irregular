@@ -33,15 +33,11 @@ KRYLOV_DIM ?= 5
 DEMAG_STRENGTH ?= 4.0
 DEMAG_THICK    ?= 1.0
 
-# ====== Ring geometry ======
-# Outer active rect:   OUTER_W_FRAC * ng   by   OUTER_H_FRAC * ny   (centered)
-# Inner rect hole:     INNER_W_FRAC_OF_OUTER * outer_w   by   INNER_H_FRAC_OF_OUTER * outer_h
-# Defaults: outer = half the grid, inner = half the outer (per professor's sketch).
-OUTER_W_FRAC          ?= 0.5
-OUTER_H_FRAC          ?= 0.5
-INNER_W_FRAC_OF_OUTER ?= 0.5
-INNER_H_FRAC_OF_OUTER ?= 0.5
-
+# ====== i5 centered active-rectangle geometry ======
+# Only the centered rectangle is active.
+# Outside this rectangle is masked out.
+OUTER_W_FRAC ?= 0.5
+OUTER_H_FRAC ?= 0.5
 # ====== Output schedule ======
 EARLY_SAVE_UNTIL ?= 100.0
 EARLY_SAVE_EVERY ?= 50
@@ -64,9 +60,7 @@ NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DDEMAG_STRENGTH=$(DEMAG_STRENGTH) \
               -DDEMAG_THICK=$(DEMAG_THICK) \
               -DOUTER_W_FRAC=$(OUTER_W_FRAC) \
-              -DOUTER_H_FRAC=$(OUTER_H_FRAC) \
-              -DINNER_W_FRAC_OF_OUTER=$(INNER_W_FRAC_OF_OUTER) \
-              -DINNER_H_FRAC_OF_OUTER=$(INNER_H_FRAC_OF_OUTER)
+              -DOUTER_H_FRAC=$(OUTER_H_FRAC)
 
 # ====== Sources & objects ======
 TARGET      := 2d_fft

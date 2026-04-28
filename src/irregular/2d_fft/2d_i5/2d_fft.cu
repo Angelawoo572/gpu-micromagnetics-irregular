@@ -175,7 +175,7 @@ __constant__ sunrealtype c_nsk[3] = {
     SUN_RCONST(1.0), SUN_RCONST(0.0), SUN_RCONST(0.0)};
 
 __constant__ sunrealtype c_chk   = SUN_RCONST(1.0);
-__constant__ sunrealtype c_che   = SUN_RCONST(6.0);
+__constant__ sunrealtype c_che   = SUN_RCONST(10.0);
 __constant__ sunrealtype c_alpha = SUN_RCONST(0.2);
 __constant__ sunrealtype c_chg   = SUN_RCONST(1.0);
 
@@ -495,39 +495,43 @@ int main(int argc, char* argv[]) {
   /* Build mask on host, then upload. */
   sunrealtype *h_ymsk = (sunrealtype*)malloc((size_t)3 * ncell * sizeof(sunrealtype));
   if (!h_ymsk) { fprintf(stderr, "h_ymsk malloc failed\n"); return 1; }
-  /* ─── Ring geometry: outer active rect with inner rect hole ───────
-    *   - Outer rectangle (active region):
-    *       width  = OUTER_W_FRAC * ng,  height = OUTER_H_FRAC * ny
-    *       centered in the ng × ny grid
-    *   - Inner rectangle (hole):
-    *       width  = INNER_W_FRAC_OF_OUTER * outer_w
-    *       height = INNER_H_FRAC_OF_OUTER * outer_h
-    *       centered inside the outer rectangle
-    *   - Cells outside outer rect          → hole (m=0)
-    *   - Cells inside outer, outside inner → active (m = +x)
-    *   - Cells inside inner rect           → hole (m=0)
-    */
+  /* ─── i5 geometry: centered active rectangle inside a larger grid ─────
+  *   - The full FFT/CVODE grid is ng × ny.
+  *   - Only the centered rectangle is magnetic / active.
+  *   - By default, the active rectangle has size:
+  *
+  *       OUTER_W_FRAC * ng  by  OUTER_H_FRAC * ny
+  *
+  *     with OUTER_W_FRAC = OUTER_H_FRAC = 0.5.
+  *
+  *   - Cells inside the centered rectangle:
+  *       active, m = uniform initial direction
+  *
+  *   - Cells outside the centered rectangle:
+  *       hole/background, m = 0, frozen by ymsk = 0
+  *
+  *   This is NOT a ring geometry. There is no inner hole.
+  */
   {
     const double cx_g    = 0.5 * (double)ng;
     const double cy_g    = 0.5 * (double)ny;
     const double halfW_o = 0.5 * OUTER_W_FRAC * (double)ng;
     const double halfH_o = 0.5 * OUTER_H_FRAC * (double)ny;
-    const double halfW_i = halfW_o * INNER_W_FRAC_OF_OUTER;
-    const double halfH_i = halfH_o * INNER_H_FRAC_OF_OUTER;
-
     for (int j = 0; j < ny; ++j) {
       for (int i = 0; i < ng; ++i) {
         const int cell = j * ng + i;
+
         const double dx = fabs((double)i + 0.5 - cx_g);
         const double dy = fabs((double)j + 0.5 - cy_g);
 
         const int in_outer = (dx <= halfW_o && dy <= halfH_o);
-        const int in_inner = (dx <= halfW_i && dy <= halfH_i);
-        // const int active   = in_outer && !in_inner; ring active
-        const int active = !in_outer || in_inner; // ring hole
+
+        /* i5: only the centered rectangle is active */
+        const int active = in_outer;
 
         const sunrealtype m = active ? SUN_RCONST(1.0) : SUN_RCONST(0.0);
-        if (active) n_active_count++; else n_hole_count++;
+        if (active) n_active_count++;
+        else        n_hole_count++;
 
         h_ymsk[idx_mx(cell, ncell)] = m;
         h_ymsk[idx_my(cell, ncell)] = m;
@@ -538,11 +542,10 @@ int main(int argc, char* argv[]) {
   CHECK_CUDA(cudaMemcpy(udata.d_ymsk, h_ymsk,
                         (size_t)3 * ncell * sizeof(sunrealtype),
                         cudaMemcpyHostToDevice));
-  printf("[geometry] ring: outer=%.2fx%.2f of grid, inner=%.2fx%.2f of outer  "
-        "(active=%ld, hole=%ld, total=%d)\n",
-        (double)OUTER_W_FRAC, (double)OUTER_H_FRAC,
-        (double)INNER_W_FRAC_OF_OUTER, (double)INNER_H_FRAC_OF_OUTER,
-        n_active_count, n_hole_count, ncell);
+  printf("[geometry] i5 centered active rectangle: active rect=%.2fx%.2f of grid  "
+       "(active=%ld, hole=%ld, total=%d)\n",
+       (double)OUTER_W_FRAC, (double)OUTER_H_FRAC,
+       n_active_count, n_hole_count, ncell);
 
   /* FFT demag (Newell tensor f̂, computed once here). */
   dstr = (double)DEMAG_STRENGTH;
