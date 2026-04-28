@@ -387,7 +387,8 @@ ys = 1:stride:ny;
 
 gif_top  = 'mx_topview.gif';
 gif_3d   = 'mx_3d_surf.gif';
-gif_map  = 'dmi_map_topview.gif';
+gif_my3d = 'my_3d_surf.gif';
+gif_my_top = 'my_topview.gif';
 
 for iframe = 1:nframe
     header_row = 1 + (iframe-1)*frame_len;
@@ -442,24 +443,38 @@ for iframe = 1:nframe
     drawnow;
     write_gif_frame(fig2, gif_3d, iframe, 0.10);
 
-    % ========== 3. DMI-like map top view ==========
+    % ========== 3. my 3D surf ==========
     fig3 = figure(3); clf;
     set(fig3, 'Color', 'w');
-    surf(X, Y, MAP);
+    surf(X, Y, MY);
+    shading interp;
+    view(3);
+    axis tight;
+    colorbar;
+    xlabel('x'); ylabel('y'); zlabel('m_y');
+    title(sprintf('m_y 3D surf, frame %d/%d, t=%.3f', iframe, nframe, tnow));
+    drawnow;
+    write_gif_frame(fig3, gif_my3d, iframe, 0.10);
+
+    % ========== 4. my top view ==========
+    fig4 = figure(4); clf;
+    set(fig4, 'Color', 'w');
+    surf(X, Y, MY);
     shading interp;
     view(2);
     axis equal tight;
     colorbar;
     xlabel('x'); ylabel('y');
-    title(sprintf('map = d_y m_x - d_x m_y, frame %d/%d, t=%.3f', iframe, nframe, tnow));
+    title(sprintf('m_y top view, frame %d/%d, t=%.3f', iframe, nframe, tnow));
     drawnow;
-    write_gif_frame(fig3, gif_map, iframe, 0.10);
+    write_gif_frame(fig4, gif_my_top, iframe, 0.10);
 end
 
 fprintf('Saved GIFs:\n');
 fprintf('  %s\n', gif_top);
 fprintf('  %s\n', gif_3d);
-fprintf('  %s\n', gif_map);
+fprintf('  %s\n', gif_my3d);
+fprintf('  %s\n', gif_my_top);
 
 function write_gif_frame(fig, gif_name, iframe, delay)
     frame = getframe(fig);
