@@ -132,19 +132,19 @@ make NX_VAL=1536 NY_VAL=512 DEMAG_STRENGTH=2.0 RTOL_VAL=1e-4
 
 ## Correctness Validation
 
-Current validation is staged:
+Validation is performed in stages:
 
-* **1D local-interaction results**
-  Used to verify qualitative spatial magnetization evolution.
+- **1D local-interaction results**  
+  Verify qualitative spatial magnetization evolution.
 
-* **Representative 3D magnetization traces**
-  Used to verify plausible LLG dynamics for individual vectors.
+- **Representative 3D magnetization traces**  
+  Verify physically plausible LLG dynamics for individual vectors.
 
-* **2D local-only vector fields**
-  Used to validate the 2D extension before integrating FFT-based long-range terms.
+- **2D local-only vector fields**  
+  Validate the 2D implementation before adding FFT-based long-range terms.
 
-The final system additionally validate small FFT-based cases against
-simplified or direct reference computations where possible.
+- **FFT-based cases (final system)**  
+  Validate small cases against simplified or direct reference computations where possible.
 
 ## Conclusion
 
