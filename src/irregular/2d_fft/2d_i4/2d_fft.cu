@@ -566,7 +566,7 @@ int main(int argc, char* argv[]) {
    * Hole cells: m = 0 exactly. */
   {
     // (3 * ny) / 4;
-    const int    j_split   = (7 * ny) / 4;          /* boundary between body and top stripe */
+    const int    j_split   = (7 * ny) / 8;          /* boundary between body and top stripe */
     const double m_tail    = (double)INIT_MY;       /* small ±y perturbation amplitude */
 
     for (int j = 0; j < ny; j++) {
