@@ -27,8 +27,8 @@ Init: head-on stripes   q1=8 (x=0.25*ng)   q3=24 (x=0.75*ng)
       mx = -1 | +1 | -1       random my,mz amplitude = 0.010
 DEMAG_STRENGTH=2.0000  DEMAG_THICK=1.0000  (h_dmag = IFFT[f_hat * m_hat] via cuFFT real-to-complex (D2Z/Z2D), fused into RHS)
 T_TOTAL=1000.00  RTOL/ATOL=1.0e-04
-GPU simulation took 12225.644 ms
+GPU simulation took 10788.376 ms
 
 Final Statistics:
-nst = 35840  nfe  = 41788  nsetups = 1800   nni = 41785  ncfn = 0      netf = 5      nge = 0
-nli = 90773  nlcf = 0      njvevals = 90773
+nst = 31306  nfe  = 36259  nsetups = 1574   nni = 36256  ncfn = 0      netf = 6      nge = 0
+nli = 81371  nlcf = 0      njvevals = 81371
