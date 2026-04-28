@@ -34,10 +34,14 @@ KRYLOV_DIM ?= 5
 DEMAG_STRENGTH ?= 4.0
 DEMAG_THICK    ?= 1.0
 
-# ====== i6 circular active-region geometry ======
-# Centered circle of radius  ACTIVE_RADIUS_FRAC * min(ng, ny)  cells.
-# Cells inside the circle are active; everything outside is hole.
-ACTIVE_RADIUS_FRAC ?= 0.25
+# ====== i6 elliptical active-region geometry ======
+# Centered ellipse with semi-axes
+#   rx = ACTIVE_RX_FRAC * ng   cells (along x)
+#   ry = ACTIVE_RY_FRAC * ny   cells (along y)
+# Cells inside (dx/rx)^2 + (dy/ry)^2 <= 1 are active; rest is hole.
+# Both fractions equal on a square ng×ny grid → circle.
+ACTIVE_RX_FRAC ?= 0.25
+ACTIVE_RY_FRAC ?= 0.50
 
 # ====== Output schedule ======
 EARLY_SAVE_UNTIL ?= 100.0
@@ -60,7 +64,8 @@ NVCC_FLAGS += -DENABLE_OUTPUT=$(PRINT) \
               -DLATE_SAVE_EVERY=$(LATE_SAVE_EVERY) \
               -DDEMAG_STRENGTH=$(DEMAG_STRENGTH) \
               -DDEMAG_THICK=$(DEMAG_THICK) \
-              -DACTIVE_RADIUS_FRAC=$(ACTIVE_RADIUS_FRAC)
+              -DACTIVE_RX_FRAC=$(ACTIVE_RX_FRAC) \
+              -DACTIVE_RY_FRAC=$(ACTIVE_RY_FRAC)
 
 # ====== Sources & objects ======
 TARGET      := 2d_i6
@@ -94,7 +99,8 @@ NCU_FLAGS ?= --set roofline -o ncu_$(TARGET)
 
 .PHONY: all run run-debug build-debug build-release \
         run-print run-noprint run-demag run-no-demag \
-        sweep-block sweep-tol sweep-demag sweep-krylov sweep-radius \
+        sweep-block sweep-tol sweep-demag sweep-krylov \
+        sweep-rx sweep-ry sweep-ellipse \
         profile profile-light profile-ext stats \
         export-csv export-sqlite ui compute \
         show-config clean reallyclean reports \
@@ -196,15 +202,37 @@ sweep-krylov:
 	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_krylov_$${kd}.txt; \
 	done
 
-# Sweep the circle radius fraction (active-region size).
-# Smaller radius → fewer active cells, larger speedup vs full-grid.
-sweep-radius:
-	@for r in 0.10 0.15 0.20 0.25 0.30; do \
+# Sweep the x semi-axis (ry held at default).
+sweep-rx:
+	@for r in 0.10 0.15 0.20 0.25 0.30 0.40; do \
 	  echo "========================================"; \
-	  echo "Testing ACTIVE_RADIUS_FRAC=$$r"; \
+	  echo "Testing ACTIVE_RX_FRAC=$$r  (ry=$(ACTIVE_RY_FRAC))"; \
 	  $(MAKE) clean >/dev/null 2>&1; \
-	  $(MAKE) BUILD=release PRINT=0 ACTIVE_RADIUS_FRAC=$$r >/dev/null && \
-	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_radius_$${r}.txt; \
+	  $(MAKE) BUILD=release PRINT=0 ACTIVE_RX_FRAC=$$r >/dev/null && \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_rx_$${r}.txt; \
+	done
+
+# Sweep the y semi-axis (rx held at default).
+sweep-ry:
+	@for r in 0.10 0.15 0.20 0.25 0.30 0.40; do \
+	  echo "========================================"; \
+	  echo "Testing ACTIVE_RY_FRAC=$$r  (rx=$(ACTIVE_RX_FRAC))"; \
+	  $(MAKE) clean >/dev/null 2>&1; \
+	  $(MAKE) BUILD=release PRINT=0 ACTIVE_RY_FRAC=$$r >/dev/null && \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_ry_$${r}.txt; \
+	done
+
+# Sweep aspect ratio at fixed area (rx*ry constant ≈ 0.25*0.25 = 0.0625).
+# Goes from circle (1:1) through stretched ellipses to a thin band.
+sweep-ellipse:
+	@for pair in "0.25 0.25" "0.30 0.208" "0.35 0.179" "0.40 0.156" "0.50 0.125"; do \
+	  rx=`echo $$pair | awk '{print $$1}'`; \
+	  ry=`echo $$pair | awk '{print $$2}'`; \
+	  echo "========================================"; \
+	  echo "Testing ACTIVE_RX_FRAC=$$rx  ACTIVE_RY_FRAC=$$ry"; \
+	  $(MAKE) clean >/dev/null 2>&1; \
+	  $(MAKE) BUILD=release PRINT=0 ACTIVE_RX_FRAC=$$rx ACTIVE_RY_FRAC=$$ry >/dev/null && \
+	  LD_LIBRARY_PATH=$(SUNDIALS_DIR)/lib64 ./$(TARGET) $(ARGS) | tee run_ellipse_rx$${rx}_ry$${ry}.txt; \
 	done
 
 # ====== Nsight Systems ======
@@ -252,7 +280,8 @@ show-config:
 	@echo "SRC                     = $(SRC)"
 	@echo "DEMAG_STRENGTH          = $(DEMAG_STRENGTH)"
 	@echo "DEMAG_THICK             = $(DEMAG_THICK)"
-	@echo "ACTIVE_RADIUS_FRAC      = $(ACTIVE_RADIUS_FRAC)"
+	@echo "ACTIVE_RX_FRAC          = $(ACTIVE_RX_FRAC)"
+	@echo "ACTIVE_RY_FRAC          = $(ACTIVE_RY_FRAC)"
 	@echo "KRYLOV_DIM              = $(KRYLOV_DIM)"
 	@echo "RTOL_VAL                = $(RTOL_VAL)"
 	@echo "ATOL_VAL                = $(ATOL_VAL)"

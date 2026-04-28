@@ -1,17 +1,20 @@
 /**
- * 2D irregular LLG solver — CIRCULAR active geometry + COMPACT active-cell
+ * 2D irregular LLG solver — ELLIPTICAL active geometry + COMPACT active-cell
  * execution + FFT demag.  CVODE + CUDA, SoA layout.
  *
  * Derived from 2d_i5 (centered-rectangle geometry, ymsk-mask execution)
  * by adopting 2d_i1's compact active-cell execution model.
  *
  * ─── Geometry (i6) ──────────────────────────────────────────────────
- * Centered CIRCLE of radius  ACTIVE_RADIUS_FRAC * min(ng, ny)  cells.
- *   - cells inside circle  : active
- *   - cells outside circle : hole / background, m = 0, frozen
+ * Centered ELLIPSE with semi-axes
+ *   rx = ACTIVE_RX_FRAC * ng   cells (along x)
+ *   ry = ACTIVE_RY_FRAC * ny   cells (along y)
+ * defined by  (dx/rx)^2 + (dy/ry)^2 <= 1.
+ *   - cells inside ellipse  : active
+ *   - cells outside ellipse : hole / background, m = 0, frozen
  *
- * Everything outside the circle is masked off.  Only the circle
- * is unmasked.
+ * Setting  ACTIVE_RX_FRAC = ACTIVE_RY_FRAC  on a square grid recovers
+ * a circle.  Setting one ≠ the other yields a stretched ellipse.
  *
  * ─── Compact active-cell execution (replaces ymsk approach) ─────────
  * Geometry is encoded as TWO compact index lists, on host and device:
@@ -48,10 +51,11 @@
  * cells' output.
  *
  * ─── Build knobs ────────────────────────────────────────────────────
- *   ACTIVE_RADIUS_FRAC : circle radius as fraction of min(ng, ny).
- *                        Default 0.25  →  radius = 128 cells on a 512 grid.
- *   DEMAG_STRENGTH     : scale on FFT demag (0 disables).
- *   BLOCK_SIZE         : threads per block for compact 1D launches.
+ *   ACTIVE_RX_FRAC : x semi-axis as fraction of ng. Default 0.25.
+ *   ACTIVE_RY_FRAC : y semi-axis as fraction of ny. Default 0.25.
+ *                    On a square ng×ny grid, both 0.25 → circle r=0.25*ng.
+ *   DEMAG_STRENGTH : scale on FFT demag (0 disables).
+ *   BLOCK_SIZE     : threads per block for compact 1D launches.
  */
 
 #include <cvode/cvode.h>
@@ -143,13 +147,18 @@
 #define LATE_SAVE_EVERY 100
 #endif
 
-/* ─── Circular geometry knob ─────────────────────────────────────────
- * Active region: centered circle of radius
- *     ACTIVE_RADIUS_FRAC * min(ng, ny)   cells.
- * Outside the circle is masked out (hole / background).
+/* ─── Elliptical geometry knobs ──────────────────────────────────────
+ * Active region: centered ellipse with semi-axes
+ *     rx = ACTIVE_RX_FRAC * ng     (cells, along x)
+ *     ry = ACTIVE_RY_FRAC * ny     (cells, along y)
+ * Inside ellipse  (dx/rx)^2 + (dy/ry)^2 <= 1  is active.
+ * Outside is masked out (hole / background).
  * ──────────────────────────────────────────────────────────────── */
-#ifndef ACTIVE_RADIUS_FRAC
-#define ACTIVE_RADIUS_FRAC 0.25
+#ifndef ACTIVE_RX_FRAC
+#define ACTIVE_RX_FRAC 0.25
+#endif
+#ifndef ACTIVE_RY_FRAC
+#define ACTIVE_RY_FRAC 0.25
 #endif
 
 /* ─── Material constants (device constant memory) ─────────────────── */
@@ -441,32 +450,40 @@ static int ShouldWriteFrame(long int iout, sunrealtype t) {
 #endif
 
 /*
- * BuildCircularActiveLists — host-side geometry construction.
+ * BuildEllipticalActiveLists — host-side geometry construction.
  *
- *   active   : cells inside the centered circle
- *   inactive : cells outside the circle (frozen at m=0)
+ *   active   : cells inside the centered ellipse
+ *              (dx/rx)^2 + (dy/ry)^2 <= 1
+ *   inactive : cells outside the ellipse (frozen at m=0)
  *
  * Allocates host-side h_active_ids / h_inactive_ids; caller is
  * responsible for freeing them (via the matching free() in cleanup).
  */
-static void BuildCircularActiveLists(int ng, int ny,
-                                     int** out_h_active_ids,
-                                     int** out_h_inactive_ids,
-                                     int*  out_n_active,
-                                     int*  out_n_inactive) {
+static void BuildEllipticalActiveLists(int ng, int ny,
+                                       int** out_h_active_ids,
+                                       int** out_h_inactive_ids,
+                                       int*  out_n_active,
+                                       int*  out_n_inactive) {
   const int ncell = ng * ny;
 
-  const double cx     = 0.5 * (double)ng;
-  const double cy     = 0.5 * (double)ny;
-  const int    minDim = (ng < ny) ? ng : ny;
-  const double radius = ACTIVE_RADIUS_FRAC * (double)minDim;
-  const double r2     = radius * radius;
+  const double cx = 0.5 * (double)ng;
+  const double cy = 0.5 * (double)ny;
+  const double rx = ACTIVE_RX_FRAC * (double)ng;
+  const double ry = ACTIVE_RY_FRAC * (double)ny;
+  if (rx <= 0.0 || ry <= 0.0) {
+    fprintf(stderr,
+            "BuildEllipticalActiveLists: rx=%.4f ry=%.4f must be > 0\n",
+            rx, ry);
+    exit(EXIT_FAILURE);
+  }
+  const double inv_rx2 = 1.0 / (rx * rx);
+  const double inv_ry2 = 1.0 / (ry * ry);
 
   int n_active = 0, n_inactive = 0;
   unsigned char* tmp_active =
       (unsigned char*)malloc((size_t)ncell * sizeof(unsigned char));
   if (!tmp_active) {
-    fprintf(stderr, "BuildCircularActiveLists: malloc failed\n");
+    fprintf(stderr, "BuildEllipticalActiveLists: malloc failed\n");
     exit(EXIT_FAILURE);
   }
 
@@ -475,9 +492,9 @@ static void BuildCircularActiveLists(int ng, int ny,
       const int cell = j * ng + i;
       const double dx = (double)i + 0.5 - cx;
       const double dy = (double)j + 0.5 - cy;
-      const double d2 = dx * dx + dy * dy;
+      const double q  = dx * dx * inv_rx2 + dy * dy * inv_ry2;
 
-      if (d2 <= r2) {
+      if (q <= 1.0) {
         tmp_active[cell] = 1;
         n_active++;
       } else {
@@ -490,7 +507,7 @@ static void BuildCircularActiveLists(int ng, int ny,
   int* h_a = (int*)malloc((size_t)n_active * sizeof(int));
   int* h_i = (int*)malloc((size_t)n_inactive * sizeof(int));
   if ((n_active > 0 && !h_a) || (n_inactive > 0 && !h_i)) {
-    fprintf(stderr, "BuildCircularActiveLists: id-array malloc failed\n");
+    fprintf(stderr, "BuildEllipticalActiveLists: id-array malloc failed\n");
     exit(EXIT_FAILURE);
   }
 
@@ -501,9 +518,10 @@ static void BuildCircularActiveLists(int ng, int ny,
   }
   free(tmp_active);
 
-  printf("[geometry i6] centered circle: radius=%.2f cells "
-         "(%.4f * min(ng,ny)=%d)\n",
-         radius, (double)ACTIVE_RADIUS_FRAC, minDim);
+  printf("[geometry i6] centered ellipse: rx=%.2f cells (%.4f * ng=%d), "
+         "ry=%.2f cells (%.4f * ny=%d)\n",
+         rx, (double)ACTIVE_RX_FRAC, ng,
+         ry, (double)ACTIVE_RY_FRAC, ny);
   printf("[geometry i6] active = %d / %d (%.2f%%),  hole = %d / %d (%.2f%%)\n",
          n_active, ncell, 100.0 * n_active / ncell,
          n_inactive, ncell, 100.0 * n_inactive / ncell);
@@ -584,10 +602,10 @@ int main(int argc, char* argv[]) {
   CHECK_CUDA(cudaMemset(udata.d_hdmag, 0,
                         (size_t)3 * ncell * sizeof(sunrealtype)));
 
-  /* ─── Build circular geometry: compact id lists ──────────────────── */
-  BuildCircularActiveLists(ng, ny,
-                           &h_active_ids, &h_inactive_ids,
-                           &udata.n_active, &udata.n_inactive);
+  /* ─── Build elliptical geometry: compact id lists ────────────────── */
+  BuildEllipticalActiveLists(ng, ny,
+                             &h_active_ids, &h_inactive_ids,
+                             &udata.n_active, &udata.n_inactive);
 
   if (udata.n_active > 0) {
     CHECK_CUDA(cudaMalloc((void**)&udata.d_active_ids,
@@ -643,9 +661,9 @@ int main(int argc, char* argv[]) {
   }
 
   /* ─── Initial condition ───────────────────────────────────────────
-   *  Active cells (inside circle) : m = (INIT_MX, INIT_MY, INIT_MZ),
-   *                                  normalized to unit length.
-   *  Hole cells (outside circle)  : m = 0, frozen for all time.
+   *  Active cells (inside ellipse) : m = (INIT_MX, INIT_MY, INIT_MZ),
+   *                                   normalized to unit length.
+   *  Hole cells (outside ellipse)  : m = 0, frozen for all time.
    *
    * Build a quick scratch byte-mask from h_active_ids so we can spot
    * active cells in O(1) during this loop.
