@@ -1,4 +1,3 @@
-````markdown
 # GPU Micromagnetic Simulation with Irregular Geometry
 
 ## Overview
