@@ -13,9 +13,7 @@
       max-width: 1200px;
     }
 
-    h1 {
-      margin-bottom: 0.2em;
-    }
+    h1 { margin-bottom: 0.2em; }
 
     h2 {
       margin-top: 2em;
@@ -23,22 +21,16 @@
       padding-bottom: 0.3em;
     }
 
-    h3 {
-      margin-bottom: 0.3em;
-    }
+    h3 { margin-bottom: 0.3em; }
 
-    a {
-      color: #0645ad;
-    }
+    a { color: #0645ad; }
 
     .summary {
       max-width: 900px;
       font-size: 1.05em;
     }
 
-    .links li {
-      margin-bottom: 0.4em;
-    }
+    .links li { margin-bottom: 0.4em; }
 
     .gallery {
       display: grid;
@@ -62,9 +54,7 @@
       border: 1px solid #ddd;
     }
 
-    .card p {
-      margin-bottom: 0;
-    }
+    .card p { margin-bottom: 0; }
 
     .featured {
       border: 2px solid #444;
@@ -75,11 +65,6 @@
       width: 100%;
       height: 650px;
       border: 1px solid #ccc;
-    }
-
-    .note {
-      color: #555;
-      font-size: 0.95em;
     }
   </style>
 </head>
@@ -122,51 +107,55 @@
 
   <p>
     The project simulates micromagnetic domain evolution in thin magnetic films.
-    The examples are motivated by classical magnetic-domain structures such as
-    Bloch walls, Néel-like spike domains near defects, cross-tie structures, and
-    asymmetric domain walls. In the code, these physical ideas are represented
-    by the Landau-Lifshitz-Gilbert equation with exchange, anisotropy, DMI-like
-    local interactions, demagnetization fields, and irregular masks such as
-    holes, rings, or dead grains.
+    The physical motivation comes from classical magnetic-domain structures:
+    Bloch walls, Néel-like spike domains near defects, cross-tie structures,
+    and asymmetric domain walls. In the code, these effects are modeled through
+    the Landau-Lifshitz-Gilbert equation with exchange, anisotropy, DMI-like
+    local interactions, FFT-based demagnetization fields, and geometry masks.
   </p>
 
   <p>
-    The most advanced version is the irregular FFT-demag simulation: a
-    Voronoi-polycrystal magnetic film with dead-grain holes, where local stencil
-    physics is combined with a long-range demagnetization field computed by
-    cuFFT. This is the closest version to the classical “defect interacting
-    with domain walls / spike domains” examples shown in micromagnetics
-    literature.
+    The main simulation target is an irregular thin-film magnetic system where
+    domain walls interact with geometric defects or inactive regions. The most
+    advanced version is the i3 case: a Voronoi-polycrystal magnetic film with
+    dead-grain holes and long-range demagnetization computed by cuFFT.
   </p>
 
-  <h2>Highlighted Results</h2>
+  <h2>Highlighted Result: i3 Irregular FFT Demag</h2>
 
   <div class="gallery">
 
     <div class="card featured">
-      <h3>Irregular FFT Demag: Voronoi Polycrystal + Dead-Grain Holes</h3>
+      <h3>Voronoi Polycrystal + Dead-Grain Holes + FFT Demag</h3>
       <a href="https://github.com/Angelawoo572/gpu-micromagnetics-irregular/blob/main/results/irregular/2d_fft/i3_quiver_animation.gif" target="_blank">
         <img src="results/irregular/2d_fft/i3_quiver_animation.gif" alt="i3 quiver animation">
       </a>
       <p>
         This is the main showcase simulation. It combines irregular grain
         geometry, dead-grain holes, local magnetic interactions, and FFT-based
-        demagnetization. It is the strongest example for showing domain-wall
-        bending, defect effects, and non-uniform magnetization dynamics.
+        demagnetization. This case is closest to the classical physical picture
+        of domain walls interacting with defects and forming non-uniform
+        magnetic structures.
       </p>
     </div>
 
     <div class="card featured">
-      <h3>i3 Top View: Magnetization Component Map</h3>
+      <h3>i3 Magnetization Top View</h3>
       <a href="https://github.com/Angelawoo572/gpu-micromagnetics-irregular/blob/main/results/irregular/2d_fft/i3_mx_topview.gif" target="_blank">
         <img src="results/irregular/2d_fft/i3_mx_topview.gif" alt="i3 mx topview">
       </a>
       <p>
-        Top-view visualization of the same irregular FFT-demag system. This
-        view makes the domain evolution easier to compare with classical
-        microscopy images of spike domains and domain-wall motion near defects.
+        Top-view visualization of the same i3 simulation. This view makes the
+        domain pattern easier to compare with microscopy-style images of spike
+        domains, wall bending, and defect-driven domain evolution.
       </p>
     </div>
+
+  </div>
+
+  <h2>Baseline and FFT Development Results</h2>
+
+  <div class="gallery">
 
     <div class="card">
       <h3>1D Correctness Test</h3>
@@ -174,8 +163,8 @@
         <img src="results/1d/correctness_filed.png" alt="1D correctness field">
       </a>
       <p>
-        A simpler 1D test case used to check correctness before moving to 2D
-        and irregular geometries.
+        A simple 1D test case used to check the solver behavior before moving
+        to 2D simulations.
       </p>
     </div>
 
@@ -185,8 +174,9 @@
         <img src="results/2d/2d_heter/quiver_animation.gif" alt="2D periodic quiver animation">
       </a>
       <p>
-        Baseline 2D periodic simulation. This version shows the transition from
-        simple regular-grid dynamics toward more complex 2D magnetic textures.
+        Baseline 2D periodic simulation. This version tests regular-grid
+        magnetization dynamics before adding long-range demagnetization and
+        irregular geometry.
       </p>
     </div>
 
@@ -196,20 +186,23 @@
         <img src="results/2d_fft/2d_heter.gif" alt="2D FFT demag simulation">
       </a>
       <p>
-        Extension of the 2D solver with FFT-based long-range demagnetization.
-        This adds the nonlocal field needed for realistic thin-film domain
+        Regular 2D simulation with FFT-based demagnetization. This adds the
+        nonlocal magnetic field needed for more realistic thin-film domain
         behavior.
       </p>
     </div>
 
     <div class="card">
-      <h3>Irregular Antidot / Hole Geometry</h3>
+      <h3>2D FFT with Three-Stripe Initial Condition</h3>
       <a href="https://github.com/Angelawoo572/gpu-micromagnetics-irregular/blob/main/results/irregular/2d_fft/2d_i1_768*256_2.gif" target="_blank">
-        <img src="results/irregular/2d_fft/2d_i1_768*256_2.gif" alt="irregular hole geometry">
+        <img src="results/irregular/2d_fft/2d_i1_768*256_2.gif" alt="2D FFT three-stripe initial condition">
       </a>
       <p>
-        Irregular geometry example with FFT demagnetization. This tests how
-        holes and masks perturb the magnetization field.
+        This is still a regular 2D FFT-demag simulation, but with a different
+        background and initial condition. The easy axis and DMI direction are
+        both along x, and the initial state is a three-stripe head-on transition:
+        mx = -1 on the left and right regions, mx = +1 in the middle region,
+        with small random my and mz perturbations to break symmetry.
       </p>
     </div>
 
@@ -225,8 +218,8 @@
         <img src="results/irregular/2d_fft/1%3A4_i4_mx_topview.gif" alt="i4 1:4 mx topview">
       </a>
       <p>
-        Geometry-ratio sweep showing how changing the shape of the irregular
-        region changes the domain pattern.
+        Geometry-ratio sweep showing how the shape of the active region changes
+        the resulting magnetic-domain pattern.
       </p>
     </div>
 
@@ -237,7 +230,7 @@
       </a>
       <p>
         A more elongated geometry case, useful for comparing how aspect ratio
-        affects domain-wall motion and field concentration.
+        affects the domain-wall pattern and field concentration.
       </p>
     </div>
 
@@ -247,9 +240,8 @@
         <img src="results/irregular/2d_fft/i5_mx_topview.gif" alt="i5 mx topview">
       </a>
       <p>
-        Ring-based irregular geometry. This tests whether the same solver can
-        support different active and inactive mask layouts with only small code
-        changes.
+        Ring-based mask geometry. This tests whether the same solver can support
+        different active and inactive layouts with only small geometry changes.
       </p>
     </div>
 
@@ -259,9 +251,8 @@
         <img src="results/irregular/2d_fft/i6_circlemx_topview.gif" alt="i6 circle mx topview">
       </a>
       <p>
-        Circular-mask example showing another irregular geometry case. This is
-        useful for demonstrating that the implementation is not restricted to a
-        single hand-coded shape.
+        Circular-mask example showing that the implementation is not restricted
+        to one hand-coded irregular shape.
       </p>
     </div>
 
