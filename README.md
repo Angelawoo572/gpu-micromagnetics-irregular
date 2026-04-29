@@ -397,8 +397,15 @@ for the full explanation of the method, experiments, and performance analysis.
 
 ## Conclusion
 
-This project shows that GPU micromagnetic simulation performance is determined
-by the interaction between local CUDA kernels, FFT-based long-range coupling,
-irregular geometry handling, and the CVODE solver pipeline.
+This project demonstrates that end-to-end performance of GPU-based
+micromagnetic simulation is determined not by individual kernels,
+but by the interaction between data-parallel computation and
+solver-level orchestration.
 
-Optimizing only one kernel is not enough; the full solver structure matters.
+While local kernels and FFT demagnetization can be highly optimized,
+the dominant cost shifts to SUNDIALS vector operations and
+synchronization overhead.
+
+Future improvements require changes at the solver level,
+such as reducing kernel launch overhead or restructuring
+integration pipelines, rather than further tuning physics kernels.
