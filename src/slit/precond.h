@@ -2,18 +2,15 @@
 #define PRECOND_H
 
 /*
- * precond.h — Block-Jacobi preconditioner for the Maxwell BDF/Newton system.
+ * precond.h — 3×3 Block-Jacobi preconditioner for spin-wave slit LLG.
  *
- * The Maxwell RHS is a pure curl operator: a 3×3 block per cell with NO
- * self-coupling (∂f_α/∂y_α |_self = 0).  So the local 3×3 J is the zero
- * matrix and (I − γ J) = I.  In other words the trivial block-Jacobi
- * preconditioner with all blocks = identity is exact for the local part.
+ * Each block approximates (I − γ ∂f/∂m_i) using:
+ *   - z-axis anisotropy self-coupling (c_msk={0,0,1})
+ *   - demag self-coupling N(0) diagonal
+ *   - exchange contributes zero self-coupling
  *
- * We still expose the full Setup/Solve interface so the SUNDIALS plumbing
- * is identical to the LLG code; PrecondSolve simply copies r → z and
- * zeros it inside the screen.  The off-diagonal coupling (the curl) is
- * left to GMRES, which converges fast because the system is small and
- * well-conditioned.
+ * ymsk: hole cells → P applied via ymsk multiply inside apply_P_kernel.
+ * API identical to i2/i5 precond.
  */
 
 #include <sundials/sundials_types.h>
@@ -25,7 +22,7 @@ extern "C" {
 
 typedef struct PrecondData PrecondData;
 
-PrecondData* Precond_Create(int nx, int ny, int ncell);
+PrecondData* Precond_Create(int ng, int ny, int ncell);
 void         Precond_Destroy(PrecondData *pd);
 
 int PrecondSetup(sunrealtype t, N_Vector y, N_Vector fy,

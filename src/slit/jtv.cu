@@ -1,17 +1,21 @@
 /*
- * jtv.cu — Analytic Jv for 2D Maxwell on a collocated grid.
+ * jtv.cu — Analytic Jv for spin-wave slit LLG.
  *
- * Maxwell is LINEAR in (Ez, Hx, Hy), so J·v is just the same curl
- * operator applied to v instead of y.  Source term doesn't appear
- * (it's a constant in y).
+ * Physics: easy axis along z (c_msk={0,0,1}), DMI along x (c_nsk={1,0,0}).
+ * This differs from i2 (x-axis anisotropy) — here anisotropy is on h3.
  *
- *   (Jv)_Ez = c·( ∂vHy/∂x − ∂vHx/∂y )
- *   (Jv)_Hx = −c · ∂vEz/∂y
- *   (Jv)_Hy =  c · ∂vEz/∂x
+ * Demag NOT included in Jv (would need second FFT per GMRES iter).
+ * Hole cells masked by ymsk → Jv = 0 there.
  *
- * Same compact-launch + zero-inactive treatment as f().
- *
- * JtvUserData mirrors UserData in slit_fdtd.cu byte-for-byte.
+ * JtvUserData layout must match UserData in 2d_slit.cu byte-for-byte:
+ *   offset 0  : void *pd_opaque
+ *   offset 8  : sunrealtype *d_hdmag
+ *   offset 16 : sunrealtype *d_ymsk
+ *   offset 24 : DemagData *demag
+ *   offset 32 : int nx, ny, ng, ncell, neq
+ *   offset 52 : int screen_col, slit_lo, slit_hi, src_col
+ *   offset 68 : double nxx0, nyy0, nzz0
+ *   offset 92 : double omega_drive
  */
 
 #include "jtv.h"
@@ -21,112 +25,150 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-#ifndef C_LIGHT
-#define C_LIGHT 2.99792458e8
+/* Constants must match 2d_slit.cu -D flags */
+#ifndef C_CHE
+#define C_CHE   4.0
+#endif
+#ifndef C_CHK
+#define C_CHK   0.5
+#endif
+#ifndef C_CHB
+#define C_CHB   0.1
+#endif
+#ifndef C_ALPHA
+#define C_ALPHA 0.01
+#endif
+#ifndef C_CHG
+#define C_CHG   1.0
 #endif
 
-#ifndef JTV_BLOCK_SIZE
-#define JTV_BLOCK_SIZE 256
-#endif
+__constant__ sunrealtype jc_che   = C_CHE;
+__constant__ sunrealtype jc_chk   = C_CHK;
+__constant__ sunrealtype jc_chb   = C_CHB;
+__constant__ sunrealtype jc_alpha = C_ALPHA;
+__constant__ sunrealtype jc_chg   = C_CHG;
 
-__device__ static inline int jidx_ez(int c, int nc) { return c; }
-__device__ static inline int jidx_hx(int c, int nc) { return nc + c; }
-__device__ static inline int jidx_hy(int c, int nc) { return 2*nc + c; }
-
-__global__ static void jtv_zero_inactive_kernel(
-    sunrealtype* __restrict__ Jv,
-    const int* __restrict__ inactive_ids,
-    int n_inactive,
-    int ncell)
-{
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= n_inactive) return;
-  int cell = inactive_ids[tid];
-  Jv[jidx_ez(cell, ncell)] = SUN_RCONST(0.0);
-  Jv[jidx_hx(cell, ncell)] = SUN_RCONST(0.0);
-  Jv[jidx_hy(cell, ncell)] = SUN_RCONST(0.0);
+__device__ static inline int jidx_mx(int c, int nc) { return c; }
+__device__ static inline int jidx_my(int c, int nc) { return nc + c; }
+__device__ static inline int jidx_mz(int c, int nc) { return 2*nc + c; }
+__device__ static inline int jwrap_x(int x, int ng) {
+    return (x < 0) ? x+ng : (x >= ng ? x-ng : x);
+}
+__device__ static inline int jwrap_y(int y, int ny) {
+    return (y < 0) ? y+ny : (y >= ny ? y-ny : y);
 }
 
-__global__ static void jtv_kernel_compact(
+/*
+ * Analytic Jv kernel.
+ *
+ * Easy axis z: c_msk={0,0,1} → only h3 gets anisotropy self-coupling.
+ * DMI x:       c_nsk={1,0,0} → only h1 gets DMI from x-neighbors.
+ *
+ * h1 = che*(y1L+y1R+y1U+y1D) + chb*(y1L+y1R)
+ * h2 = che*(y2L+y2R+y2U+y2D)
+ * h3 = che*(y3L+y3R+y3U+y3D) + chk*m3*(m3²-1)
+ *
+ * dh1 = (che+chb)*(v1L+v1R) + che*(v1U+v1D)
+ * dh2 = che*(v2L+v2R+v2U+v2D)
+ * dh3 = che*(v3L+v3R+v3U+v3D) + chk*(3m3²-1)*v3
+ */
+__global__ static void jtv_kernel(
+    const sunrealtype* __restrict__ y,
     const sunrealtype* __restrict__ v,
-    const int* __restrict__ active_ids,
-    int n_active,
-    sunrealtype* __restrict__ Jv,
-    int nx, int ny, int ncell,
-    double inv_dx, double c_speed)
+    const sunrealtype* __restrict__ ymsk,
+    sunrealtype*       __restrict__ Jv,
+    int ng, int ny, int ncell)
 {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= n_active) return;
+    const int gx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (gx >= ng || gy >= ny) return;
 
-  const int cell = active_ids[tid];
-  const int gx = cell % nx;
-  const int gy = cell / nx;
+    const int cell = gy*ng + gx;
+    const int mx = jidx_mx(cell,ncell);
+    const int my = jidx_my(cell,ncell);
+    const int mz = jidx_mz(cell,ncell);
 
-  const int iez = jidx_ez(cell, ncell);
-  const int ihx = jidx_hx(cell, ncell);
-  const int ihy = jidx_hy(cell, ncell);
+    const int xl = jwrap_x(gx-1,ng), xr = jwrap_x(gx+1,ng);
+    const int yu = jwrap_y(gy-1,ny), ydn = jwrap_y(gy+1,ny);
+    const int lc = gy*ng+xl, rc = gy*ng+xr;
+    const int uc = yu*ng+gx, dc = ydn*ng+gx;
 
-  const sunrealtype ez_l = (gx > 0)    ? v[jidx_ez((gy)*nx + (gx-1), ncell)] : SUN_RCONST(0.0);
-  const sunrealtype ez_r = (gx < nx-1) ? v[jidx_ez((gy)*nx + (gx+1), ncell)] : SUN_RCONST(0.0);
-  const sunrealtype ez_u = (gy > 0)    ? v[jidx_ez((gy-1)*nx + (gx), ncell)] : SUN_RCONST(0.0);
-  const sunrealtype ez_d = (gy < ny-1) ? v[jidx_ez((gy+1)*nx + (gx), ncell)] : SUN_RCONST(0.0);
+    const sunrealtype m1 = y[mx], m2 = y[my], m3 = y[mz];
+    const sunrealtype v1 = v[mx], v2 = v[my], v3 = v[mz];
 
-  const sunrealtype hx_u = (gy > 0)    ? v[jidx_hx((gy-1)*nx + (gx), ncell)] : SUN_RCONST(0.0);
-  const sunrealtype hx_d = (gy < ny-1) ? v[jidx_hx((gy+1)*nx + (gx), ncell)] : SUN_RCONST(0.0);
+    /* y neighbors */
+    const sunrealtype y1L=y[jidx_mx(lc,ncell)], y1R=y[jidx_mx(rc,ncell)];
+    const sunrealtype y1U=y[jidx_mx(uc,ncell)], y1D=y[jidx_mx(dc,ncell)];
+    const sunrealtype y2L=y[jidx_my(lc,ncell)], y2R=y[jidx_my(rc,ncell)];
+    const sunrealtype y2U=y[jidx_my(uc,ncell)], y2D=y[jidx_my(dc,ncell)];
+    const sunrealtype y3L=y[jidx_mz(lc,ncell)], y3R=y[jidx_mz(rc,ncell)];
+    const sunrealtype y3U=y[jidx_mz(uc,ncell)], y3D=y[jidx_mz(dc,ncell)];
 
-  const sunrealtype hy_l = (gx > 0)    ? v[jidx_hy((gy)*nx + (gx-1), ncell)] : SUN_RCONST(0.0);
-  const sunrealtype hy_r = (gx < nx-1) ? v[jidx_hy((gy)*nx + (gx+1), ncell)] : SUN_RCONST(0.0);
+    /* v neighbors */
+    const sunrealtype v1L=v[jidx_mx(lc,ncell)], v1R=v[jidx_mx(rc,ncell)];
+    const sunrealtype v1U=v[jidx_mx(uc,ncell)], v1D=v[jidx_mx(dc,ncell)];
+    const sunrealtype v2L=v[jidx_my(lc,ncell)], v2R=v[jidx_my(rc,ncell)];
+    const sunrealtype v2U=v[jidx_my(uc,ncell)], v2D=v[jidx_my(dc,ncell)];
+    const sunrealtype v3L=v[jidx_mz(lc,ncell)], v3R=v[jidx_mz(rc,ncell)];
+    const sunrealtype v3U=v[jidx_mz(uc,ncell)], v3D=v[jidx_mz(dc,ncell)];
 
-  const sunrealtype half_inv_dx = SUN_RCONST(0.5) * (sunrealtype)inv_dx;
-  const sunrealtype dHy_dx = (hy_r - hy_l) * half_inv_dx;
-  const sunrealtype dHx_dy = (hx_d - hx_u) * half_inv_dx;
-  const sunrealtype dEz_dx = (ez_r - ez_l) * half_inv_dx;
-  const sunrealtype dEz_dy = (ez_d - ez_u) * half_inv_dx;
+    /* Effective field at y */
+    const sunrealtype h1 = jc_che*(y1L+y1R+y1U+y1D) + jc_chb*(y1L+y1R);
+    const sunrealtype h2 = jc_che*(y2L+y2R+y2U+y2D);
+    const sunrealtype h3 = jc_che*(y3L+y3R+y3U+y3D)
+                         + jc_chk * m3 * (m3*m3 - SUN_RCONST(1.0));
 
-  Jv[iez] =  (sunrealtype)c_speed * (dHy_dx - dHx_dy);
-  Jv[ihx] = -(sunrealtype)c_speed * dEz_dy;
-  Jv[ihy] =  (sunrealtype)c_speed * dEz_dx;
+    const sunrealtype mh = m1*h1 + m2*h2 + m3*h3;
+
+    /* Derivative of h w.r.t. v */
+    const sunrealtype dh1 = (jc_che+jc_chb)*(v1L+v1R) + jc_che*(v1U+v1D);
+    const sunrealtype dh2 = jc_che*(v2L+v2R+v2U+v2D);
+    /* k3 = d/dv3 [chk * m3*(m3^2-1)] = chk*(3m3^2-1)*v3 */
+    const sunrealtype k3  = jc_chk * (SUN_RCONST(3.0)*m3*m3 - SUN_RCONST(1.0));
+    const sunrealtype dh3 = jc_che*(v3L+v3R+v3U+v3D) + k3*v3;
+
+    const sunrealtype dmh = (v1*h1+v2*h2+v3*h3) + (m1*dh1+m2*dh2+m3*dh3);
+
+    Jv[mx] = ymsk[mx]*(jc_chg*(v3*h2+m3*dh2-v2*h3-m2*dh3)
+                      +jc_alpha*(dh1-dmh*m1-mh*v1));
+    Jv[my] = ymsk[my]*(jc_chg*(v1*h3+m1*dh3-v3*h1-m3*dh1)
+                      +jc_alpha*(dh2-dmh*m2-mh*v2));
+    Jv[mz] = ymsk[mz]*(jc_chg*(v2*h1+m2*dh1-v1*h2-m1*dh2)
+                      +jc_alpha*(dh3-dmh*m3-mh*v3));
 }
 
+/* UserData layout mirror for jtv.cu — matches 2d_slit.cu exactly */
 typedef struct {
-  void *pd_opaque;
-  int  *d_active_ids;
-  int  *d_inactive_ids;
-  int nx, ny, ncell, neq;
-  int n_active, n_inactive;
-  int src_col, pad0;
-  double inv_dx;
-  double omega;
-  double t_ramp;
+    void           *pd_opaque;
+    sunrealtype    *d_hdmag;
+    sunrealtype    *d_ymsk;
+    void           *demag;
+    int   nx, ny, ng, ncell, neq;
+    int   screen_col, slit_lo, slit_hi, src_col;
+    double nxx0, nyy0, nzz0;
+    double omega_drive;
 } JtvUserData;
 
 int JtvProduct(N_Vector v, N_Vector Jv, sunrealtype t,
-               N_Vector y, N_Vector fy, void* user_data, N_Vector tmp)
+               N_Vector y, N_Vector fy, void *user_data, N_Vector tmp)
 {
-  (void)t; (void)y; (void)fy; (void)tmp;
-  const JtvUserData* ud = (const JtvUserData*)user_data;
+    (void)t; (void)fy; (void)tmp;
+    const JtvUserData *ud = (const JtvUserData*)user_data;
 
-  sunrealtype *Jvdata = N_VGetDeviceArrayPointer_Cuda(Jv);
+    const dim3 block(16, 8);
+    const dim3 grid((ud->ng + 15)/16, (ud->ny + 7)/8);
 
-  if (ud->n_inactive > 0) {
-    int g0 = (ud->n_inactive + JTV_BLOCK_SIZE - 1) / JTV_BLOCK_SIZE;
-    jtv_zero_inactive_kernel<<<g0, JTV_BLOCK_SIZE>>>(
-        Jvdata, ud->d_inactive_ids, ud->n_inactive, ud->ncell);
-  }
-
-  if (ud->n_active > 0) {
-    int g1 = (ud->n_active + JTV_BLOCK_SIZE - 1) / JTV_BLOCK_SIZE;
-    jtv_kernel_compact<<<g1, JTV_BLOCK_SIZE>>>(
+    jtv_kernel<<<grid, block>>>(
+        N_VGetDeviceArrayPointer_Cuda(y),
         N_VGetDeviceArrayPointer_Cuda(v),
-        ud->d_active_ids, ud->n_active,
-        Jvdata,
-        ud->nx, ud->ny, ud->ncell,
-        ud->inv_dx, C_LIGHT);
-  }
+        ud->d_ymsk,
+        N_VGetDeviceArrayPointer_Cuda(Jv),
+        ud->ng, ud->ny, ud->ncell);
 
-  if (cudaPeekAtLastError() != cudaSuccess) {
-    fprintf(stderr, "jtv failed: %s\n", cudaGetErrorString(cudaGetLastError()));
-    return -1;
-  }
-  return 0;
+    if (cudaPeekAtLastError() != cudaSuccess) {
+        fprintf(stderr, "jtv_kernel failed: %s\n",
+                cudaGetErrorString(cudaGetLastError()));
+        return -1;
+    }
+    return 0;
 }
